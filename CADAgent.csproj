@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>CADAgent</AssemblyName>
+    <RootNamespace>CADAgent</RootNamespace>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+
+  <!--
+    Set these paths to match your Civil3D installation.
+    AutoCADPath:  base AutoCAD directory (contains acdbmgd.dll, acmgd.dll, accoremgd.dll)
+    Civil3DPath:  Civil3D-specific directory (contains AeccDbMgd.dll)
+
+    Common locations (adjust year as needed):
+      AutoCAD 2024:  C:\Program Files\Autodesk\AutoCAD 2024
+      Civil3D 2024:  C:\Program Files\Autodesk\AutoCAD 2024\C3D
+  -->
+  <PropertyGroup>
+    <AutoCADPath>C:\Program Files\Autodesk\AutoCAD 2024</AutoCADPath>
+    <Civil3DPath>C:\Program Files\Autodesk\AutoCAD 2024\C3D</Civil3DPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- AutoCAD core references -->
+    <Reference Include="acdbmgd">
+      <HintPath>$(AutoCADPath)\acdbmgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="acmgd">
+      <HintPath>$(AutoCADPath)\acmgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="accoremgd">
+      <HintPath>$(AutoCADPath)\accoremgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
+    <!-- Civil3D database API (alignments, surfaces, corridors, profiles, etc.) -->
+    <Reference Include="AeccDbMgd">
+      <HintPath>$(Civil3DPath)\AeccDbMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
