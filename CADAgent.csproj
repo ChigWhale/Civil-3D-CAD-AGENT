@@ -1,26 +1,30 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net48</TargetFramework>
+    <TargetFramework>net8.0-windows</TargetFramework>
     <AssemblyName>CADAgent</AssemblyName>
     <RootNamespace>CADAgent</RootNamespace>
     <Nullable>enable</Nullable>
     <PlatformTarget>x64</PlatformTarget>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
-  <!--
-    Set these paths to match your Civil3D installation.
-    AutoCADPath:  base AutoCAD directory (contains acdbmgd.dll, acmgd.dll, accoremgd.dll)
-    Civil3DPath:  Civil3D-specific directory (contains AeccDbMgd.dll)
-
-    Common locations (adjust year as needed):
-      AutoCAD 2024:  C:\Program Files\Autodesk\AutoCAD 2024
-      Civil3D 2024:  C:\Program Files\Autodesk\AutoCAD 2024\C3D
-  -->
+  <!-- Auto-detect Civil 3D installation -->
   <PropertyGroup>
-    <AutoCADPath>C:\Program Files\Autodesk\AutoCAD 2024</AutoCADPath>
-    <Civil3DPath>C:\Program Files\Autodesk\AutoCAD 2024\C3D</Civil3DPath>
+    <AutoCADPath>$([System.IO.Directory]::GetDirectories('C:\Program Files\Autodesk','AutoCAD 20*')[0])</AutoCADPath>
+    <Civil3DPath>$(AutoCADPath)\C3D</Civil3DPath>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <!-- UI is built entirely in code — exclude the XAML file from compilation -->
+  <ItemGroup>
+    <Page Remove="AgentPaletteControl.xaml" />
+    <None Include="AgentPaletteControl.xaml" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- AutoCAD core references -->
@@ -37,9 +41,15 @@
       <Private>False</Private>
     </Reference>
 
-    <!-- Civil3D database API (alignments, surfaces, corridors, profiles, etc.) -->
+    <!-- Civil3D database API -->
     <Reference Include="AeccDbMgd">
       <HintPath>$(Civil3DPath)\AeccDbMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
+    <!-- AEC base types required by Civil3D objects (Entity, Handle, etc.) -->
+    <Reference Include="AecBaseMgd">
+      <HintPath>$(AutoCADPath)\ACA\AecBaseMgd.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>
