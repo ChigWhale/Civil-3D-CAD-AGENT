@@ -8,6 +8,7 @@
     <PlatformTarget>x64</PlatformTarget>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
+    <OutputPath></OutputPath>
   </PropertyGroup>
 
   <!-- Auto-detect Civil 3D installation -->

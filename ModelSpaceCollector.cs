@@ -46,7 +46,8 @@ namespace CADAgent
         [CommandMethod("ASKAGENT")]
         public void AskAgent()
         {
-            App.ShowPalette();
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            doc?.Editor.WriteMessage("\n  CAD Agent is running — use Claude Desktop to send commands.\n");
         }
 
         /// <summary>
@@ -56,7 +57,7 @@ namespace CADAgent
         public static string RunAgent(string question)
         {
             // Path to the Python agent script — adjust if needed
-            const string scriptPath = @"C:\Users\me\OneDrive\Desktop\CADAgent-Files\CAD-Agent\ollama_agent.py";
+            const string scriptPath = @"C:\Users\me\Git-Destination-CAD-Agent\CAD-Agent\ollama_agent.py";
 
             var psi = new ProcessStartInfo
             {
