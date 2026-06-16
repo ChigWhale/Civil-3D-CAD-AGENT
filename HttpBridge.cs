@@ -1,8 +1,8 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Text;
-using System.Threading;
 using Newtonsoft.Json.Linq;
 using AcadApp = Autodesk.AutoCAD.ApplicationServices.Application;
 
@@ -12,89 +12,133 @@ namespace CADAgent
     /// Listens on http://localhost:5199/ and exposes two endpoints:
     ///   GET  /modelspace  — collects the drawing and returns LastJson
     ///   POST /execute     — dispatches a single agent step to ModelSpaceBuilder
+    ///
+    /// Requests are accepted asynchronously (BeginGetContext) and queued.
+    /// They are processed during AutoCAD's Idle event, which fires on the
+    /// application thread — no cross-thread marshalling required.
     /// </summary>
-    public class HttpBridge
+    public class HttpBridge : IDisposable
     {
-        private HttpListener? _listener;
-        private Thread?       _thread;
+        private HttpListener?                          _listener;
+        private readonly ConcurrentQueue<HttpListenerContext> _pending = new();
+        private readonly object                        _startLock = new object();
 
         public void Start(string prefix = "http://localhost:5199/")
         {
-            _listener = new HttpListener();
-            _listener.Prefixes.Add(prefix);
-            _listener.Start();
-
-            _thread = new Thread(Listen)
+            lock (_startLock)
             {
-                IsBackground = true,
-                Name         = "CADAgent-HTTP",
-            };
-            _thread.Start();
+                if (_listener?.IsListening == true) return;
+                _listener = new HttpListener();
+                _listener.Prefixes.Add(prefix);
+                _listener.Start();
+                AcadApp.Idle += OnIdle;
+                BeginAccept();
+            }
         }
 
-        public void Stop() => _listener?.Stop();
-
-        // ── Request loop ──────────────────────────────────────────────────────────
-
-        private void Listen()
+        public void Stop()
         {
-            while (_listener!.IsListening)
+            AcadApp.Idle -= OnIdle;
+            _listener?.Close();
+            _listener = null;
+        }
+
+        public void Dispose() => Stop();
+
+        // ── Async accept loop (ThreadPool callback — touches no AutoCAD API) ──────
+
+        private void BeginAccept()
+        {
+            try   { _listener?.BeginGetContext(OnRequestReceived, null); }
+            catch (ObjectDisposedException) { }
+            catch (HttpListenerException)   { }
+        }
+
+        private void OnRequestReceived(IAsyncResult ar)
+        {
+            try
             {
-                try
-                {
-                    var ctx = _listener.GetContext();
-                    ThreadPool.QueueUserWorkItem(_ => Handle(ctx));
-                }
+                var ctx = _listener!.EndGetContext(ar);
+                _pending.Enqueue(ctx);
+            }
+            catch (ObjectDisposedException) { return; }
+            catch (HttpListenerException)   { return; }
+            catch { }
+            BeginAccept();
+        }
+
+        // ── Idle handler (AutoCAD application thread) ─────────────────────────────
+
+        private void OnIdle(object sender, EventArgs e)
+        {
+            while (_pending.TryDequeue(out var ctx))
+            {
+                try { Handle(ctx); }
                 catch { }
             }
         }
 
-        private void Handle(HttpListenerContext ctx)
+        // ── Request dispatch ──────────────────────────────────────────────────────
+
+        private static void Handle(HttpListenerContext ctx)
         {
             string path   = ctx.Request.Url!.AbsolutePath.ToLower();
             string method = ctx.Request.HttpMethod.ToUpper();
 
+            string body   = Error("Internal server error");
+            int    status = 500;
+
             try
             {
-                string body = path switch
+                (body, status) = path switch
                 {
-                    "/modelspace" when method == "GET"  => HandleModelSpace(),
+                    "/modelspace" when method == "GET"  => (HandleModelSpace(), 200),
                     "/execute"    when method == "POST" => HandleExecute(ctx),
-                    _                                   => Error("Unknown endpoint"),
+                    _                                   => (Error("Unknown endpoint"), 404),
                 };
-                Respond(ctx, body, 200);
             }
             catch (Exception ex)
             {
-                Respond(ctx, Error(ex.Message), 500);
+                body   = Error(ex.Message);
+                status = 500;
             }
+
+            try { Respond(ctx, body, status); }
+            catch { }
         }
 
-        // ── Handlers ──────────────────────────────────────────────────────────────
+        // ── Handlers (already on application thread via OnIdle) ───────────────────
 
         private static string HandleModelSpace()
         {
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
             if (doc == null) return Error("No active document");
-
-            ModelSpaceCollector.Collect(doc);
-            return ModelSpaceCollector.LastJson;
+            using (doc.LockDocument())
+            {
+                ModelSpaceCollector.Collect(doc);
+                return ModelSpaceCollector.LastJson;
+            }
         }
 
-        private static string HandleExecute(HttpListenerContext ctx)
+        private static (string body, int status) HandleExecute(HttpListenerContext ctx)
         {
+            const long MaxBodyBytes = 1 * 1024 * 1024;
+            if (ctx.Request.ContentLength64 > MaxBodyBytes)
+                return (Error("Request body too large"), 413);
+
             string body;
             using (var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8))
                 body = reader.ReadToEnd();
 
-            var    root   = JObject.Parse(body);
-            string intent = root["intent"]?.ToString() ?? "chat";
+            string intent = ModelSpaceBuilder.GetIntent(body);
+            if (intent == "chat")
+                return (Error("Could not parse intent from request body"), 400);
 
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
-            if (doc == null) return Error("No active document");
+            if (doc == null) return (Error("No active document"), 500);
 
             using (doc.LockDocument())
-                return ModelSpaceBuilder.ExecuteStep(intent, body, doc);
+                return (ModelSpaceBuilder.ExecuteStep(intent, body, doc), 200);
         }
 
         // ── Helpers ───────────────────────────────────────────────────────────────
@@ -104,12 +148,18 @@ namespace CADAgent
 
         private static void Respond(HttpListenerContext ctx, string body, int status)
         {
-            ctx.Response.StatusCode  = status;
-            ctx.Response.ContentType = "application/json; charset=utf-8";
-            byte[] bytes             = Encoding.UTF8.GetBytes(body);
+            ctx.Response.StatusCode      = status;
+            ctx.Response.ContentType     = "application/json; charset=utf-8";
+            byte[] bytes                 = Encoding.UTF8.GetBytes(body);
             ctx.Response.ContentLength64 = bytes.Length;
-            ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
-            ctx.Response.OutputStream.Close();
+            try
+            {
+                ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
+            }
+            finally
+            {
+                ctx.Response.OutputStream.Close();
+            }
         }
     }
 }

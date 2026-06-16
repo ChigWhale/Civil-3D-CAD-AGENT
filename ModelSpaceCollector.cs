@@ -1,5 +1,4 @@
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using Newtonsoft.Json.Linq;
 using Autodesk.AutoCAD.ApplicationServices;
@@ -8,10 +7,16 @@ using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Runtime;
 using Autodesk.Civil.ApplicationServices;
 using Autodesk.Civil.DatabaseServices;
+using MathNet.Numerics.LinearAlgebra;
+using MathNet.Numerics.LinearAlgebra.Double;
+using MathNet.Numerics.Statistics;
 
 // Disambiguate types that exist in both AutoCAD and Civil3D namespaces
 using AcadDBObject = Autodesk.AutoCAD.DatabaseServices.DBObject;
 using AcadEntity   = Autodesk.AutoCAD.DatabaseServices.Entity;
+using System.Data.Common;
+using Autodesk.Civil;
+using System;
 
 [assembly: CommandClass(typeof(CADAgent.ModelSpaceCollector))]
 
@@ -21,9 +26,10 @@ namespace CADAgent
     {
         /// <summary>
         /// The JSON string produced by the most recent call to Collect().
-        /// The custom UI reads this after calling Collect() and pipes it to the Python agent.
+        /// Read by HttpBridge.HandleModelSpace() and returned as the HTTP response body to the MCP server.
         /// </summary>
-        public static string LastJson { get; private set; } = string.Empty;
+        private static volatile string _lastJson = string.Empty;
+        public static string LastJson => _lastJson;
 
         /// <summary>
         /// AutoCAD command: GETCADOBJECTS
@@ -40,8 +46,7 @@ namespace CADAgent
 
         /// <summary>
         /// AutoCAD command: ASKAGENT
-        /// Prompts for a question, collects model space, pipes JSON + question to the Python agent,
-        /// and prints the response in the AutoCAD command line.
+        /// Prints a message directing the user to Claude Desktop. Commands are now handled via MCP.
         /// </summary>
         [CommandMethod("ASKAGENT")]
         public void AskAgent()
@@ -50,53 +55,26 @@ namespace CADAgent
             doc?.Editor.WriteMessage("\n  CAD Agent is running — use Claude Desktop to send commands.\n");
         }
 
-        /// <summary>
-        /// Spawns the Python agent as a child process, pipes the collected JSON to its stdin,
-        /// and returns the agent's stdout output.
-        /// </summary>
-        public static string RunAgent(string question)
+        public static (double[], double[], double[]) PolyPCA(double[] xPoint, double[] yPoint)
         {
-            // Path to the Python agent script — adjust if needed
-            const string scriptPath = @"C:\Users\me\Git-Destination-CAD-Agent\CAD-Agent\ollama_agent.py";
+            var polyMatrix = DenseMatrix.OfColumns(xPoint.Length, 2, new[] {xPoint, yPoint});
+            var mean = polyMatrix.ColumnSums() / xPoint.Length;
+            for(int i = 0; i < xPoint.Length; i++)
+                polyMatrix.SetRow(i, polyMatrix.Row(i) - mean);
 
-            var psi = new ProcessStartInfo
-            {
-                FileName               = "python",
-                Arguments              = $"\"{scriptPath}\" \"{question}\"",
-                RedirectStandardInput  = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError  = true,
-                UseShellExecute        = false,
-                CreateNoWindow         = true,
-            };
+            var covMatrix = (polyMatrix.Transpose() * polyMatrix) / (xPoint.Length-1);
+            var evd = covMatrix.Evd(Symmetricity.Symmetric);
+            double[] eigenValues = evd.EigenValues.Real().ToArray();
+            double[] mainEigenvector = evd.EigenVectors.Column(1).ToArray();
+            double[] secondaryEigenvector = evd.EigenVectors.Column(0).ToArray();
 
-            using (Process proc = Process.Start(psi))
-            {
-                proc.StandardInput.Write(LastJson);
-                proc.StandardInput.Close();  // signals EOF so sys.stdin.read() returns
-
-                // Read stdout and stderr concurrently to avoid buffer-deadlock
-                var stdoutTask = System.Threading.Tasks.Task.Run(() => proc.StandardOutput.ReadToEnd());
-                var stderrTask = System.Threading.Tasks.Task.Run(() => proc.StandardError.ReadToEnd());
-
-                // 120-second timeout — prevents the palette hanging indefinitely
-                bool exited = proc.WaitForExit(120_000);
-                if (!exited)
-                {
-                    try { proc.Kill(); } catch { }
-                    return "[Error] Python agent timed out after 120 s. Is Ollama running?";
-                }
-
-                string output = stdoutTask.Result;
-                string stderr = stderrTask.Result;
-                return string.IsNullOrWhiteSpace(output) ? stderr : output;
-            }
+            return (eigenValues, mainEigenvector, secondaryEigenvector);
         }
 
         /// <summary>
         /// Gathers all entities from model space with full geometric data, builds a JSON
         /// string, and stores it in <see cref="LastJson"/>.
-        /// Call this from the custom UI button handler.
+        /// Primary caller: HttpBridge.HandleModelSpace() (via GET /modelspace).
         /// </summary>
         public static void Collect(Document doc)
         {
@@ -119,6 +97,7 @@ namespace CADAgent
                 var sectionViews  = new List<SectionView>();
                 var lines         = new List<Line>();
                 var arcs          = new List<Arc>();
+                var polylines     = new List<Polyline>();
                 var standardEntities = new Dictionary<string, int>();
 
                 foreach (ObjectId objId in ms)
@@ -141,6 +120,7 @@ namespace CADAgent
                         if (entity is SectionView sv) { sectionViews.Add(sv); continue; }
                         if (entity is Line        ln) { lines.Add(ln);        continue; }
                         if (entity is Arc         ar) { arcs.Add(ar);         continue; }
+                        if (entity is Polyline    pl) { polylines.Add(pl);    continue; }
 
                         string typeName = entity.GetType().Name;
                         standardEntities[typeName] =
@@ -251,12 +231,58 @@ namespace CADAgent
                     })
                 );
 
+                // Polylines
+                var polylineArray = new JArray();
+                foreach (var pl in polylines)
+                {
+                    var verts = new JArray();
+                    int numVert = pl.NumberOfVertices;
+                    double[] xPoint = new double[numVert];
+                    double[] yPoint = new double[numVert];
+                    for (int i = 0; i < pl.NumberOfVertices; i++)
+                    {
+                        var pt = pl.GetPoint2dAt(i);
+                        xPoint[i] = pt.X;
+                        yPoint[i] = pt.Y;
+                        verts.Add(new JArray(pt.X, pt.Y));
+                    }
+                    var (eigenValues, mainEigenvector, secondaryEigenvector) = PolyPCA(xPoint, yPoint);
+                    double[] scaledMainEigenvector = mainEigenvector.Select(v => v * Math.Sqrt(eigenValues[1])).ToArray();
+                    double[] scaledSecondaryEigenvector = secondaryEigenvector.Select(v => v * Math.Sqrt(eigenValues[0])).ToArray();
+
+                    double area = 0, cx = 0, cy = 0;
+                    for (int i = 0; i < numVert; i++)
+                    {
+                        int j = (i + 1) % numVert;
+                        double cross = xPoint[i] * yPoint[j] - xPoint[j] * yPoint[i];
+                        area += cross;
+                        cx += (xPoint[i] + xPoint[j]) * cross;
+                        cy += (yPoint[i] + yPoint[j]) * cross;
+                    }
+                    area /= 2;
+                    cx /= (6 * area);
+                    cy /= (6 * area);
+
+                    polylineArray.Add(new JObject
+                    {
+                        ["handle"]               = pl.Handle.ToString(),
+                        ["layer"]                = pl.Layer,
+                        ["closed"]               = pl.Closed,
+                        ["vertices"]             = verts,
+                        ["area"]                 = pl.Area,
+                        ["centroid"]             = new JArray(cx, cy),
+                        ["main_eigenvector"]     = new JArray(scaledMainEigenvector),
+                        ["secondary_eigenvector"]= new JArray(scaledSecondaryEigenvector),
+                    });
+                }
+                root["polylines"] = polylineArray;
+
                 // Standard AutoCAD entities (all other types, by count)
                 root["standard_entities"] = new JArray(
                     standardEntities.Select(kvp => new JObject { ["type"] = kvp.Key, ["count"] = kvp.Value })
                 );
 
-                LastJson = root.ToString(Newtonsoft.Json.Formatting.Indented);
+                _lastJson = root.ToString(Newtonsoft.Json.Formatting.Indented);
                 tr.Commit();
             }
         }

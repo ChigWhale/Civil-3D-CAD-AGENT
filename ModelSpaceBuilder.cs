@@ -69,7 +69,9 @@ namespace CADAgent
                     var arr = Newtonsoft.Json.Linq.JArray.Parse(trimmed);
                     return arr.OfType<JObject>().ToList();
                 }
-                var obj = JObject.Parse(ExtractJson(response));
+                string extracted = ExtractJson(response);
+                if (extracted == null) return new List<JObject>();
+                var obj = JObject.Parse(extracted);
                 return new List<JObject> { obj };
             }
             catch { return new List<JObject>(); }
@@ -128,7 +130,9 @@ namespace CADAgent
             if (string.IsNullOrWhiteSpace(response)) return false;
             try
             {
-                var obj = JObject.Parse(ExtractJson(response));
+                string extracted = ExtractJson(response);
+                if (extracted == null) return false;
+                var obj = JObject.Parse(extracted);
                 if (obj["action"]?.ToString() == "add") return true;
                 return obj.ContainsKey("lines")         ||
                        obj.ContainsKey("arcs")          ||
@@ -167,7 +171,9 @@ namespace CADAgent
         public static string Delete(string json, Document doc)
         {
             JObject root;
-            try   { root = JObject.Parse(ExtractJson(json)); }
+            string rootJson = ExtractJson(json);
+            if (rootJson == null) return "Invalid JSON: no JSON object found.";
+            try   { root = JObject.Parse(rootJson); }
             catch (SysException ex) { return $"Invalid JSON: {ex.Message}"; }
 
             var objects = root["objects"] as JArray
@@ -177,7 +183,6 @@ namespace CADAgent
                 return "Delete failed: no objects listed in response.";
 
             Database db = doc.Database;
-            Editor   ed = doc.Editor;
             int deleted = 0, skipped = 0;
 
             using (Transaction tr = db.TransactionManager.StartTransaction())
@@ -191,13 +196,13 @@ namespace CADAgent
 
                     try
                     {
-                        long handleLong = Convert.ToInt64(handle, 16);
+                        long handleLong = (long)Convert.ToUInt64(handle, 16);
                         ObjectId objId;
                         if (!db.TryGetObjectId(new Handle(handleLong), out objId)) { skipped++; continue; }
 
                         AcadDBObject obj = tr.GetObject(objId, OpenMode.ForWrite) as AcadDBObject;
+                        if (obj == null) { skipped++; continue; }
                         obj.Erase();
-                        ed.WriteMessage($"\n  Deleted {objectType} (handle: {handle}).");
                         deleted++;
                     }
                     catch { skipped++; }
@@ -206,7 +211,6 @@ namespace CADAgent
             }
 
             string summary = $"Deleted {deleted} object(s), {skipped} skipped.";
-            ed.WriteMessage($"\n  {summary}\n");
             return summary;
         }
 
@@ -233,7 +237,6 @@ namespace CADAgent
                     line.Layer = (lt != null && lt.Has(layer)) ? layer : "0";
                     tr.Commit();
                 }
-                doc.Editor.WriteMessage("\n  Line created.\n");
                 return "Line created.";
             }
             catch (SysException ex) { return $"draw_line failed: {ex.Message}"; }
@@ -269,7 +272,6 @@ namespace CADAgent
                     pl.Layer = (lt != null && lt.Has(layer)) ? layer : "0";
                     tr.Commit();
                 }
-                doc.Editor.WriteMessage("\n  Shape created.\n");
                 return "Shape created.";
             }
             catch (SysException ex) { return $"draw_shape failed: {ex.Message}"; }
@@ -283,8 +285,8 @@ namespace CADAgent
             {
                 var root     = JObject.Parse(ExtractJson(json));
                 string name  = root["name"]?.ToString();
-                short  color = root["color"] != null ? root["color"].Value<short>() : (short)7;
-                string lt    = root["linetype"]?.ToString() ?? "Continuous";
+                short  color    = root["color"] != null ? root["color"].Value<short>() : (short)7;
+                string linetype = root["linetype"]?.ToString() ?? "Continuous";
 
                 if (string.IsNullOrWhiteSpace(name)) return "create_layer failed: no name provided.";
 
@@ -292,7 +294,7 @@ namespace CADAgent
                 using (Transaction tr = db.TransactionManager.StartTransaction())
                 {
                     LayerTable lt2 = tr.GetObject(db.LayerTableId, OpenMode.ForWrite) as LayerTable;
-                    if (lt2.Has(name)) return $"Layer '{name}' already exists.";
+                    if (lt2.Has(name)) { tr.Abort(); return $"Layer '{name}' already exists."; }
                     var ltr = new LayerTableRecord
                     {
                         Name  = name,
@@ -301,9 +303,11 @@ namespace CADAgent
                     };
                     lt2.Add(ltr);
                     tr.AddNewlyCreatedDBObject(ltr, true);
+                    LinetypeTable ltt = tr.GetObject(db.LinetypeTableId, OpenMode.ForRead) as LinetypeTable;
+                    if (ltt != null && ltt.Has(linetype))
+                        ltr.LinetypeObjectId = ltt[linetype];
                     tr.Commit();
                 }
-                doc.Editor.WriteMessage($"\n  Layer '{name}' created.\n");
                 return $"Layer '{name}' created.";
             }
             catch (SysException ex) { return $"create_layer failed: {ex.Message}"; }
@@ -338,7 +342,7 @@ namespace CADAgent
                     {
                         try
                         {
-                            long handleLong = Convert.ToInt64(h.ToString(), 16);
+                            long handleLong = (long)Convert.ToUInt64(h.ToString(), 16);
                             ObjectId objId;
                             if (!db.TryGetObjectId(new Handle(handleLong), out objId)) { skipped++; continue; }
                             AcadEntity ent = tr.GetObject(objId, OpenMode.ForWrite) as AcadEntity;
@@ -370,7 +374,7 @@ namespace CADAgent
                 using (Transaction tr = db.TransactionManager.StartTransaction())
                 {
                     LayerTable lt = tr.GetObject(db.LayerTableId, OpenMode.ForRead) as LayerTable;
-                    if (!lt.Has(name)) return $"edit_layer failed: layer '{name}' not found.";
+                    if (!lt.Has(name)) { tr.Abort(); return $"edit_layer failed: layer '{name}' not found."; }
 
                     LayerTableRecord ltr = tr.GetObject(lt[name], OpenMode.ForWrite) as LayerTableRecord;
 
@@ -408,7 +412,7 @@ namespace CADAgent
                     {
                         try
                         {
-                            long handleLong = Convert.ToInt64(h.ToString(), 16);
+                            long handleLong = (long)Convert.ToUInt64(h.ToString(), 16);
                             ObjectId objId;
                             if (!db.TryGetObjectId(new Handle(handleLong), out objId)) { skipped++; continue; }
                             AcadEntity ent = tr.GetObject(objId, OpenMode.ForWrite) as AcadEntity;
@@ -442,7 +446,7 @@ namespace CADAgent
         {
             Editor        ed       = doc.Editor;
             Database      db       = doc.Database;
-            CivilDocument civilDoc = CivilApplication.ActiveDocument;
+            CivilDocument civilDoc = CivilDocument.GetCivilDocument(doc.Database);
 
             int created = 0, skipped = 0;
 
@@ -479,8 +483,8 @@ namespace CADAgent
             {
                 try
                 {
-                    var sp  = t["start_point"] as JArray;
-                    var ep  = t["end_point"]   as JArray;
+                    var sp  = ResolvePointArray(t["start_point"]);
+                    var ep  = ResolvePointArray(t["end_point"]);
                     var line = new Line(Pt3(sp), Pt3(ep))
                     {
                         Layer = t["layer"]?.ToString() ?? "0"
@@ -507,7 +511,6 @@ namespace CADAgent
                     if (vertices == null || vertices.Count < 2) { skipped++; continue; }
 
                     var pl = new Polyline();
-                    pl.Layer = t["layer"]?.ToString() ?? "0";
 
                     for (int i = 0; i < vertices.Count; i++)
                         pl.AddVertexAt(i, Pt2(vertices[i] as JArray), 0, 0, 0);
@@ -516,6 +519,7 @@ namespace CADAgent
 
                     ms.AppendEntity(pl);
                     tr.AddNewlyCreatedDBObject(pl, true);
+                    pl.Layer = t["layer"]?.ToString() ?? "0";
                     created++;
                 }
                 catch { skipped++; }
@@ -587,6 +591,7 @@ namespace CADAgent
                 try
                 {
                     Alignment align = tr.GetObject(alignId, OpenMode.ForWrite) as Alignment;
+                    if (align == null) { skipped++; created--; continue; }
                     foreach (JToken entToken in alignToken["entities"] ?? new JArray())
                     {
                         try
@@ -595,10 +600,13 @@ namespace CADAgent
                             if (type == "Tangent")
                             {
                                 // Use reflection — AddFixedLine signature varies across Civil 3D versions
-                                align.Entities.GetType()
+                                var m = align.Entities.GetType()
                                     .GetMethod("AddFixedLine",
-                                        new[] { typeof(Point2d), typeof(Point2d) })
-                                    ?.Invoke(align.Entities, new object[]
+                                        new[] { typeof(Point2d), typeof(Point2d) });
+                                if (m == null)
+                                    ed.WriteMessage("\n  [Skip entity] AddFixedLine not found on this Civil 3D version.");
+                                else
+                                    m.Invoke(align.Entities, new object[]
                                     {
                                         Pt2(entToken["start"] as JArray),
                                         Pt2(entToken["end"]   as JArray)
@@ -608,10 +616,13 @@ namespace CADAgent
                             {
                                 bool cw = entToken["clockwise"]?.Value<bool>() ?? false;
                                 // Use reflection — AddFixedCurve signature varies across Civil 3D versions
-                                align.Entities.GetType()
+                                var m = align.Entities.GetType()
                                     .GetMethod("AddFixedCurve",
-                                        new[] { typeof(Point2d), typeof(Point2d), typeof(Point2d), typeof(bool) })
-                                    ?.Invoke(align.Entities, new object[]
+                                        new[] { typeof(Point2d), typeof(Point2d), typeof(Point2d), typeof(bool) });
+                                if (m == null)
+                                    ed.WriteMessage("\n  [Skip entity] AddFixedCurve not found on this Civil 3D version.");
+                                else
+                                    m.Invoke(align.Entities, new object[]
                                     {
                                         Pt2(entToken["center"] as JArray),
                                         Pt2(entToken["start"]  as JArray),
@@ -637,6 +648,7 @@ namespace CADAgent
                             profStyleId, profLabelSetId);
 
                         Profile profile = tr.GetObject(profileId, OpenMode.ForWrite) as Profile;
+                        if (profile == null) { skipped++; continue; }
                         foreach (JToken pviToken in profToken["pvis"] ?? new JArray())
                         {
                             try
