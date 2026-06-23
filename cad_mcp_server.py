@@ -1,5 +1,6 @@
 import requests
 import json, openpyxl, os
+from collections import defaultdict
 from mcp.server.fastmcp import FastMCP
 
 mcp     = FastMCP("CAD Agent")
@@ -86,11 +87,32 @@ def move_to_layer(handles: list[str], layer: str) -> str:
     return _post({"intent": "add_to_layer", "layer": layer, "handles": handles})
 
 @mcp.tool()
-def quantify() -> str:
-    """Collects all objects from model space and writes a quantity takeoff to
-    C:/CAD-Agent Test/quantities.xlsx.
-    Rows: one per object. Columns: Type, Handle, Layer, Quantity, Unit.
-    Call this when the user asks for a quantity takeoff or to fill out the Excel."""
+def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
+    """Writes a quantity takeoff Excel file for specific objects the user asked about.
+
+    BEFORE calling this tool you MUST complete both steps below — do not call
+    the tool until it is done:
+
+    STEP 1 - Identify Quantities:
+    From the user prompt, distinguish the set of quantities that is asked for.
+    Using quantitiesOfInterest, fill the dictionary and make sure to have all keys match their respective fields in the JSON.
+    i.e. for Lines the key would be 'lines' to stay consistent.
+    This means that the quantities need to be set the same as the JSON too
+
+
+    STEP 2 - Identify handles:
+      Call get_model_space if you have not already. Then find every object in the
+      JSON that matches what the user described and collect their "handle" values
+      into objOfInterest. Match by any property the user mentions:
+        - Object type (line, arc, polyline, pipe, structure)
+        - Layer name (layer == "STORM")
+        - Diameter (inner_diameter == 12) ***This can be extended to ask for circular or non-circular pipes***
+        - Closed/open (closed == true)
+        - Network name
+      If no objects match, tell the user instead of calling this tool with an
+      empty list.
+      Pipe/structure handles are nested: pipe_networks[i].pipes[j].handle
+                                         pipe_networks[i].structures[j].handle"""
 
     raw = _get("/modelspace")
     try:
@@ -98,32 +120,105 @@ def quantify() -> str:
     except Exception:
         return raw
 
+    wanted = set(objOfInterest)
     rows = []
 
     for ln in data.get("lines", []):
-        rows.append(("Line", ln.get("handle",""), ln.get("layer",""), round(ln.get("length", 0), 4), "length"))
+        if ln.get("handle") in wanted:
+            toAppend = ["Line"]
+            for item in quantitiesOfInterest.get("lines",[]):
+                if isinstance(ln.get(item), (int, float)):
+                    toAppend.append(round(ln.get(item, 0), 4))
+                else:
+                    toAppend.append(ln.get(item , ""))
+            rows.append(toAppend)
 
     for ar in data.get("arcs", []):
-        rows.append(("Arc", ar.get("handle",""), ar.get("layer",""), round(ar.get("length", 0), 4), "length"))
+        if ar.get("handle") in wanted:
+            toAppend = ["Arc"]
+            for item in quantitiesOfInterest.get("arcs", []):
+                if isinstance(ar.get(item), (int, float)):
+                    toAppend.append(round(ar.get(item, 0), 4))
+                else:
+                    toAppend.append(ar.get(item, ""))
+            rows.append(toAppend)
 
     for pl in data.get("polylines", []):
-        rows.append(("Polyline", pl.get("handle",""), pl.get("layer",""), round(pl.get("area", 0), 4), "area"))
+        if pl.get("handle") in wanted:
+            toAppend = ["Polyline"]
+            for item in quantitiesOfInterest.get("polylines", []):
+                if isinstance(pl.get(item), (int, float)):
+                    toAppend.append(round(pl.get(item, 0), 4))
+                else:
+                    toAppend.append(pl.get(item, ""))
+            rows.append(toAppend)
 
     for al in data.get("alignments", []):
-        rows.append(("Alignment", al.get("handle",""), al.get("name",""), round(al.get("length", 0), 4), "length"))
+        if al.get("handle") in wanted:
+            toAppend = ["Alignment"]
+            for item in quantitiesOfInterest.get("alignments", []):
+                if isinstance(al.get(item), (int, float)):
+                    toAppend.append(round(al.get(item, 0), 4))
+                else:
+                    toAppend.append(al.get(item, ""))
+            rows.append(toAppend)
 
-    for se in data.get("standard_entities", []):
-        rows.append((se.get("type",""), "", "", se.get("count", 0), "count"))
+    for net in data.get("pipe_networks", []):
+        net_name = net.get("name", "")
+        for pipe in net.get("pipes", []):
+            if pipe.get("handle") in wanted:
+                dia = round(pipe.get("inner_diameter", 0), 4)
+                rows.append((
+                    f"Pipe ({dia}\")",
+                    pipe.get("name", ""),
+                    net_name,
+                    round(pipe.get("length", 0), 4),
+                    "length",
+                ))
+        for struct in net.get("structures", []):
+            if struct.get("handle") in wanted:
+                dia = round(struct.get("inner_diameter", 0), 4)
+                rows.append((
+                    f"Structure ({dia}\")",
+                    struct.get("name", ""),
+                    net_name,
+                    1,
+                    "count",
+                ))
 
     path = r"C:\Users\me\Desktop\MCP Test\quantities.xlsx"
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     wb = openpyxl.Workbook()
+
+    # ── Main sheet: one row per object ───────────────────────────────────────
     ws = wb.active
     ws.title = "Quantities"
-    ws.append(["Type", "Handle", "Layer / Name", "Quantity", "Unit"])
+    ws.append(["Type", "Handle", "Network / Layer", "Quantity", "Unit"])
     for row in rows:
         ws.append(list(row))
+
+    # ── Pipe Summary: total length grouped by pipe name ──────────────────────
+    pipe_totals = defaultdict(float)
+    for net in data.get("pipe_networks", []):
+        for pipe in net.get("pipes", []):
+            if pipe.get("handle") in wanted:
+                pipe_totals[pipe.get("name", "Unknown")] += pipe.get("length", 0)
+
+    # ── Structure Summary: count grouped by structure name ───────────────────
+    struct_totals = defaultdict(int)
+    for net in data.get("pipe_networks", []):
+        for struct in net.get("structures", []):
+            if struct.get("handle") in wanted:
+                struct_totals[struct.get("name", "Unknown")] += 1
+
+    if pipe_totals or struct_totals:
+        ws2 = wb.create_sheet("Pipe Summary")
+        ws2.append(["Name", "Total Length", "Count"])
+        for name, total in sorted(pipe_totals.items()):
+            ws2.append([name, round(total, 4), ""])
+        for name, count in sorted(struct_totals.items()):
+            ws2.append([name, "", count])
 
     wb.save(path)
     return f"Excel written to {path} — {len(rows)} rows."

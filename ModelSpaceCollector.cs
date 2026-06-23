@@ -55,6 +55,84 @@ namespace CADAgent
             doc?.Editor.WriteMessage("\n  CAD Agent is running — use Claude Desktop to send commands.\n");
         }
 
+        [CommandMethod("DRAWSPATIALHASH")]
+        public void DrawSpatialHash()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+            Database db = doc.Database;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                // Create debug layer
+                var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+                const string layerName = "SPATIALHASH_DEBUG";
+                if (!lt.Has(layerName))
+                {
+                    lt.UpgradeOpen();
+                    var ltr = new LayerTableRecord { Name = layerName };
+                    ltr.Color = Autodesk.AutoCAD.Colors.Color.FromColorIndex(Autodesk.AutoCAD.Colors.ColorMethod.ByAci, 1); // red
+                    lt.Add(ltr);
+                    tr.AddNewlyCreatedDBObject(ltr, true);
+                }
+
+                // Collect geometry (same as Collect but lightweight)
+                var lines     = new List<Line>();
+                var arcs      = new List<Arc>();
+                var polylines = new List<Polyline>();
+                var msRead = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+                foreach (ObjectId id in msRead)
+                {
+                    try
+                    {
+                        var obj = tr.GetObject(id, OpenMode.ForRead);
+                        if (obj is Line   ln && ln.Layer != layerName) lines.Add(ln);
+                        if (obj is Arc    ar && ar.Layer != layerName) arcs.Add(ar);
+                        if (obj is Polyline pl && pl.Layer != layerName) polylines.Add(pl);
+                    }
+                    catch { }
+                }
+
+                var hash = new SpatialHash(cellSize: 50.0, adjacencyThreshold: 50.0);
+                hash.Build(lines, arcs, polylines);
+
+                // Draw one rectangle per occupied cell
+                int cellCount = 0;
+                foreach (var (x0, y0, x1, y1) in hash.GetOccupiedCells())
+                {
+                    var pl = new Polyline();
+                    pl.Layer = layerName;
+                    pl.AddVertexAt(0, new Autodesk.AutoCAD.Geometry.Point2d(x0, y0), 0, 0, 0);
+                    pl.AddVertexAt(1, new Autodesk.AutoCAD.Geometry.Point2d(x1, y0), 0, 0, 0);
+                    pl.AddVertexAt(2, new Autodesk.AutoCAD.Geometry.Point2d(x1, y1), 0, 0, 0);
+                    pl.AddVertexAt(3, new Autodesk.AutoCAD.Geometry.Point2d(x0, y1), 0, 0, 0);
+                    pl.Closed = true;
+                    ms.AppendEntity(pl);
+                    tr.AddNewlyCreatedDBObject(pl, true);
+                    cellCount++;
+                }
+
+                // Draw a circle at each adjacency contact point
+                foreach (var edge in hash.Edges)
+                {
+                    var circle = new Circle(
+                        new Autodesk.AutoCAD.Geometry.Point3d(edge.ContactPoint.X, edge.ContactPoint.Y, 0),
+                        Autodesk.AutoCAD.Geometry.Vector3d.ZAxis,
+                        hash.CellSize * 0.1);
+                    circle.Layer = layerName;
+                    ms.AppendEntity(circle);
+                    tr.AddNewlyCreatedDBObject(circle, true);
+                }
+
+                tr.Commit();
+                ed.WriteMessage($"\n  SPATIALHASH_DEBUG: {cellCount} cells, {hash.Edges.Count} adjacency edges drawn.\n");
+                ed.WriteMessage($"  Run ERASE and select layer SPATIALHASH_DEBUG to clean up.\n");
+            }
+        }
+
         public static (double[], double[], double[]) PolyPCA(double[] xPoint, double[] yPoint)
         {
             var polyMatrix = DenseMatrix.OfColumns(xPoint.Length, 2, new[] {xPoint, yPoint});
@@ -269,6 +347,7 @@ namespace CADAgent
                         ["layer"]                = pl.Layer,
                         ["closed"]               = pl.Closed,
                         ["vertices"]             = verts,
+                        ["length"]               = pl.Length,
                         ["area"]                 = pl.Area,
                         ["centroid"]             = new JArray(cx, cy),
                         ["main_eigenvector"]     = new JArray(scaledMainEigenvector),
@@ -281,6 +360,11 @@ namespace CADAgent
                 root["standard_entities"] = new JArray(
                     standardEntities.Select(kvp => new JObject { ["type"] = kvp.Key, ["count"] = kvp.Value })
                 );
+
+                // Spatial adjacency graph
+                var spatialHash = new SpatialHash(cellSize: 50.0, adjacencyThreshold: 50.0);
+                spatialHash.Build(lines, arcs, polylines);
+                root["adjacency"] = spatialHash.ToJson();
 
                 _lastJson = root.ToString(Newtonsoft.Json.Formatting.Indented);
                 tr.Commit();
