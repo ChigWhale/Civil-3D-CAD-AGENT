@@ -93,11 +93,18 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
     BEFORE calling this tool you MUST complete both steps below — do not call
     the tool until it is done:
 
-    STEP 1 - Identify Quantities:
-    From the user prompt, distinguish the set of quantities that is asked for.
-    Using quantitiesOfInterest, fill the dictionary and make sure to have all keys match their respective fields in the JSON.
-    i.e. for Lines the key would be 'lines' to stay consistent.
-    This means that the quantities need to be set the same as the JSON too
+    STEP 1 - Build quantitiesOfInterest:
+    This is a dict where each key is an object category and each value is a list
+    of field names to extract from that object's JSON. Only include categories
+    the user asked about. Use EXACTLY these field names:
+
+      "lines":      ["handle", "layer", "length", "start_point", "end_point"]
+      "arcs":       ["handle", "layer", "length", "radius", "center"]
+      "polylines":  ["handle", "layer", "length", "area", "closed"]
+      "alignments": ["handle", "name", "length", "start_station", "end_station"]
+
+    Example — user asks for line lengths and layers:
+      quantitiesOfInterest = {"lines": ["handle", "layer", "length"]}
 
 
     STEP 2 - Identify handles:
@@ -167,20 +174,18 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
         net_name = net.get("name", "")
         for pipe in net.get("pipes", []):
             if pipe.get("handle") in wanted:
-                dia = round(pipe.get("inner_diameter", 0), 4)
                 rows.append((
-                    f"Pipe ({dia}\")",
                     pipe.get("name", ""),
+                    pipe.get("handle", ""),
                     net_name,
                     round(pipe.get("length", 0), 4),
                     "length",
                 ))
         for struct in net.get("structures", []):
             if struct.get("handle") in wanted:
-                dia = round(struct.get("inner_diameter", 0), 4)
                 rows.append((
-                    f"Structure ({dia}\")",
                     struct.get("name", ""),
+                    struct.get("handle", ""),
                     net_name,
                     1,
                     "count",
@@ -194,7 +199,7 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
     # ── Main sheet: one row per object ───────────────────────────────────────
     ws = wb.active
     ws.title = "Quantities"
-    ws.append(["Type", "Handle", "Network / Layer", "Quantity", "Unit"])
+    ws.append(quantitiesOfInterest)
     for row in rows:
         ws.append(list(row))
 
@@ -221,7 +226,9 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
             ws2.append([name, "", count])
 
     wb.save(path)
-    return f"Excel written to {path} — {len(rows)} rows."
+    return (f"Excel written to {path} — {len(rows)} rows.\n"
+            f"DEBUG objOfInterest: {list(wanted)}\n"
+            f"DEBUG quantitiesOfInterest: {quantitiesOfInterest}")
 
 # @mcp.tool()
 # def delete_objects(handles: list[str]) -> str:

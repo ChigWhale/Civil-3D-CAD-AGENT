@@ -176,6 +176,7 @@ namespace CADAgent
                 var lines         = new List<Line>();
                 var arcs          = new List<Arc>();
                 var polylines     = new List<Polyline>();
+                var blocks        = new List<BlockReference>();
                 var standardEntities = new Dictionary<string, int>();
 
                 foreach (ObjectId objId in ms)
@@ -196,9 +197,10 @@ namespace CADAgent
                         if (entity is Parcel      p)  { parcels.Add(p);       continue; }
                         if (entity is ProfileView pv) { profileViews.Add(pv); continue; }
                         if (entity is SectionView sv) { sectionViews.Add(sv); continue; }
-                        if (entity is Line        ln) { lines.Add(ln);        continue; }
-                        if (entity is Arc         ar) { arcs.Add(ar);         continue; }
-                        if (entity is Polyline    pl) { polylines.Add(pl);    continue; }
+                        if (entity is Line           ln) { lines.Add(ln);        continue; }
+                        if (entity is Arc            ar) { arcs.Add(ar);         continue; }
+                        if (entity is Polyline       pl) { polylines.Add(pl);    continue; }
+                        if (entity is BlockReference br) { blocks.Add(br);       continue; }
 
                         string typeName = entity.GetType().Name;
                         standardEntities[typeName] =
@@ -355,6 +357,37 @@ namespace CADAgent
                     });
                 }
                 root["polylines"] = polylineArray;
+
+                // Blocks
+                var blockArray = new JArray();
+                foreach (var br in blocks)
+                {
+                    try
+                    {
+                        var attribs = new JObject();
+                        foreach (ObjectId attId in br.AttributeCollection)
+                        {
+                            try
+                            {
+                                var att = tr.GetObject(attId, OpenMode.ForRead) as AttributeReference;
+                                if (att != null) attribs[att.Tag] = att.TextString;
+                            }
+                            catch { }
+                        }
+                        blockArray.Add(new JObject
+                        {
+                            ["handle"]     = br.Handle.ToString(),
+                            ["name"]       = br.Name,
+                            ["layer"]      = br.Layer,
+                            ["position"]   = new JArray(Math.Round(br.Position.X, 4), Math.Round(br.Position.Y, 4)),
+                            ["rotation"]   = Math.Round(br.Rotation * (180.0 / Math.PI), 4),
+                            ["scale"]      = Math.Round(br.ScaleFactors.X, 4),
+                            ["attributes"] = attribs,
+                        });
+                    }
+                    catch { }
+                }
+                root["blocks"] = blockArray;
 
                 // Standard AutoCAD entities (all other types, by count)
                 root["standard_entities"] = new JArray(
