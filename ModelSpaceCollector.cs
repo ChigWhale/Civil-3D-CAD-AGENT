@@ -224,6 +224,7 @@ namespace CADAgent
                         alignArray.Add(new JObject
                         {
                             ["name"]          = align.Name,
+                            ["description"]   = align.Description,
                             ["handle"]        = align.Handle.ToString(),
                             ["start_station"] = align.StartingStation,
                             ["end_station"]   = align.EndingStation,
@@ -635,6 +636,8 @@ namespace CADAgent
                         pipes.Add(new JObject
                         {
                             ["name"]            = pipe.Name,
+                            ["description"]     = pipe.Description,
+                            ["network"]         = network.Name,
                             ["handle"]          = pipe.Handle.ToString(),
                             ["inner_diameter"]  = pipe.InnerDiameterOrWidth,
                             ["start_point"]     = new JArray(sp.X, sp.Y, sp.Z),
@@ -664,6 +667,7 @@ namespace CADAgent
                         structures.Add(new JObject
                         {
                             ["name"]            = s.Name,
+                            ["description"]     = s.Description,
                             ["handle"]          = s.Handle.ToString(),
                             ["insertion_point"] = new JArray(ip.X, ip.Y),
                             ["rim_elevation"]   = s.RimElevation,

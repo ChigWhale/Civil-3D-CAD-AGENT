@@ -96,15 +96,18 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
     STEP 1 - Build quantitiesOfInterest:
     This is a dict where each key is an object category and each value is a list
     of field names to extract from that object's JSON. Only include categories
-    the user asked about. Use EXACTLY these field names:
+    AND fields the user explicitly asked about — do NOT default to all fields.
+    Use ONLY the field names the user mentioned, chosen from these available options:
 
       "lines":      ["handle", "layer", "length", "start_point", "end_point"]
       "arcs":       ["handle", "layer", "length", "radius", "center"]
       "polylines":  ["handle", "layer", "length", "area", "closed"]
       "alignments": ["handle", "name", "length", "start_station", "end_station"]
+      "pipes":      ["handle", "name", "description", "network", "length", "slope", "inner_diameter", "start_structure", "end_structure", "start_point", "end_point"]
+      "structures": ["handle", "name", "description", "network", "rim_elevation", "sump_elevation", "inner_diameter"]
 
-    Example — user asks for line lengths and layers:
-      quantitiesOfInterest = {"lines": ["handle", "layer", "length"]}
+    Example — user asks ONLY for line lengths and layers (do NOT add handle or other fields):
+      quantitiesOfInterest = {"lines": ["layer", "length"]}
 
 
     STEP 2 - Identify handles:
@@ -134,64 +137,82 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
         if ln.get("handle") in wanted:
             toAppend = ["Line"]
             for item in quantitiesOfInterest.get("lines",[]):
-                if isinstance(ln.get(item), (int, float)):
-                    toAppend.append(round(ln.get(item, 0), 4))
+                val = ln.get(item)
+                if isinstance(val, bool):
+                    toAppend.append(f"{str(item)}: {val}")
+                elif isinstance(val, (int, float)):
+                    toAppend.append(f"{str(item)}: {round(val, 4)}")
                 else:
-                    toAppend.append(ln.get(item , ""))
+                    toAppend.append(f"{str(item)}: {val or ''}")
             rows.append(toAppend)
 
     for ar in data.get("arcs", []):
         if ar.get("handle") in wanted:
             toAppend = ["Arc"]
             for item in quantitiesOfInterest.get("arcs", []):
-                if isinstance(ar.get(item), (int, float)):
-                    toAppend.append(round(ar.get(item, 0), 4))
+                val = ar.get(item)
+                if isinstance(val, bool):
+                    toAppend.append(f"{str(item)}: {val}")
+                elif isinstance(val, (int, float)):
+                    toAppend.append(f"{str(item)}: {round(val, 4)}")
                 else:
-                    toAppend.append(ar.get(item, ""))
+                    toAppend.append(f"{str(item)}: {val or ''}")
             rows.append(toAppend)
 
     for pl in data.get("polylines", []):
         if pl.get("handle") in wanted:
             toAppend = ["Polyline"]
             for item in quantitiesOfInterest.get("polylines", []):
-                if isinstance(pl.get(item), (int, float)):
-                    toAppend.append(round(pl.get(item, 0), 4))
+                val = pl.get(item)
+                if isinstance(val, bool):
+                    toAppend.append(f"{str(item)}: {val}")
+                elif isinstance(val, (int, float)):
+                    toAppend.append(f"{str(item)}: {round(val, 4)}")
                 else:
-                    toAppend.append(pl.get(item, ""))
+                    toAppend.append(f"{str(item)}: {val or ''}")
             rows.append(toAppend)
 
     for al in data.get("alignments", []):
         if al.get("handle") in wanted:
             toAppend = ["Alignment"]
             for item in quantitiesOfInterest.get("alignments", []):
-                if isinstance(al.get(item), (int, float)):
-                    toAppend.append(round(al.get(item, 0), 4))
+                val = al.get(item)
+                if isinstance(val, bool):
+                    toAppend.append(f"{str(item)}: {val}")
+                elif isinstance(val, (int, float)):
+                    toAppend.append(f"{str(item)}: {round(val, 4)}")
                 else:
-                    toAppend.append(al.get(item, ""))
+                    toAppend.append(f"{str(item)}: {val or ''}")
             rows.append(toAppend)
 
     for net in data.get("pipe_networks", []):
         net_name = net.get("name", "")
         for pipe in net.get("pipes", []):
             if pipe.get("handle") in wanted:
-                rows.append((
-                    pipe.get("name", ""),
-                    pipe.get("handle", ""),
-                    net_name,
-                    round(pipe.get("length", 0), 4),
-                    "length",
-                ))
+                toAppend = ["Pipe"]
+                for item in quantitiesOfInterest.get("pipes", []):
+                    val = net_name if item == "network" else pipe.get(item)
+                    if isinstance(val, bool):
+                        toAppend.append(f"{str(item)}: {val}")
+                    elif isinstance(val, (int, float)):
+                        toAppend.append(f"{str(item)}: {round(val, 4)}")
+                    else:
+                        toAppend.append(f"{str(item)}: {val or ''}")
+                rows.append(toAppend)
         for struct in net.get("structures", []):
             if struct.get("handle") in wanted:
-                rows.append((
-                    struct.get("name", ""),
-                    struct.get("handle", ""),
-                    net_name,
-                    1,
-                    "count",
-                ))
+                toAppend = ["Structure"]
+                for item in quantitiesOfInterest.get("structures", []):
+                    val = net_name if item == "network" else struct.get(item)
+                    if isinstance(val, bool):
+                        toAppend.append(f"{str(item)}: {val}")
+                    elif isinstance(val, (int, float)):
+                        toAppend.append(f"{str(item)}: {round(val, 4)}")
+                    else:
+                        toAppend.append(f"{str(item)}: {val or ''}")
+                rows.append(toAppend)
 
-    path = r"C:\Users\me\Desktop\MCP Test\quantities.xlsx"
+    path = r"C:\Users\me\Downloads\quantities.xlsx"
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     wb = openpyxl.Workbook()
@@ -199,7 +220,6 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
     # ── Main sheet: one row per object ───────────────────────────────────────
     ws = wb.active
     ws.title = "Quantities"
-    ws.append(quantitiesOfInterest)
     for row in rows:
         ws.append(list(row))
 
@@ -208,22 +228,22 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
     for net in data.get("pipe_networks", []):
         for pipe in net.get("pipes", []):
             if pipe.get("handle") in wanted:
-                pipe_totals[pipe.get("name", "Unknown")] += pipe.get("length", 0)
+                pipe_totals[pipe.get("description", "Unknown")] += pipe.get("length", 0)
 
     # ── Structure Summary: count grouped by structure name ───────────────────
     struct_totals = defaultdict(int)
     for net in data.get("pipe_networks", []):
         for struct in net.get("structures", []):
             if struct.get("handle") in wanted:
-                struct_totals[struct.get("name", "Unknown")] += 1
+                struct_totals[struct.get("description", "Unknown")] += 1
 
     if pipe_totals or struct_totals:
         ws2 = wb.create_sheet("Pipe Summary")
         ws2.append(["Name", "Total Length", "Count"])
         for name, total in sorted(pipe_totals.items()):
             ws2.append([name, round(total, 4), ""])
-        for name, count in sorted(struct_totals.items()):
-            ws2.append([name, "", count])
+        for description, count in sorted(struct_totals.items()):
+            ws2.append([description, "", count])
 
     wb.save(path)
     return (f"Excel written to {path} — {len(rows)} rows.\n"
