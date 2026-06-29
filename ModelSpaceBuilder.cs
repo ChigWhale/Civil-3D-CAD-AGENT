@@ -85,6 +85,7 @@ namespace CADAgent
             switch (intent)
             {
                 case "draw_line":         return DrawLine(json, doc);
+                case "draw_arc":          return DrawArc(json, doc);
                 case "draw_shape":        return DrawShape(json, doc);
                 case "create_layer":      return CreateLayer(json, doc);
                 case "add_to_layer":      return AddToLayer(json, doc);
@@ -240,6 +241,36 @@ namespace CADAgent
                 return "Line created.";
             }
             catch (SysException ex) { return $"draw_line failed: {ex.Message}"; }
+        }
+
+        // ── draw_arc ──────────────────────────────────────────────────────────────
+
+        public static string DrawArc(string json, Document doc)
+        {
+            try
+            {
+                var root        = JObject.Parse(ExtractJson(json));
+                var center      = (JArray)root["center"]!;
+                double radius   = (double)root["radius"]!;
+                double startAng = (double)root["start_angle"]!;
+                double endAng   = (double)root["end_angle"]!;
+                string layer    = root["layer"]?.ToString() ?? "0";
+
+                Database db = doc.Database;
+                using (Transaction tr = db.TransactionManager.StartTransaction())
+                {
+                    BlockTable       bt = tr.GetObject(db.BlockTableId,                OpenMode.ForRead)  as BlockTable;
+                    BlockTableRecord ms = tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+                    var arc = new Arc(Pt3(center), Vector3d.ZAxis, radius, startAng, endAng);
+                    ms.AppendEntity(arc);
+                    tr.AddNewlyCreatedDBObject(arc, true);
+                    LayerTable lt = tr.GetObject(db.LayerTableId, OpenMode.ForRead) as LayerTable;
+                    arc.Layer = (lt != null && lt.Has(layer)) ? layer : "0";
+                    tr.Commit();
+                }
+                return "Arc created.";
+            }
+            catch (SysException ex) { return $"draw_arc failed: {ex.Message}"; }
         }
 
         // ── draw_shape ────────────────────────────────────────────────────────────

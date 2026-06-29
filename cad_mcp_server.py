@@ -27,8 +27,19 @@ def _post(payload: dict) -> str:
 def get_model_space() -> str:
     """Returns the current Civil 3D drawing as JSON (alignments, surfaces,
     corridors, pipe networks, lines, arcs, layers, etc.).
-    Call this EVERY time a user enters a prompt."""
+    Call this EVERY time a user enters a prompt.
+    ALWAYS call get_context after using this tool."""
     return _get("/modelspace")
+
+@mcp.tool()
+def get_context() -> str:
+    """Returns the contents of a file on the server machine.
+       ALWAYS call this right after get_model_space."""
+    try:
+        with open(r"C:\Users\me\Desktop\.md test\driveway_drawing_instructions.md", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -36,12 +47,34 @@ def draw_line(start_x: float, start_y: float,
               end_x: float,   end_y: float,
               layer: str) -> str:
     """Draws a straight line in the active Civil 3D drawing.
-    Only call when the user explicitly asks to draw or create a line.
+    Only call when the user explicitly asks to draw or create a line or when markdown files need them.
     If the user does not explicitly state a layer, use layer as '0' """
     return _post({
         "intent":      "draw_line",
         "start_point": [start_x, start_y, 0],
         "end_point":   [end_x,   end_y,   0],
+        "layer":       layer,
+    })
+
+@mcp.tool()
+def draw_arc(center_x: float, center_y: float,
+             radius: float,
+             start_angle_deg: float, end_angle_deg: float,
+             layer: str) -> str:
+    """Draws an arc in the active Civil 3D drawing.
+    center_x, center_y define the center of the circle the arc belongs to.
+    radius is the radius of that circle.
+    start_angle_deg and end_angle_deg are in degrees, measured counter-clockwise
+    from the positive X axis. The arc always draws counter-clockwise from start to end.
+    Only call when the user explicitly asks to draw or create an arc.
+    If the user does not explicitly state a layer, use layer as '0'"""
+    import math
+    return _post({
+        "intent":      "draw_arc",
+        "center":      [center_x, center_y, 0],
+        "radius":      radius,
+        "start_angle": math.radians(start_angle_deg),
+        "end_angle":   math.radians(end_angle_deg),
         "layer":       layer,
     })
 
@@ -52,7 +85,7 @@ def draw_shape(vertices: list[list[float]],
                closed:   bool = True) -> str:
     """Draws a polyline shape in the drawing.
     vertices is a list of [x, y] pairs, e.g. [[0,0],[10,0],[10,10]].
-    Only call when the user asks to draw a shape or polygon.
+    Only call when the user asks to draw a shape or polygon or when markdown files need them.
     If the user does not explicitly state a layer, use layer as '0' """
     return _post({
         "intent":   "draw_shape",
