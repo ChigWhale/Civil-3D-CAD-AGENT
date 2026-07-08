@@ -8,6 +8,14 @@ BASE    = "http://localhost:5199"
 TIMEOUT = 30
 _NO_CONNECTION = '{"error": "Civil 3D is not reachable — make sure AutoCAD is open with the CADAgent plugin loaded."}'
 
+_SIZE_LIMIT = 950_000  # bytes — 50 KB buffer below the 1 MB MCP threshold
+
+_ALL_CATEGORIES = [
+    "lines", "arcs", "polylines", "alignments",
+    "pipe_networks", "surfaces", "corridors",
+    "blocks", "layers", "adjacency",
+]
+
 
 def _get(path: str) -> str:
     try:
@@ -24,19 +32,57 @@ def _post(payload: dict) -> str:
 
 
 @mcp.tool()
-def get_model_space() -> str:
-    """Returns the current Civil 3D drawing as JSON (alignments, surfaces,
-    corridors, pipe networks, lines, arcs, layers, etc.).
-    Call this EVERY time a user enters a prompt.
-    ALWAYS call get_context after using this tool."""
-    return _get("/modelspace")
+def get_model_space(categories: list[str] | None = None) -> str:
+    """Returns the current Civil 3D drawing as JSON.
+    YOU MUST call this before ANY other tool and before responding to ANY user message.
+    Never skip this call — drawing state changes between messages.
+
+    categories: optional list limiting which data categories are returned.
+    Omit to request all. Valid values:
+      "lines", "arcs", "polylines", "alignments", "pipe_networks",
+      "surfaces", "corridors", "blocks", "layers", "adjacency"
+
+    CHUNKING: if the response approaches 1 MB, partial data is returned with a
+    "__remaining_categories__" field. You MUST call get_model_space again with
+    those categories and repeat until "__remaining_categories__" is absent."""
+
+    raw = _get("/modelspace")
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return raw
+
+    # When no categories specified, walk every known category in order.
+    # When categories are specified, walk only those — preserving caller order.
+    pool = _ALL_CATEGORIES if categories is None else categories
+    to_fetch = [c for c in pool if c in data]
+
+    result    = {}
+    remaining = []
+
+    for i, cat in enumerate(to_fetch):
+        candidate = {**result, cat: data[cat]}
+        if len(json.dumps(candidate).encode("utf-8")) > _SIZE_LIMIT:
+            remaining = to_fetch[i:]   # this cat and everything after didn't fit
+            break
+        result[cat] = data[cat]
+
+    if remaining:
+        result["__remaining_categories__"] = remaining
+        result["__size_bytes__"]           = len(json.dumps(result).encode("utf-8"))
+        result["__note__"] = (
+            f"Size limit reached ({result['__size_bytes__']:,} bytes). "
+            f"Call get_model_space({remaining}) to retrieve the rest. "
+            f"Repeat until __remaining_categories__ is absent."
+        )
+
+    return json.dumps(result)
 
 @mcp.tool()
 def get_context() -> str:
-    """Returns the contents of a file on the server machine.
-       ALWAYS call this right after get_model_space."""
+    """Returns the contents of a file on the server machine."""
     try:
-        with open(r"C:\Users\me\Desktop\.md test\driveway_drawing_instructions.md", "r", encoding="utf-8") as f:
+        with open(r"C:\Users\me\Downloads\driveway.md", "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:
         return f"Error: {e}"
@@ -268,7 +314,8 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
     for net in data.get("pipe_networks", []):
         for struct in net.get("structures", []):
             if struct.get("handle") in wanted:
-                struct_totals[struct.get("description", "Unknown")] += 1
+                key = struct.get("description") or struct.get("name") or "Unknown"
+                struct_totals[key] += 1
 
     if pipe_totals or struct_totals:
         ws2 = wb.create_sheet("Pipe Summary")
