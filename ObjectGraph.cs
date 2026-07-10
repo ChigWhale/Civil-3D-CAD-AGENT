@@ -36,9 +36,11 @@ namespace CADAgent
     internal sealed class GraphNodeData
     {
         public readonly string Handle, Type, Layer, Label;
-        public readonly double WorldX, WorldY;
-        public GraphNodeData(string handle, string type, string layer, string label, double x, double y)
-        { Handle = handle; Type = type; Layer = layer; Label = label; WorldX = x; WorldY = y; }
+        public readonly double WorldX, WorldY, NormX, NormY;
+        public GraphNodeData(string handle, string type, string layer, string label,
+                             double x, double y, double normX, double normY)
+        { Handle = handle; Type = type; Layer = layer; Label = label;
+          WorldX = x; WorldY = y; NormX = normX; NormY = normY; }
     }
 
     internal sealed class GraphEdgeData
@@ -72,6 +74,15 @@ namespace CADAgent
             string seedHandle;
 
             using (doc.LockDocument())
+            {
+            // Global model-space extents — must be inside document lock
+            db.UpdateExt(true);
+            double gMinX   = db.Extmin.X, gMinY   = db.Extmin.Y;
+            double gRangeX = Math.Max(db.Extmax.X - gMinX, 1.0);
+            double gRangeY = Math.Max(db.Extmax.Y - gMinY, 1.0);
+            double NX(double wx) => (wx - gMinX) / gRangeX;
+            double NY(double wy) => (wy - gMinY) / gRangeY;
+
             using (var tr = db.TransactionManager.StartTransaction())
             {
                 var seed = tr.GetObject(per.ObjectId, OpenMode.ForRead) as AcadEntity;
@@ -106,23 +117,23 @@ namespace CADAgent
                         {
                             lines.Add(ln);
                             var c = Mid2d(ln.StartPoint, ln.EndPoint);
-                            nodes.Add(new GraphNodeData(h, "Line", ln.Layer, $"Line\n{h}", c.X, c.Y));
+                            nodes.Add(new GraphNodeData(h, "Line", ln.Layer, $"Line\n{h}", c.X, c.Y, NX(c.X), NY(c.Y)));
                         }
                         else if (obj is Arc ar)
                         {
                             arcs.Add(ar);
-                            nodes.Add(new GraphNodeData(h, "Arc", ar.Layer, $"Arc\n{h}", ar.Center.X, ar.Center.Y));
+                            nodes.Add(new GraphNodeData(h, "Arc", ar.Layer, $"Arc\n{h}", ar.Center.X, ar.Center.Y, NX(ar.Center.X), NY(ar.Center.Y)));
                         }
                         else if (obj is AcadPolyline pl)
                         {
                             polylines.Add(pl);
                             var c = PlCenter(pl);
-                            nodes.Add(new GraphNodeData(h, "Polyline", pl.Layer, $"PL\n{pl.Layer}", c.X, c.Y));
+                            nodes.Add(new GraphNodeData(h, "Polyline", pl.Layer, $"PL\n{pl.Layer}", c.X, c.Y, NX(c.X), NY(c.Y)));
                         }
                         else if (obj is BlockReference br)
                         {
                             nodes.Add(new GraphNodeData(h, "Block", br.Layer,
-                                $"Blk\n{br.Name}", br.Position.X, br.Position.Y));
+                                $"Blk\n{br.Name}", br.Position.X, br.Position.Y, NX(br.Position.X), NY(br.Position.Y)));
                         }
                         else if (obj is CivilLabel lbl)
                         {
@@ -136,7 +147,7 @@ namespace CADAgent
                                         (ext.MinPoint.Y + ext.MaxPoint.Y) / 2, 0); }
                             string shortType = lbl.GetType().Name.Replace("Label", "");
                             nodes.Add(new GraphNodeData(h, "Label", lbl.Layer,
-                                $"Lbl\n{shortType}", anchor.X, anchor.Y));
+                                $"Lbl\n{shortType}", anchor.X, anchor.Y, NX(anchor.X), NY(anchor.Y)));
                         }
                     }
                     catch { }
@@ -162,10 +173,10 @@ namespace CADAgent
                             var al = tr.GetObject(aid, OpenMode.ForRead) as Alignment;
                             if (al == null || !BboxIntersects(al, x0, y0, x1, y1)) continue;
                             var ext = al.GeometricExtents;
+                            double acx = (ext.MinPoint.X + ext.MaxPoint.X) / 2;
+                            double acy = (ext.MinPoint.Y + ext.MaxPoint.Y) / 2;
                             nodes.Add(new GraphNodeData(al.Handle.ToString(), "Alignment", al.Layer,
-                                $"Align\n{al.Name}",
-                                (ext.MinPoint.X + ext.MaxPoint.X) / 2,
-                                (ext.MinPoint.Y + ext.MaxPoint.Y) / 2));
+                                $"Align\n{al.Name}", acx, acy, NX(acx), NY(acy)));
                         }
                         catch { }
                     }
@@ -189,7 +200,7 @@ namespace CADAgent
                                     string sh = s.Handle.ToString();
                                     if (seenHandles.Add(sh))
                                         nodes.Add(new GraphNodeData(sh, "Structure", s.Layer,
-                                            $"Struct\n{s.Name}", ip.X, ip.Y));
+                                            $"Struct\n{s.Name}", ip.X, ip.Y, NX(ip.X), NY(ip.Y)));
                                 }
                                 catch { }
                             }
@@ -212,7 +223,7 @@ namespace CADAgent
                                     string ph = p.Handle.ToString();
                                     if (seenHandles.Add(ph))
                                         nodes.Add(new GraphNodeData(ph, "Pipe", p.Layer,
-                                            $"Pipe\n{p.Name}", pcx, pcy));
+                                            $"Pipe\n{p.Name}", pcx, pcy, NX(pcx), NY(pcy)));
 
                                     if (p.StartStructureId != ObjectId.Null)
                                     {
@@ -245,6 +256,7 @@ namespace CADAgent
 
                 tr.Commit();
             }
+            } // end LockDocument
 
             ed.WriteMessage($"\n  Graph: {nodes.Count} nodes, {edges.Count} edges in 50×50 ft region.\n");
 
@@ -383,18 +395,22 @@ namespace CADAgent
             double Cx(double wx) => single ? CW / 2 : (wx - wxMin) * scale + Pad;
             double Cy(double wy) => single ? CH / 2 : CH - ((wy - wyMin) * scale + Pad); // flip Y
 
+            // Pre-compute canvas positions, then repel overlapping nodes
+            var pos = nodes.ToDictionary(n => n.Handle,
+                                         n => (cx: Cx(n.WorldX), cy: Cy(n.WorldY)));
+            ApplyRepulsion(pos, NodeR * 2 + 10);
+
             // ── Draw edges first (rendered behind nodes) ──────────────────────
             var byHandle = nodes.ToDictionary(n => n.Handle);
             foreach (var e in edges)
             {
-                if (!byHandle.TryGetValue(e.From, out var fn) ||
-                    !byHandle.TryGetValue(e.To,   out var tn)) continue;
+                if (!pos.ContainsKey(e.From) || !pos.ContainsKey(e.To)) continue;
 
                 bool structural = e.EdgeType == "pipe_connection";
                 var line = new WpfLine
                 {
-                    X1 = Cx(fn.WorldX), Y1 = Cy(fn.WorldY),
-                    X2 = Cx(tn.WorldX), Y2 = Cy(tn.WorldY),
+                    X1 = pos[e.From].cx, Y1 = pos[e.From].cy,
+                    X2 = pos[e.To].cx,   Y2 = pos[e.To].cy,
                     Stroke = new SolidColorBrush(structural
                         ? Color.FromRgb(210, 170, 80)
                         : Color.FromRgb(110, 110, 110)),
@@ -411,8 +427,8 @@ namespace CADAgent
             {
                 bool isSeed = n.Handle == seedHandle;
                 double r    = isSeed ? NodeR * 1.35 : NodeR;
-                double cx   = Cx(n.WorldX);
-                double cy   = Cy(n.WorldY);
+                double cx   = pos[n.Handle].cx;
+                double cy   = pos[n.Handle].cy;
 
                 var fill   = new SolidColorBrush(_colors.TryGetValue(n.Type, out var col) ? col : Colors.Gray);
                 var stroke = new SolidColorBrush(isSeed ? Colors.Gold : Color.FromRgb(200, 200, 200));
@@ -423,7 +439,7 @@ namespace CADAgent
                     Fill   = fill,   Stroke = stroke,
                     StrokeThickness = isSeed ? 3.0 : 1.5,
                     Cursor  = Cursors.Hand,
-                    ToolTip = $"{n.Type}  [{n.Handle}]\nLayer: {n.Layer}",
+                    ToolTip = $"{n.Type}  [{n.Handle}]\nLayer: {n.Layer}\nNorm: ({n.NormX:F4}, {n.NormY:F4})",
                 };
 
                 var parts = n.Label.Split('\n');
@@ -437,9 +453,18 @@ namespace CADAgent
                     TextAlignment = WpfTextAlignment.Center,
                 };
 
+                var normLbl = new TextBlock
+                {
+                    Text          = $"({n.NormX:F3}, {n.NormY:F3})",
+                    Foreground    = new SolidColorBrush(Color.FromRgb(180, 180, 180)),
+                    FontSize      = 8,
+                    TextAlignment = WpfTextAlignment.Center,
+                };
+
                 var stack = new StackPanel { Orientation = Orientation.Vertical };
                 stack.Children.Add(ellipse);
                 stack.Children.Add(lbl);
+                stack.Children.Add(normLbl);
 
                 Canvas.SetLeft(stack, cx - r);
                 Canvas.SetTop(stack,  cy - r);
@@ -479,6 +504,35 @@ namespace CADAgent
             Canvas.SetLeft(legendBorder, 10);
             Canvas.SetTop(legendBorder,  10);
             _canvas.Children.Add(legendBorder);
+        }
+
+        // ── Layout ───────────────────────────────────────────────────────────
+
+        private static void ApplyRepulsion(
+            Dictionary<string, (double cx, double cy)> pos,
+            double minDist, int iterations = 60)
+        {
+            var keys = pos.Keys.ToList();
+            for (int iter = 0; iter < iterations; iter++)
+            {
+                var delta = keys.ToDictionary(k => k, _ => (dx: 0.0, dy: 0.0));
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    for (int j = i + 1; j < keys.Count; j++)
+                    {
+                        string a = keys[i], b = keys[j];
+                        double dx   = pos[b].cx - pos[a].cx;
+                        double dy   = pos[b].cy - pos[a].cy;
+                        double dist = Math.Max(Math.Sqrt(dx * dx + dy * dy), 0.1);
+                        if (dist >= minDist) continue;
+                        double force = (minDist - dist) / dist * 0.5;
+                        delta[a] = (delta[a].dx - dx * force, delta[a].dy - dy * force);
+                        delta[b] = (delta[b].dx + dx * force, delta[b].dy + dy * force);
+                    }
+                }
+                foreach (var k in keys)
+                    pos[k] = (pos[k].cx + delta[k].dx, pos[k].cy + delta[k].dy);
+            }
         }
 
         // ── Drag ─────────────────────────────────────────────────────────────
