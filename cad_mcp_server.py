@@ -1,4 +1,4 @@
-import requests
+﻿import requests
 import json, openpyxl, os
 from collections import defaultdict
 from mcp.server.fastmcp import FastMCP
@@ -15,6 +15,11 @@ _ALL_CATEGORIES = [
     "pipe_networks", "surfaces", "corridors",
     "blocks", "layers", "adjacency",
 ]
+
+# Per-session state: populated on the initial (no-arg) call, reused for chunked follow-ups.
+_MS_CACHE: dict | None = None   # full raw data from one AutoCAD fetch
+_MS_ACCUM: dict        = {}     # merged result across all chunks this session
+_MS_SAVE_PATH = os.path.join(os.path.expanduser("~"), "Downloads", "model_space_full.json")
 
 
 def _get(path: str) -> str:
@@ -44,17 +49,26 @@ def get_model_space(categories: list[str] | None = None) -> str:
 
     CHUNKING: if the response approaches 1 MB, partial data is returned with a
     "__remaining_categories__" field. You MUST call get_model_space again with
-    those categories and repeat until "__remaining_categories__" is absent."""
+    those categories and repeat until "__remaining_categories__" is absent.
+    The server accumulates every chunk automatically; the full JSON is written
+    to disk once all chunks have been retrieved."""
 
-    raw = _get("/modelspace")
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return raw
+    global _MS_CACHE, _MS_ACCUM
 
-    # When no categories specified, walk every known category in order.
-    # When categories are specified, walk only those — preserving caller order.
-    pool = _ALL_CATEGORIES if categories is None else categories
+    # Initial call: fetch fresh data from AutoCAD and reset accumulator.
+    if categories is None:
+        raw = _get("/modelspace")
+        try:
+            _MS_CACHE = json.loads(raw)
+        except Exception:
+            return raw
+        _MS_ACCUM = {}
+    else:
+        if _MS_CACHE is None:
+            return '{"error": "Call get_model_space() without arguments first to load drawing data."}'
+
+    data     = _MS_CACHE
+    pool     = _ALL_CATEGORIES if categories is None else categories
     to_fetch = [c for c in pool if c in data]
 
     result    = {}
@@ -67,6 +81,10 @@ def get_model_space(categories: list[str] | None = None) -> str:
             break
         result[cat] = data[cat]
 
+    # Merge this chunk into the session accumulator.
+    for cat, val in result.items():
+        _MS_ACCUM[cat] = val
+
     if remaining:
         result["__remaining_categories__"] = remaining
         result["__size_bytes__"]           = len(json.dumps(result).encode("utf-8"))
@@ -75,17 +93,40 @@ def get_model_space(categories: list[str] | None = None) -> str:
             f"Call get_model_space({remaining}) to retrieve the rest. "
             f"Repeat until __remaining_categories__ is absent."
         )
+    else:
+        # All chunks received — write the complete accumulated JSON to disk.
+        try:
+            os.makedirs(os.path.dirname(_MS_SAVE_PATH), exist_ok=True)
+            with open(_MS_SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(_MS_ACCUM, f)
+        except Exception:
+            pass  # don't fail the tool call if the save fails
 
     return json.dumps(result)
 
+
 @mcp.tool()
-def get_context() -> str:
-    """Returns the contents of a file on the server machine."""
+def query_model_space(category: str) -> str:
+    """Returns one category of data from the most recently fetched model space JSON.
+    Use this to look up specific drawing data without re-fetching everything from AutoCAD.
+    Prefer this over re-calling get_model_space when you only need one category.
+    Valid values: lines, arcs, polylines, alignments, pipe_networks,
+                  surfaces, corridors, blocks, layers, adjacency"""
+    # In-memory accumulator takes priority (current session, no disk I/O)
+    if category in _MS_ACCUM:
+        return json.dumps({category: _MS_ACCUM[category]})
+    # Fall back to saved file (data from a previous session)
     try:
-        with open(r"C:\Users\me\Downloads\driveway.md", "r", encoding="utf-8") as f:
-            return f.read()
+        with open(_MS_SAVE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if category in data:
+            return json.dumps({category: data[category]})
+        return json.dumps({"error": f"Category '{category}' not found.",
+                           "available": list(data.keys())})
+    except FileNotFoundError:
+        return '{"error": "No saved model space data. Call get_model_space() first."}'
     except Exception as e:
-        return f"Error: {e}"
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
@@ -291,7 +332,7 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
                         toAppend.append(f"{str(item)}: {val or ''}")
                 rows.append(toAppend)
 
-    path = r"C:\Users\me\Downloads\quantities.xlsx"
+    path = os.path.join(os.path.expanduser("~"), "Downloads", "quantities.xlsx")
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     wb = openpyxl.Workbook()

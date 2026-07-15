@@ -78,8 +78,10 @@ namespace CADAgent
             // Global model-space extents — must be inside document lock
             db.UpdateExt(true);
             double gMinX   = db.Extmin.X, gMinY   = db.Extmin.Y;
-            double gRangeX = Math.Max(db.Extmax.X - gMinX, 1.0);
-            double gRangeY = Math.Max(db.Extmax.Y - gMinY, 1.0);
+            double gMaxX   = db.Extmax.X, gMaxY   = db.Extmax.Y;
+            double gRangeX = Math.Max(gMaxX - gMinX, 1.0);
+            double gRangeY = Math.Max(gMaxY - gMinY, 1.0);
+            ed.WriteMessage($"\n  [NormDebug] Extmin=({gMinX:F2}, {gMinY:F2})  Extmax=({gMaxX:F2}, {gMaxY:F2})  Range=({gRangeX:F2}, {gRangeY:F2})");
             double NX(double wx) => (wx - gMinX) / gRangeX;
             double NY(double wy) => (wy - gMinY) / gRangeY;
 
@@ -133,7 +135,7 @@ namespace CADAgent
                         else if (obj is BlockReference br)
                         {
                             nodes.Add(new GraphNodeData(h, "Block", br.Layer,
-                                $"Blk\n{br.Name}", br.Position.X, br.Position.Y, NX(br.Position.X), NY(br.Position.Y)));
+                                $"Blk\n{br.Name}", br.Position.X, br.Position.Y, 0, 0));
                         }
                         else if (obj is CivilLabel lbl)
                         {
@@ -258,6 +260,35 @@ namespace CADAgent
             }
             } // end LockDocument
 
+            // Spatial adjacency for label nodes — same 1 ft threshold as SpatialHash,
+            // comparing the label's anchor point (WorldX/Y) to every other node's
+            // representative point.
+            {
+                var seen = new HashSet<(string, string)>(
+                    edges.Select(e => string.Compare(e.From, e.To, StringComparison.Ordinal) <= 0
+                                      ? (e.From, e.To) : (e.To, e.From)));
+
+                const double LabelThreshold = 1.0;
+                foreach (var lbl in nodes.Where(n => n.Type == "Label"))
+                {
+                    foreach (var other in nodes)
+                    {
+                        if (other.Handle == lbl.Handle) continue;
+                        double dx = other.WorldX - lbl.WorldX, dy = other.WorldY - lbl.WorldY;
+                        if (Math.Sqrt(dx * dx + dy * dy) > LabelThreshold) continue;
+                        var key = string.Compare(lbl.Handle, other.Handle, StringComparison.Ordinal) <= 0
+                                  ? (lbl.Handle, other.Handle) : (other.Handle, lbl.Handle);
+                        if (seen.Add(key))
+                            edges.Add(new GraphEdgeData(lbl.Handle, other.Handle, "adjacent"));
+                    }
+                }
+            }
+
+            if (nodes.Count > 0)
+            {
+                var s = nodes[0];
+                ed.WriteMessage($"\n  [NormDebug] First node: WorldX={s.WorldX:F2}, WorldY={s.WorldY:F2}  →  NormX={s.NormX:F4}, NormY={s.NormY:F4}");
+            }
             ed.WriteMessage($"\n  Graph: {nodes.Count} nodes, {edges.Count} edges in 50×50 ft region.\n");
 
             // Launch the WPF window on a dedicated STA thread so it doesn't block the command
@@ -510,11 +541,12 @@ namespace CADAgent
 
         private static void ApplyRepulsion(
             Dictionary<string, (double cx, double cy)> pos,
-            double minDist, int iterations = 60)
+            double minDist, int maxIterations = 400)
         {
             var keys = pos.Keys.ToList();
-            for (int iter = 0; iter < iterations; iter++)
+            for (int iter = 0; iter < maxIterations; iter++)
             {
+                bool anyOverlap = false;
                 var delta = keys.ToDictionary(k => k, _ => (dx: 0.0, dy: 0.0));
                 for (int i = 0; i < keys.Count; i++)
                 {
@@ -523,13 +555,17 @@ namespace CADAgent
                         string a = keys[i], b = keys[j];
                         double dx   = pos[b].cx - pos[a].cx;
                         double dy   = pos[b].cy - pos[a].cy;
-                        double dist = Math.Max(Math.Sqrt(dx * dx + dy * dy), 0.1);
+                        double dist = Math.Max(Math.Sqrt(dx * dx + dy * dy), 0.01);
                         if (dist >= minDist) continue;
-                        double force = (minDist - dist) / dist * 0.5;
-                        delta[a] = (delta[a].dx - dx * force, delta[a].dy - dy * force);
-                        delta[b] = (delta[b].dx + dx * force, delta[b].dy + dy * force);
+                        anyOverlap = true;
+                        // Push each node half the overlap distance in opposite directions
+                        double push = (minDist - dist) * 0.5;
+                        double nx = dx / dist, ny = dy / dist;
+                        delta[a] = (delta[a].dx - nx * push, delta[a].dy - ny * push);
+                        delta[b] = (delta[b].dx + nx * push, delta[b].dy + ny * push);
                     }
                 }
+                if (!anyOverlap) break;  // fully separated — stop early
                 foreach (var k in keys)
                     pos[k] = (pos[k].cx + delta[k].dx, pos[k].cy + delta[k].dy);
             }
