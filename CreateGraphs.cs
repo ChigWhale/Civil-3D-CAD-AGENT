@@ -43,31 +43,38 @@ public class GNNGraphCreator
         {
             var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
             var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
-            List<ObjectId> allLabels = new();
 
             //Grabbing the object Id for all labels in modelspace
             foreach (ObjectId id in ms)
             {
                 if (tr.GetObject(id, OpenMode.ForRead) is CivilLabel label && label.Dragged)
                 {
-                    allLabels.Add(id);
+                    makeGraphLabel(ms, tr, db);
                 }
-            }  
-
-            foreach (ObjectId draggedLabels in allLabels)
-            {
-                for (int hold = 0; hold < 5; hold++)
-                {
-                    
-                } 
-            }        
+            }         
         }
     }
 
-    public List<ObjectId> GetNearObj(ObjectId center)
+    public List<(ObjectId, Point3d)> makeGraphLabel(BlockTableRecord ms, Transaction tr, Database db)
     {
-        List<ObjectId> hold = new();
+        var geometryNodes = new List<(ObjectId id, Point3d position)>();
+        Point3d minPoint = db.Extmin;
+        Point3d maxPoint = db.Extmax;
 
-        return hold;
+        foreach (ObjectId id in ms)
+        {
+            var ent = tr.GetObject(id, OpenMode.ForRead) as AcadEntity;
+            if (ent == null)
+            {
+                continue;
+            }
+
+            if(!(ent is BlockReference))
+            {
+                
+            }
+        }
+
+        return geometryNodes;
     }
 }
