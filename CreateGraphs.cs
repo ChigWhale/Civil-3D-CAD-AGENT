@@ -23,14 +23,6 @@ using CivilLabel         = Autodesk.Civil.DatabaseServices.Label;
 using AcadEntity         = Autodesk.AutoCAD.DatabaseServices.Entity;
 using AcadLine           = Autodesk.AutoCAD.DatabaseServices.Line;
 using AcadPolyline       = Autodesk.AutoCAD.DatabaseServices.Polyline;
-using WpfDoubleCollection = System.Windows.Media.DoubleCollection;
-using WpfEllipse         = System.Windows.Shapes.Ellipse;
-using WpfLine            = System.Windows.Shapes.Line;
-using WpfPoint           = System.Windows.Point;
-using WpfTextAlignment   = System.Windows.TextAlignment;
-using System.ComponentModel.DataAnnotations.Schema;
-using System.ComponentModel;
-using Autodesk.Civil.DatabaseServices.Styles;
 
 public class GNNGraphCreator
 {
@@ -142,13 +134,36 @@ public class GNNGraphCreator
                 return (nodeFeature, nodeCoord);
 
             case CivilLabel label:
+                Point3d normalizedLabelPoint = new Point3d((label.LabelLocation.X-minPoint.X)/(maxPoint.X-minPoint.X),(label.LabelLocation.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                nodeFeature.Add((nodeNum, new List<double> {normalizedLabelPoint.X, normalizedLabelPoint.Y}));
+                nodeCoord.Add((nodeNum, new List<double> {label.LabelLocation.X, label.LabelLocation.Y}));
+                nodeNum += 1;
                 break;
             
             case BlockReference br:
                 BlockTableRecord btr = tr.GetObject(br.BlockTableRecord, OpenMode.ForRead) as BlockTableRecord;
                 foreach (ObjectId entId in btr)
                 {
-                    
+                    AcadEntity ent = tr.GetObject(entId, OpenMode.ForRead) as AcadEntity;
+                    switch(ent)
+                    {
+                        case AcadLine ln:
+                            Point3d transformedStartPoint = ln.StartPoint.TransformBy(br.BlockTransform);
+                            Point3d transformedEndPoint = ln.EndPoint.TransformBy(br.BlockTransform);
+                            Point3d normalizedBlockStartLine = new Point3d((transformedStartPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedStartPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                            Point3d normalizedBlockEndLine = new Point3d((transformedEndPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedEndPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                            nodeFeature.Add((nodeNum, new List<double> {normalizedBlockStartLine.X, normalizedBlockStartLine.Y}));
+                            nodeCoord.Add((nodeNum, new List<double> {transformedStartPoint.X, transformedStartPoint.Y}));
+                            nodeNum += 1;
+                            nodeFeature.Add((nodeNum, new List<double> {normalizedBlockEndLine.X, normalizedBlockEndLine.Y}));
+                            nodeCoord.Add((nodeNum, new List<double> {transformedEndPoint.X, transformedEndPoint.Y}));
+                            nodeNum += 1;
+                            break;
+
+                        case Arc ar:
+                            Point3d transformedArcCenter = ar.Center.TransformBy(br.BlockTransform);
+                            break;
+                    }
                 }
                 break;
         }
