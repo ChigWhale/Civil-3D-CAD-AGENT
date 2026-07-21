@@ -23,6 +23,7 @@ using CivilLabel         = Autodesk.Civil.DatabaseServices.Label;
 using AcadEntity         = Autodesk.AutoCAD.DatabaseServices.Entity;
 using AcadLine           = Autodesk.AutoCAD.DatabaseServices.Line;
 using AcadPolyline       = Autodesk.AutoCAD.DatabaseServices.Polyline;
+using Autodesk.AutoCAD.Windows;
 
 public class GNNGraphCreator
 {
@@ -55,8 +56,10 @@ public class GNNGraphCreator
         {
             var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
             var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
-            Dictionary<int,List<double>> nodes = new Dictionary<int,List<double>>();
-            Dictionary<int,List<double>> edgeCreation = new Dictionary<int,List<double>>();
+            List<(int,List<double>)> nodes = new List<(int,List<double>)>();
+            List<(int,List<double>)> edgeCreation = new List<(int,List<double>)>();
+            List<int> fromList = new List<int>();
+            List<int> toList = new List<int>();
 
             //Grabbing the object Id for all labels in modelspace
             foreach (ObjectId id in ms)
@@ -67,19 +70,29 @@ public class GNNGraphCreator
                     Point3d labelPoint = graphStart.LabelLocation;
                     double pointX = labelPoint.X;
                     double pointY = labelPoint.Y;
-                    (nodes, edgeCreation) = makeGraphFeatures(tr, id, pointX, pointY);
-                    writeGraphToFile();
+                    (nodes, edgeCreation) = makeGraph(tr, id, pointX, pointY);
+                    (fromList, toList) = makeGraphEdges(edgeCreation);
+                    if(isLabel)
+                    {
+                        Point3d displacement = graphStart.LabelLocation - graphStart.DraggedOffset;
+                        List<double> disp = new List<double> {displacement.X, displacement.Y};
+                        writeGraphToFile(fromList, toList, nodes, disp);
+                    }
+                    else
+                    {
+                        writeGraphToFile(fromList, toList, nodes);
+                    }
                 }
             }         
         }
     }
 
-    public (Dictionary<int,List<double>>,Dictionary<int,List<double>>) makeGraphFeatures(Transaction tr, ObjectId labelID, double labelPointX, double labelPointY, int boxing = 50, int proximity = 20)
+    public (List<(int,List<double>)>,List<(int,List<double>)>) makeGraph(Transaction tr, ObjectId labelID, double labelPointX, double labelPointY, double boxing = 50.0, double proximity = 20.0)
     {
         Point3d graphMin = new Point3d(labelPointX - boxing, labelPointY - boxing, 0);
         Point3d graphMax = new Point3d(labelPointX + boxing, labelPointY + boxing, 0);
-        Dictionary<int,List<double>> nodes = new Dictionary<int,List<double>>();
-        Dictionary<int,List<double>> edgeCreation = new Dictionary<int,List<double>>();
+        List<(int,List<double>)> nodes = new List<(int,List<double>)>();
+        List<(int,List<double>)> edgeCreation = new List<(int,List<double>)>();
         int nodeNum = 0;
 
         PromptSelectionResult boxedObj = ed.SelectCrossingWindow(graphMin, graphMax);
@@ -88,14 +101,37 @@ public class GNNGraphCreator
         {
             var ent = tr.GetObject(withinBox.ObjectId, OpenMode.ForRead) as AcadEntity;
             (List<(int,List<double>)> nodeFeature, List<(int,List<double>)> nodeCoord) = getObjPoint(ent, tr, graphMin, graphMax, nodeNum);
+            for (int i = 0; i < nodeFeature.Count; i++)
+            {
+                nodes.Add(nodeFeature[i]);
+                edgeCreation.Add(nodeCoord[i]);
+            }
         }
-
         return (nodes, edgeCreation);
     }
 
-    public void makeGraphEdges()
+    public (List<int>, List<int>) makeGraphEdges(List<(int,List<double>)> edgeCreation, double proximity = 20.0)
     {
-        
+        List<int> fromList = new List<int>();
+        List<int> toList = new List<int>();
+
+        for (int k = 0; k < edgeCreation.Count; k++)
+        {
+            List<double> nodeInQuestion = edgeCreation[k].Item2;
+            for(int j = 0; j < edgeCreation.Count; j++)
+            {
+                if(nodeInQuestion[0] - proximity <= edgeCreation[j].Item2[0] && 
+                edgeCreation[j].Item2[0] <= nodeInQuestion[0] + proximity &&
+                nodeInQuestion[1] - proximity <= edgeCreation[j].Item2[1] && 
+                edgeCreation[j].Item2[1] <= nodeInQuestion[1] + proximity && k != j)
+                {
+                    fromList.Add(edgeCreation[k].Item1);
+                    toList.Add(edgeCreation[j].Item1);
+                }
+            }
+        }  
+
+        return (fromList, toList); 
     }
 
     public (List<(int,List<double>)>,List<(int,List<double>)>) getObjPoint(AcadEntity entity, Transaction tr, Point3d graphMin, Point3d graphMax, int nodeNum)
@@ -158,18 +194,41 @@ public class GNNGraphCreator
                             nodeFeature.Add((nodeNum, new List<double> {normalizedBlockEndLine.X, normalizedBlockEndLine.Y}));
                             nodeCoord.Add((nodeNum, new List<double> {transformedEndPoint.X, transformedEndPoint.Y}));
                             nodeNum += 1;
-                            break;
+                            return (nodeFeature, nodeCoord);
 
                         case Arc ar:
                             Point3d transformedArcCenter = ar.Center.TransformBy(br.BlockTransform);
-                            break;
+                            Point3d normalizedBlockArcCenter = new Point3d((transformedArcCenter.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedArcCenter.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                            nodeFeature.Add((nodeNum, new List<double> {normalizedBlockArcCenter.X, normalizedBlockArcCenter.Y}));
+                            nodeCoord.Add((nodeNum, new List<double> {transformedArcCenter.X, transformedArcCenter.Y}));
+                            nodeNum += 1;
+                            return (nodeFeature, nodeCoord);
+                        
+                        case AcadPolyline pl:
+                            for (int k = 0; k < pl.NumberOfVertices; k++)
+                            {
+                                Point3d transformedVertex = pl.GetPoint3dAt(k).TransformBy(br.BlockTransform);
+                                Point3d normalizedBlockVertex = new Point3d((transformedVertex.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedVertex.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                                nodeFeature.Add((nodeNum, new List<double> {normalizedBlockVertex.X, normalizedBlockVertex.Y}));
+                                nodeCoord.Add((nodeNum, new List<double> {transformedVertex.X, transformedVertex.Y}));
+                                nodeNum += 1;
+                            }
+                            return (nodeFeature, nodeCoord);
+
+                        case CivilLabel label:
+                            Point3d transformedLabelPoint = label.LabelLocation.TransformBy(br.BlockTransform);
+                            Point3d normalizedBlockLabelPoint = new Point3d((transformedLabelPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedLabelPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                            nodeFeature.Add((nodeNum, new List<double> {normalizedBlockLabelPoint.X, normalizedBlockLabelPoint.Y}));
+                            nodeCoord.Add((nodeNum, new List<double> {transformedLabelPoint.X, transformedLabelPoint.Y}));
+                            nodeNum += 1;
+                            return (nodeFeature, nodeCoord);
                     }
                 }
                 break;
         }
         return (nodeFeature,nodeCoord);
     }
-    public void writeGraphToFile()
+    public void writeGraphToFile(List<int> fromList, List<int> toList, List<(int,List<double>)> nodes, List<double> graphLabel = null)
     {
         
     }
