@@ -1,12 +1,5 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Input;
-using System.Windows.Media;
-using System.Windows.Shapes;
 using Newtonsoft.Json;
 using System.IO;
 using Autodesk.AutoCAD.ApplicationServices;
@@ -23,8 +16,9 @@ using CivilLabel         = Autodesk.Civil.DatabaseServices.Label;
 using AcadEntity         = Autodesk.AutoCAD.DatabaseServices.Entity;
 using AcadLine           = Autodesk.AutoCAD.DatabaseServices.Line;
 using AcadPolyline       = Autodesk.AutoCAD.DatabaseServices.Polyline;
-using Autodesk.AutoCAD.Windows;
 
+namespace CADAgent
+{
 public class GNNGraphCreator
 {
         private Document doc;
@@ -33,7 +27,7 @@ public class GNNGraphCreator
         private Point3d minPoint;
         private Point3d maxPoint;
 
-    [CommandMethod("GNNGraphCreator")]
+    [CommandMethod("GraphNeuralNetworkCreator")]
     public void CreateGraph()
     {
         //Creating gloabal variables, and needed objects for transactions
@@ -100,7 +94,7 @@ public class GNNGraphCreator
         foreach (SelectedObject withinBox in boxedObj.Value)
         {
             var ent = tr.GetObject(withinBox.ObjectId, OpenMode.ForRead) as AcadEntity;
-            (List<(int,List<double>)> nodeFeature, List<(int,List<double>)> nodeCoord) = getObjPoint(ent, tr, graphMin, graphMax, nodeNum);
+            (List<(int,List<double>)> nodeFeature, List<(int,List<double>)> nodeCoord) = getObjPoint(ent, tr, graphMin, graphMax, ref nodeNum);
             for (int i = 0; i < nodeFeature.Count; i++)
             {
                 nodes.Add(nodeFeature[i]);
@@ -134,7 +128,7 @@ public class GNNGraphCreator
         return (fromList, toList); 
     }
 
-    public (List<(int,List<double>)>,List<(int,List<double>)>) getObjPoint(AcadEntity entity, Transaction tr, Point3d graphMin, Point3d graphMax, int nodeNum)
+    public (List<(int,List<double>)>,List<(int,List<double>)>) getObjPoint(AcadEntity entity, Transaction tr, Point3d graphMin, Point3d graphMax, ref int nodeNum)
     {
         List<(int,List<double>)> nodeFeature = new List<(int,List<double>)>();
         List<(int,List<double>)> nodeCoord = new List<(int,List<double>)>();
@@ -150,24 +144,24 @@ public class GNNGraphCreator
                 nodeFeature.Add((nodeNum, new List<double> {normalizedEndLine.X, normalizedEndLine.Y}));
                 nodeCoord.Add((nodeNum, new List<double> {ln.EndPoint.X, ln.EndPoint.Y}));
                 nodeNum += 1;
-                return (nodeFeature, nodeCoord);
+                break;
             
             case Arc ar:
-                Point3d normalizedArcCenter = new Point3d((ar.Center.X-minPoint.X)/(maxPoint.X-maxPoint.Y),(ar.Center.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                Point3d normalizedArcCenter = new Point3d((ar.Center.X-minPoint.X)/(maxPoint.X-minPoint.X),(ar.Center.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
                 nodeFeature.Add((nodeNum, new List<double> {normalizedArcCenter.X, normalizedArcCenter.Y}));
                 nodeCoord.Add((nodeNum, new List<double> {ar.Center.X, ar.Center.Y}));
                 nodeNum += 1;
-                return (nodeFeature, nodeCoord);
+                break;
             
             case AcadPolyline pl:
                 for (int k = 0; k < pl.NumberOfVertices; k++)
                 {
-                    Point3d normalizedvertex = new Point3d((pl.GetPoint3dAt(k).X-minPoint.X)/(maxPoint.X-minPoint.X),(pl.GetPointAtDist(k).Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                    Point3d normalizedvertex = new Point3d((pl.GetPoint3dAt(k).X-minPoint.X)/(maxPoint.X-minPoint.X),(pl.GetPoint3dAt(k).Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
                     nodeFeature.Add((nodeNum, new List<double> {normalizedvertex.X, normalizedvertex.Y}));
-                    nodeCoord.Add((nodeNum, new List<double> {pl.GetPoint3dAt(k).X, pl.GetPointAtDist(k).Y}));
+                    nodeCoord.Add((nodeNum, new List<double> {pl.GetPoint3dAt(k).X, pl.GetPoint3dAt(k).Y}));
                     nodeNum += 1;
                 }
-                return (nodeFeature, nodeCoord);
+                break;
 
             case CivilLabel label:
                 Point3d normalizedLabelPoint = new Point3d((label.LabelLocation.X-minPoint.X)/(maxPoint.X-minPoint.X),(label.LabelLocation.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
@@ -194,7 +188,7 @@ public class GNNGraphCreator
                             nodeFeature.Add((nodeNum, new List<double> {normalizedBlockEndLine.X, normalizedBlockEndLine.Y}));
                             nodeCoord.Add((nodeNum, new List<double> {transformedEndPoint.X, transformedEndPoint.Y}));
                             nodeNum += 1;
-                            return (nodeFeature, nodeCoord);
+                            break;
 
                         case Arc ar:
                             Point3d transformedArcCenter = ar.Center.TransformBy(br.BlockTransform);
@@ -202,7 +196,7 @@ public class GNNGraphCreator
                             nodeFeature.Add((nodeNum, new List<double> {normalizedBlockArcCenter.X, normalizedBlockArcCenter.Y}));
                             nodeCoord.Add((nodeNum, new List<double> {transformedArcCenter.X, transformedArcCenter.Y}));
                             nodeNum += 1;
-                            return (nodeFeature, nodeCoord);
+                            break;
                         
                         case AcadPolyline pl:
                             for (int k = 0; k < pl.NumberOfVertices; k++)
@@ -213,7 +207,7 @@ public class GNNGraphCreator
                                 nodeCoord.Add((nodeNum, new List<double> {transformedVertex.X, transformedVertex.Y}));
                                 nodeNum += 1;
                             }
-                            return (nodeFeature, nodeCoord);
+                            break;
 
                         case CivilLabel label:
                             Point3d transformedLabelPoint = label.LabelLocation.TransformBy(br.BlockTransform);
@@ -221,7 +215,7 @@ public class GNNGraphCreator
                             nodeFeature.Add((nodeNum, new List<double> {normalizedBlockLabelPoint.X, normalizedBlockLabelPoint.Y}));
                             nodeCoord.Add((nodeNum, new List<double> {transformedLabelPoint.X, transformedLabelPoint.Y}));
                             nodeNum += 1;
-                            return (nodeFeature, nodeCoord);
+                            break;
                     }
                 }
                 break;
@@ -230,6 +224,22 @@ public class GNNGraphCreator
     }
     public void writeGraphToFile(List<int> fromList, List<int> toList, List<(int,List<double>)> nodes, List<double> graphLabel = null)
     {
-        
+        var toBeJSON = new Dictionary<string, object>();
+
+        toBeJSON["From"] = fromList;
+        toBeJSON["To"] = toList;
+        toBeJSON["Features"] = nodes;
+        if(graphLabel != null)
+        {
+            toBeJSON["Label"] = graphLabel;
+        }
+
+        string json = JsonConvert.SerializeObject(toBeJSON);
+        string folderPath = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),"Downloads", "JSON GNN Representation");
+        Directory.CreateDirectory(folderPath);
+
+        string filePath = System.IO.Path.Combine(folderPath, $"graph_{DateTime.Now:yyyyMMdd_HHmmss}.json");
+        File.WriteAllText(filePath, json);
     }
+}
 }
