@@ -17,6 +17,8 @@ using AcadEntity         = Autodesk.AutoCAD.DatabaseServices.Entity;
 using AcadLine           = Autodesk.AutoCAD.DatabaseServices.Line;
 using AcadPolyline       = Autodesk.AutoCAD.DatabaseServices.Polyline;
 
+[assembly: CommandClass(typeof(CADAgent.GNNGraphCreator))]
+
 namespace CADAgent
 {
 public class GNNGraphCreator
@@ -68,8 +70,7 @@ public class GNNGraphCreator
                     (fromList, toList) = makeGraphEdges(edgeCreation);
                     if(isLabel)
                     {
-                        Point3d displacement = graphStart.LabelLocation - graphStart.DraggedOffset;
-                        List<double> disp = new List<double> {displacement.X, displacement.Y};
+                        List<double> disp = new List<double> {graphStart.DraggedOffset.X, graphStart.DraggedOffset.Y};
                         writeGraphToFile(fromList, toList, nodes, disp);
                     }
                     else
