@@ -47,6 +47,9 @@ public class GNNGraphCreator
         {
             isLabel = true;
         }
+        PromptStringOptions project = new PromptStringOptions("What project are these graphs for: ");
+        PromptResult result = ed.GetString(project);
+        string projectInput = result.StringResult;
 
         using (Transaction tr = db.TransactionManager.StartTransaction())
         {
@@ -56,6 +59,7 @@ public class GNNGraphCreator
             List<(int,List<double>)> edgeCreation = new List<(int,List<double>)>();
             List<int> fromList = new List<int>();
             List<int> toList = new List<int>();
+            int graphNum = 1;
 
             //Grabbing the object Id for all labels in modelspace
             foreach (ObjectId id in ms)
@@ -71,12 +75,13 @@ public class GNNGraphCreator
                     if(isLabel)
                     {
                         List<double> disp = new List<double> {graphStart.DraggedOffset.X, graphStart.DraggedOffset.Y};
-                        writeGraphToFile(fromList, toList, nodes, disp);
+                        writeGraphToFile(fromList, toList, nodes, projectInput, ref graphNum, disp);
                     }
                     else
                     {
-                        writeGraphToFile(fromList, toList, nodes);
+                        writeGraphToFile(fromList, toList, nodes, projectInput, ref graphNum);
                     }
+                    graphNum += 1;
                 }
             }         
         }
@@ -88,7 +93,7 @@ public class GNNGraphCreator
         Point3d graphMax = new Point3d(labelPointX + boxing, labelPointY + boxing, 0);
         List<(int,List<double>)> nodes = new List<(int,List<double>)>();
         List<(int,List<double>)> edgeCreation = new List<(int,List<double>)>();
-        int nodeNum = 0;
+        int nodeNum = 1;
 
         PromptSelectionResult boxedObj = ed.SelectCrossingWindow(graphMin, graphMax);
 
@@ -223,7 +228,7 @@ public class GNNGraphCreator
         }
         return (nodeFeature,nodeCoord);
     }
-    public void writeGraphToFile(List<int> fromList, List<int> toList, List<(int,List<double>)> nodes, List<double> graphLabel = null)
+    public void writeGraphToFile(List<int> fromList, List<int> toList, List<(int Node,List<double> normalizedCoords)> nodes, string project, ref int graphNum, List<double> graphLabel = null)
     {
         var toBeJSON = new Dictionary<string, object>();
 
@@ -239,7 +244,8 @@ public class GNNGraphCreator
         string folderPath = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),"Downloads", "JSON GNN Representation");
         Directory.CreateDirectory(folderPath);
 
-        string filePath = System.IO.Path.Combine(folderPath, $"graph_{DateTime.Now:yyyyMMdd_HHmmss}.json");
+        string filePath = System.IO.Path.Combine(folderPath, $"graph_{DateTime.Now:yyyyMMdd_HHmmssff}_{project}_{graphNum}.json"
+);
         File.WriteAllText(filePath, json);
     }
 }
