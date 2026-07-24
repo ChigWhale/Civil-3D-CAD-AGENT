@@ -87,7 +87,7 @@ public class GNNGraphCreator
         }
     }
 
-    public (List<(int,List<double>)>,List<(int,List<double>)>) makeGraph(Transaction tr, ObjectId labelID, double labelPointX, double labelPointY, double boxing = 50.0, double proximity = 20.0)
+    public (List<(int,List<double>)>,List<(int,List<double>)>) makeGraph(Transaction tr, ObjectId labelID, double labelPointX, double labelPointY, double boxing = 20.0, double proximity = 10.0)
     {
         Point3d graphMin = new Point3d(labelPointX - boxing, labelPointY - boxing, 0);
         Point3d graphMax = new Point3d(labelPointX + boxing, labelPointY + boxing, 0);
@@ -96,6 +96,7 @@ public class GNNGraphCreator
         int nodeNum = 1;
 
         PromptSelectionResult boxedObj = ed.SelectCrossingWindow(graphMin, graphMax);
+        if (boxedObj.Status != PromptStatus.OK) return (nodes, edgeCreation);
 
         foreach (SelectedObject withinBox in boxedObj.Value)
         {
