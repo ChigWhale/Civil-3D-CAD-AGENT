@@ -28,7 +28,8 @@ num_epochs = 200
 
 show_graph = input("Show training visualization? (y/n): ").strip().lower() == "y"
 
-plot_data = {"xs": [], "ys": [], "zs": [], "colors": [], "paused": False}
+plot_data = {"xs": [], "ys": [], "zs": [], "colors": [], "batch_nums": [], "paused": False}
+batch_num = 1
 
 def epoch_color(epoch):
     third = num_epochs / 3
@@ -52,10 +53,19 @@ def run_plot():
 
     pause_btn.on_clicked(toggle_pause)
 
+    window_size = 5
+
     def update(frame):
         ax.clear()
-        if plot_data["xs"]:
-            ax.scatter(plot_data["xs"], plot_data["ys"], plot_data["zs"], c=plot_data["colors"])
+        xs = plot_data["xs"][-window_size:]
+        ys = plot_data["ys"][-window_size:]
+        zs = plot_data["zs"][-window_size:]
+        colors = plot_data["colors"][-window_size:]
+        batch_nums = plot_data["batch_nums"][-window_size:]
+        if xs:
+            ax.scatter(xs, ys, zs, c=colors)
+            for x, y, z, n in zip(xs, ys, zs, batch_nums):
+                ax.text(x, y, z, str(n))
         ax.set_xlabel("X Dist. Error")
         ax.set_ylabel("Y Dist. Error")
         ax.set_zlabel("Tot. Error")
@@ -69,7 +79,7 @@ if show_graph:
     plot_thread.start()
 
 for epoch in range(num_epochs):
-    for batch in loader:
+    for batch_in_epoch, batch in enumerate(loader, start=1):
         optimizer.zero_grad()
         out = model(batch)
         out_pooled = global_mean_pool(out, batch.batch)
@@ -83,12 +93,17 @@ for epoch in range(num_epochs):
         y_loss = per_dim[1].item()
         tot_loss = (x_loss + y_loss) / 2
 
+        print(f"epoch {epoch + 1}: batch {batch_in_epoch}: Training error: {tot_loss}")
+
         if show_graph:
             plot_data["xs"].append(x_loss)
             plot_data["ys"].append(y_loss)
             plot_data["zs"].append(tot_loss)
             plot_data["colors"].append(epoch_color(epoch))
+            plot_data["batch_nums"].append(batch_num)
             while plot_data["paused"]:
                 time.sleep(0.1)
+
+        batch_num += 1
 
 torch.save(model.state_dict(), "gnn_weights.pt")
