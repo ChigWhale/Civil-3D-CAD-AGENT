@@ -245,8 +245,7 @@ public class GNNGraphCreator
         string folderPath = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),"Downloads", "JSON GNN Representation");
         Directory.CreateDirectory(folderPath);
 
-        string filePath = System.IO.Path.Combine(folderPath, $"graph_{DateTime.Now:yyyyMMdd_HHmmssff}_{project}_{graphNum}.json"
-);
+        string filePath = System.IO.Path.Combine(folderPath, $"graph_{DateTime.Now:yyyyMMdd_HHmmssff}_{project}_{graphNum}.json");
         File.WriteAllText(filePath, json);
     }
 }
