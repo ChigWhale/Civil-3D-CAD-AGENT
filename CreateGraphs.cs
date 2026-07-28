@@ -95,11 +95,23 @@ public class GNNGraphCreator
         List<(int,List<double>)> edgeCreation = new List<(int,List<double>)>();
         int nodeNum = 1;
 
+        // Always include the originating label itself as a node, regardless of whether the
+        // crossing-window selection below finds it or anything else nearby — otherwise a
+        // label with nothing else around it produces a totally empty graph.
+        var labelEntity = tr.GetObject(labelID, OpenMode.ForRead) as AcadEntity;
+        if (labelEntity != null)
+        {
+            (List<(int,List<double>)> labelFeature, List<(int,List<double>)> labelCoord) = getObjPoint(labelEntity, tr, graphMin, graphMax, ref nodeNum);
+            nodes.AddRange(labelFeature);
+            edgeCreation.AddRange(labelCoord);
+        }
+
         PromptSelectionResult boxedObj = ed.SelectCrossingWindow(graphMin, graphMax);
         if (boxedObj.Status != PromptStatus.OK) return (nodes, edgeCreation);
 
         foreach (SelectedObject withinBox in boxedObj.Value)
         {
+            if (withinBox.ObjectId == labelID) continue; // already added above
             var ent = tr.GetObject(withinBox.ObjectId, OpenMode.ForRead) as AcadEntity;
             (List<(int,List<double>)> nodeFeature, List<(int,List<double>)> nodeCoord) = getObjPoint(ent, tr, graphMin, graphMax, ref nodeNum);
             for (int i = 0; i < nodeFeature.Count; i++)
@@ -143,40 +155,54 @@ public class GNNGraphCreator
         switch(entity)
         {
             case AcadLine ln:
-                Point3d normalizedStartLine = new Point3d((ln.StartPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(ln.StartPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
-                Point3d normalizedEndLine = new Point3d((ln.EndPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(ln.EndPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
-                nodeFeature.Add((nodeNum, new List<double> {normalizedStartLine.X, normalizedStartLine.Y}));
-                nodeCoord.Add((nodeNum, new List<double> {ln.StartPoint.X, ln.StartPoint.Y}));
-                nodeNum += 1;
-                nodeFeature.Add((nodeNum, new List<double> {normalizedEndLine.X, normalizedEndLine.Y}));
-                nodeCoord.Add((nodeNum, new List<double> {ln.EndPoint.X, ln.EndPoint.Y}));
-                nodeNum += 1;
+                if (IsWithinBox(ln.StartPoint, graphMin, graphMax))
+                {
+                    Point3d normalizedStartLine = new Point3d((ln.StartPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(ln.StartPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                    nodeFeature.Add((nodeNum, new List<double> {normalizedStartLine.X, normalizedStartLine.Y}));
+                    nodeCoord.Add((nodeNum, new List<double> {ln.StartPoint.X, ln.StartPoint.Y}));
+                    nodeNum += 1;
+                }
+                if (IsWithinBox(ln.EndPoint, graphMin, graphMax))
+                {
+                    Point3d normalizedEndLine = new Point3d((ln.EndPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(ln.EndPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                    nodeFeature.Add((nodeNum, new List<double> {normalizedEndLine.X, normalizedEndLine.Y}));
+                    nodeCoord.Add((nodeNum, new List<double> {ln.EndPoint.X, ln.EndPoint.Y}));
+                    nodeNum += 1;
+                }
                 break;
-            
+
             case Arc ar:
-                Point3d normalizedArcCenter = new Point3d((ar.Center.X-minPoint.X)/(maxPoint.X-minPoint.X),(ar.Center.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
-                nodeFeature.Add((nodeNum, new List<double> {normalizedArcCenter.X, normalizedArcCenter.Y}));
-                nodeCoord.Add((nodeNum, new List<double> {ar.Center.X, ar.Center.Y}));
-                nodeNum += 1;
+                if (IsWithinBox(ar.Center, graphMin, graphMax))
+                {
+                    Point3d normalizedArcCenter = new Point3d((ar.Center.X-minPoint.X)/(maxPoint.X-minPoint.X),(ar.Center.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                    nodeFeature.Add((nodeNum, new List<double> {normalizedArcCenter.X, normalizedArcCenter.Y}));
+                    nodeCoord.Add((nodeNum, new List<double> {ar.Center.X, ar.Center.Y}));
+                    nodeNum += 1;
+                }
                 break;
-            
+
             case AcadPolyline pl:
                 for (int k = 0; k < pl.NumberOfVertices; k++)
                 {
-                    Point3d normalizedvertex = new Point3d((pl.GetPoint3dAt(k).X-minPoint.X)/(maxPoint.X-minPoint.X),(pl.GetPoint3dAt(k).Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                    Point3d vertex = pl.GetPoint3dAt(k);
+                    if (!IsWithinBox(vertex, graphMin, graphMax)) continue;
+                    Point3d normalizedvertex = new Point3d((vertex.X-minPoint.X)/(maxPoint.X-minPoint.X),(vertex.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
                     nodeFeature.Add((nodeNum, new List<double> {normalizedvertex.X, normalizedvertex.Y}));
-                    nodeCoord.Add((nodeNum, new List<double> {pl.GetPoint3dAt(k).X, pl.GetPoint3dAt(k).Y}));
+                    nodeCoord.Add((nodeNum, new List<double> {vertex.X, vertex.Y}));
                     nodeNum += 1;
                 }
                 break;
 
             case CivilLabel label:
-                Point3d normalizedLabelPoint = new Point3d((label.LabelLocation.X-minPoint.X)/(maxPoint.X-minPoint.X),(label.LabelLocation.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
-                nodeFeature.Add((nodeNum, new List<double> {normalizedLabelPoint.X, normalizedLabelPoint.Y}));
-                nodeCoord.Add((nodeNum, new List<double> {label.LabelLocation.X, label.LabelLocation.Y}));
-                nodeNum += 1;
+                if (IsWithinBox(label.LabelLocation, graphMin, graphMax))
+                {
+                    Point3d normalizedLabelPoint = new Point3d((label.LabelLocation.X-minPoint.X)/(maxPoint.X-minPoint.X),(label.LabelLocation.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                    nodeFeature.Add((nodeNum, new List<double> {normalizedLabelPoint.X, normalizedLabelPoint.Y}));
+                    nodeCoord.Add((nodeNum, new List<double> {label.LabelLocation.X, label.LabelLocation.Y}));
+                    nodeNum += 1;
+                }
                 break;
-            
+
             case BlockReference br:
                 BlockTableRecord btr = tr.GetObject(br.BlockTableRecord, OpenMode.ForRead) as BlockTableRecord;
                 foreach (ObjectId entId in btr)
@@ -187,28 +213,38 @@ public class GNNGraphCreator
                         case AcadLine ln:
                             Point3d transformedStartPoint = ln.StartPoint.TransformBy(br.BlockTransform);
                             Point3d transformedEndPoint = ln.EndPoint.TransformBy(br.BlockTransform);
-                            Point3d normalizedBlockStartLine = new Point3d((transformedStartPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedStartPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
-                            Point3d normalizedBlockEndLine = new Point3d((transformedEndPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedEndPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
-                            nodeFeature.Add((nodeNum, new List<double> {normalizedBlockStartLine.X, normalizedBlockStartLine.Y}));
-                            nodeCoord.Add((nodeNum, new List<double> {transformedStartPoint.X, transformedStartPoint.Y}));
-                            nodeNum += 1;
-                            nodeFeature.Add((nodeNum, new List<double> {normalizedBlockEndLine.X, normalizedBlockEndLine.Y}));
-                            nodeCoord.Add((nodeNum, new List<double> {transformedEndPoint.X, transformedEndPoint.Y}));
-                            nodeNum += 1;
+                            if (IsWithinBox(transformedStartPoint, graphMin, graphMax))
+                            {
+                                Point3d normalizedBlockStartLine = new Point3d((transformedStartPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedStartPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                                nodeFeature.Add((nodeNum, new List<double> {normalizedBlockStartLine.X, normalizedBlockStartLine.Y}));
+                                nodeCoord.Add((nodeNum, new List<double> {transformedStartPoint.X, transformedStartPoint.Y}));
+                                nodeNum += 1;
+                            }
+                            if (IsWithinBox(transformedEndPoint, graphMin, graphMax))
+                            {
+                                Point3d normalizedBlockEndLine = new Point3d((transformedEndPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedEndPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                                nodeFeature.Add((nodeNum, new List<double> {normalizedBlockEndLine.X, normalizedBlockEndLine.Y}));
+                                nodeCoord.Add((nodeNum, new List<double> {transformedEndPoint.X, transformedEndPoint.Y}));
+                                nodeNum += 1;
+                            }
                             break;
 
                         case Arc ar:
                             Point3d transformedArcCenter = ar.Center.TransformBy(br.BlockTransform);
-                            Point3d normalizedBlockArcCenter = new Point3d((transformedArcCenter.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedArcCenter.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
-                            nodeFeature.Add((nodeNum, new List<double> {normalizedBlockArcCenter.X, normalizedBlockArcCenter.Y}));
-                            nodeCoord.Add((nodeNum, new List<double> {transformedArcCenter.X, transformedArcCenter.Y}));
-                            nodeNum += 1;
+                            if (IsWithinBox(transformedArcCenter, graphMin, graphMax))
+                            {
+                                Point3d normalizedBlockArcCenter = new Point3d((transformedArcCenter.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedArcCenter.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                                nodeFeature.Add((nodeNum, new List<double> {normalizedBlockArcCenter.X, normalizedBlockArcCenter.Y}));
+                                nodeCoord.Add((nodeNum, new List<double> {transformedArcCenter.X, transformedArcCenter.Y}));
+                                nodeNum += 1;
+                            }
                             break;
-                        
+
                         case AcadPolyline pl:
                             for (int k = 0; k < pl.NumberOfVertices; k++)
                             {
                                 Point3d transformedVertex = pl.GetPoint3dAt(k).TransformBy(br.BlockTransform);
+                                if (!IsWithinBox(transformedVertex, graphMin, graphMax)) continue;
                                 Point3d normalizedBlockVertex = new Point3d((transformedVertex.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedVertex.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
                                 nodeFeature.Add((nodeNum, new List<double> {normalizedBlockVertex.X, normalizedBlockVertex.Y}));
                                 nodeCoord.Add((nodeNum, new List<double> {transformedVertex.X, transformedVertex.Y}));
@@ -218,10 +254,13 @@ public class GNNGraphCreator
 
                         case CivilLabel label:
                             Point3d transformedLabelPoint = label.LabelLocation.TransformBy(br.BlockTransform);
-                            Point3d normalizedBlockLabelPoint = new Point3d((transformedLabelPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedLabelPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
-                            nodeFeature.Add((nodeNum, new List<double> {normalizedBlockLabelPoint.X, normalizedBlockLabelPoint.Y}));
-                            nodeCoord.Add((nodeNum, new List<double> {transformedLabelPoint.X, transformedLabelPoint.Y}));
-                            nodeNum += 1;
+                            if (IsWithinBox(transformedLabelPoint, graphMin, graphMax))
+                            {
+                                Point3d normalizedBlockLabelPoint = new Point3d((transformedLabelPoint.X-minPoint.X)/(maxPoint.X-minPoint.X),(transformedLabelPoint.Y-minPoint.Y)/(maxPoint.Y-minPoint.Y),0);
+                                nodeFeature.Add((nodeNum, new List<double> {normalizedBlockLabelPoint.X, normalizedBlockLabelPoint.Y}));
+                                nodeCoord.Add((nodeNum, new List<double> {transformedLabelPoint.X, transformedLabelPoint.Y}));
+                                nodeNum += 1;
+                            }
                             break;
                     }
                 }
@@ -229,6 +268,13 @@ public class GNNGraphCreator
         }
         return (nodeFeature,nodeCoord);
     }
+
+    private static bool IsWithinBox(Point3d point, Point3d graphMin, Point3d graphMax)
+    {
+        return point.X >= graphMin.X && point.X <= graphMax.X &&
+               point.Y >= graphMin.Y && point.Y <= graphMax.Y;
+    }
+
     public void writeGraphToFile(List<int> fromList, List<int> toList, List<(int Node,List<double> normalizedCoords)> nodes, string project, ref int graphNum, List<double> graphLabel = null)
     {
         var toBeJSON = new Dictionary<string, object>();
