@@ -13,7 +13,7 @@ import threading
 import time
 
 model = CADGNN()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 root = tk.Tk()
 root.withdraw()
@@ -24,7 +24,7 @@ file_path = filedialog.askopenfilename(
 
 dataset = torch.load(file_path, weights_only=False)
 loader = DataLoader(dataset, batch_size = 32, shuffle = True)
-num_epochs = 8
+num_epochs = 200
 
 show_graph = input("Show training visualization? (y/n): ").strip().lower() == "y"
 
