@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CAD Agent Dashboards</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>CAD Agent Dashboards</h1>
+    <div class="header-right">
+      <button id="newDashboard" class="primary-btn">+ New dashboard</button>
+      <div class="conn" id="connStatus">connecting…</div>
+    </div>
+  </header>
+
+  <main id="lanes">
+    <p class="empty" id="emptyState">
+      No dashboards yet. Click <strong>+ New dashboard</strong>, then assign it a drawing
+      file. Tell the agent which dashboard to work in — it can't pick a drawing itself.
+    </p>
+  </main>
+
+  <template id="laneTemplate">
+    <section class="lane">
+      <div class="lane-head">
+        <img class="avatar-thumb" alt="agent avatar">
+        <div class="lane-meta">
+          <div class="lane-title">
+            <span class="lane-name"></span>
+            <span class="lane-id"></span>
+          </div>
+          <div class="lane-file">
+            <input type="text" class="file-input" spellcheck="false"
+                   placeholder="C:\path\to\drawing.dwg — assign a drawing">
+            <button class="file-set">Assign</button>
+            <span class="file-status"></span>
+          </div>
+        </div>
+        <label class="upload-btn">
+          Avatar
+          <input type="file" class="avatar-input" accept="image/*" hidden>
+        </label>
+        <button class="delete-btn" title="Delete dashboard">×</button>
+      </div>
+
+      <div class="lane-run">
+        <textarea class="script-input" spellcheck="false" rows="3"
+                  placeholder="Commands run directly on this dashboard's drawing — no chat needed.&#10;5x draw_line 0 0 10 10&#10;draw_arc 5 5 2 0 90 STORM&#10;create_layer STORM 1"></textarea>
+        <div class="run-controls">
+          <button class="run-btn">Run</button>
+          <button class="stop-btn" disabled>Stop</button>
+          <span class="run-status"></span>
+        </div>
+      </div>
+
+      <div class="lane-body">
+        <div class="board">
+          <div class="node" data-tool="idle" style="grid-area: idle;">idle</div>
+          <div class="node" data-tool="list_dashboards" style="grid-area: n1;">list_dashboards</div>
+          <div class="node" data-tool="get_model_space" style="grid-area: n2;">get_model_space</div>
+          <div class="node" data-tool="query_model_space" style="grid-area: n3;">query_model_space</div>
+          <div class="node" data-tool="draw_line" style="grid-area: n4;">draw_line</div>
+          <div class="node" data-tool="draw_arc" style="grid-area: n5;">draw_arc</div>
+          <div class="node" data-tool="draw_shape" style="grid-area: n6;">draw_shape</div>
+          <div class="node" data-tool="create_layer" style="grid-area: n7;">create_layer</div>
+          <div class="node" data-tool="edit_layer" style="grid-area: n8;">edit_layer</div>
+          <div class="node" data-tool="move_to_layer" style="grid-area: n9;">move_to_layer</div>
+          <div class="node" data-tool="quantify" style="grid-area: n10;">quantify</div>
+          <div class="node" data-tool="classify_image" style="grid-area: n11;">classify_image</div>
+          <img class="avatar" alt="agent avatar">
+        </div>
+        <div class="log"></div>
+      </div>
+    </section>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>

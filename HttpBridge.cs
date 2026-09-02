@@ -3,7 +3,9 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Text;
+using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
+using Autodesk.AutoCAD.ApplicationServices;
 using AcadApp = Autodesk.AutoCAD.ApplicationServices.Application;
 
 namespace CADAgent
@@ -73,72 +75,174 @@ namespace CADAgent
         {
             while (_pending.TryDequeue(out var ctx))
             {
-                try { Handle(ctx); }
-                catch { }
+                try { Dispatch(ctx); }
+                catch
+                {
+                    try { Respond(ctx, Error("Internal server error"), 500); }
+                    catch { }
+                }
             }
         }
 
         // ── Request dispatch ──────────────────────────────────────────────────────
 
-        private static void Handle(HttpListenerContext ctx)
+        private const long MaxBodyBytes = 1 * 1024 * 1024;
+
+        /// <summary>
+        /// Runs on the AutoCAD application thread. Resolving and opening documents must happen
+        /// here. Reads are handled inline because ModelSpaceCollector touches doc.Editor, which
+        /// belongs on this thread; writes are handed to a worker thread holding that document's
+        /// own lock, so two different drawings can be edited at the same time.
+        /// </summary>
+        private static void Dispatch(HttpListenerContext ctx)
         {
             string path   = ctx.Request.Url!.AbsolutePath.ToLower();
             string method = ctx.Request.HttpMethod.ToUpper();
 
-            string body   = Error("Internal server error");
-            int    status = 500;
-
-            try
+            if (path == "/documents" && method == "GET")
             {
-                (body, status) = path switch
+                string body; int status;
+                try   { body = HandleDocuments(); status = 200; }
+                catch (Exception ex) { body = Error(ex.Message); status = 500; }
+                Respond(ctx, body, status);
+                return;
+            }
+
+            if (path == "/modelspace" && method == "GET")
+            {
+                string body; int status;
+                try   { body = HandleModelSpace(ctx.Request.QueryString["file"]); status = 200; }
+                catch (Exception ex) { body = Error(ex.Message); status = 500; }
+                Respond(ctx, body, status);
+                return;
+            }
+
+            if (path == "/execute" && method == "POST")
+            {
+                if (ctx.Request.ContentLength64 > MaxBodyBytes)
                 {
-                    "/modelspace" when method == "GET"  => (HandleModelSpace(), 200),
-                    "/execute"    when method == "POST" => HandleExecute(ctx),
-                    _                                   => (Error("Unknown endpoint"), 404),
-                };
-            }
-            catch (Exception ex)
-            {
-                body   = Error(ex.Message);
-                status = 500;
+                    Respond(ctx, Error("Request body too large"), 413);
+                    return;
+                }
+
+                string requestBody;
+                using (var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8))
+                    requestBody = reader.ReadToEnd();
+
+                string intent = ModelSpaceBuilder.GetIntent(requestBody);
+                if (intent == "chat")
+                {
+                    Respond(ctx, Error("Could not parse intent from request body"), 400);
+                    return;
+                }
+
+                Document doc;
+                try { doc = ResolveDocument(GetRequestedFile(requestBody)); }
+                catch (Exception ex) { Respond(ctx, Error(ex.Message), 500); return; }
+
+                if (doc == null)
+                {
+                    Respond(ctx, Error("No active document"), 500);
+                    return;
+                }
+
+                // LockDocument is per-document: writes to different drawings proceed in
+                // parallel, writes to the same drawing queue behind each other.
+                Task.Run(() =>
+                {
+                    string body; int status;
+                    try
+                    {
+                        using (doc.LockDocument())
+                        {
+                            body   = ModelSpaceBuilder.ExecuteStep(intent, requestBody, doc);
+                            status = 200;
+                        }
+                    }
+                    catch (Exception ex) { body = Error(ex.Message); status = 500; }
+                    try { Respond(ctx, body, status); } catch { }
+                });
+                return;
             }
 
-            try { Respond(ctx, body, status); }
-            catch { }
+            Respond(ctx, Error("Unknown endpoint"), 404);
         }
 
-        // ── Handlers (already on application thread via OnIdle) ───────────────────
+        // ── Handlers ──────────────────────────────────────────────────────────────
 
-        private static string HandleModelSpace()
+        /// <summary>Lists the drawings currently open in AutoCAD, so the agent can be
+        /// given real paths to target instead of guessing at them.</summary>
+        private static string HandleDocuments()
         {
-            var doc = AcadApp.DocumentManager.MdiActiveDocument;
+            var drawings = new JArray();
+            Document active = AcadApp.DocumentManager.MdiActiveDocument;
+
+            foreach (Document d in AcadApp.DocumentManager)
+            {
+                try
+                {
+                    drawings.Add(new JObject
+                    {
+                        ["path"]    = d.Name,
+                        ["focused"] = ReferenceEquals(d, active),
+                    });
+                }
+                catch { }
+            }
+
+            return new JObject { ["drawings"] = drawings }.ToString();
+        }
+
+        private static string HandleModelSpace(string filePath)
+        {
+            Document doc = ResolveDocument(filePath);
             if (doc == null) return Error("No active document");
             using (doc.LockDocument())
             {
                 ModelSpaceCollector.Collect(doc);
-                return ModelSpaceCollector.LastJson;
+                return ModelSpaceCollector.GetLastJson(doc.Name);
             }
         }
 
-        private static (string body, int status) HandleExecute(HttpListenerContext ctx)
+        /// <summary>Returns the "file" field from an /execute payload, or null if absent.</summary>
+        private static string GetRequestedFile(string requestBody)
         {
-            const long MaxBodyBytes = 1 * 1024 * 1024;
-            if (ctx.Request.ContentLength64 > MaxBodyBytes)
-                return (Error("Request body too large"), 413);
+            try
+            {
+                string json = ModelSpaceBuilder.ExtractJson(requestBody);
+                return json == null ? null : JObject.Parse(json)["file"]?.ToString();
+            }
+            catch { return null; }
+        }
 
-            string body;
-            using (var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8))
-                body = reader.ReadToEnd();
+        /// <summary>
+        /// Returns the open Document matching <paramref name="filePath"/>, opening the drawing if
+        /// it is not already open. With no file specified this returns MdiActiveDocument, which
+        /// preserves the original single-document behavior for callers that don't target a file.
+        /// Must be called on the AutoCAD application thread.
+        /// </summary>
+        private static Document ResolveDocument(string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath))
+                return AcadApp.DocumentManager.MdiActiveDocument;
 
-            string intent = ModelSpaceBuilder.GetIntent(body);
-            if (intent == "chat")
-                return (Error("Could not parse intent from request body"), 400);
+            string wanted = Path.GetFullPath(filePath);
 
-            var doc = AcadApp.DocumentManager.MdiActiveDocument;
-            if (doc == null) return (Error("No active document"), 500);
+            foreach (Document d in AcadApp.DocumentManager)
+            {
+                try
+                {
+                    if (string.IsNullOrEmpty(d.Name)) continue;
+                    if (string.Equals(Path.GetFullPath(d.Name), wanted, StringComparison.OrdinalIgnoreCase))
+                        return d;
+                }
+                catch { }
+            }
 
-            using (doc.LockDocument())
-                return (ModelSpaceBuilder.ExecuteStep(intent, body, doc), 200);
+            if (!File.Exists(wanted))
+                throw new FileNotFoundException($"Drawing not found: {wanted}");
+
+            return AcadApp.DocumentManager.Open(wanted, false);
         }
 
         // ── Helpers ───────────────────────────────────────────────────────────────

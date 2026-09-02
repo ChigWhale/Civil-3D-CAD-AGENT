@@ -12,5 +12,8 @@ __pycache__/
 *.pyo
 .env
 
+# Dashboard uploads (user-provided avatar/classify images)
+dashboard/uploads/
+
 # Claude
 .claude/

@@ -25,11 +25,19 @@ namespace CADAgent
     public class ModelSpaceCollector
     {
         /// <summary>
-        /// The JSON string produced by the most recent call to Collect().
-        /// Read by HttpBridge.HandleModelSpace() and returned as the HTTP response body to the MCP server.
+        /// The JSON string produced by the most recent call to Collect() for each document,
+        /// keyed by the document's full path (Document.Name). Read by HttpBridge.HandleModelSpace()
+        /// and returned as the HTTP response body to the MCP server. Per-document so that
+        /// concurrent sessions reading different drawings don't clobber each other's cached JSON.
         /// </summary>
-        private static volatile string _lastJson = string.Empty;
-        public static string LastJson => _lastJson;
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _lastJsonByDoc =
+            new System.Collections.Concurrent.ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        public static string GetLastJson(string docPath) =>
+            docPath != null && _lastJsonByDoc.TryGetValue(docPath, out var json) ? json : string.Empty;
+
+        /// <summary>Convenience accessor for the MdiActiveDocument — used by the GETCADOBJECTS command.</summary>
+        public static string LastJson => GetLastJson(Application.DocumentManager.MdiActiveDocument?.Name);
 
         /// <summary>
         /// AutoCAD command: GETCADOBJECTS
@@ -157,7 +165,9 @@ namespace CADAgent
         public static void Collect(Document doc)
         {
             Database db = doc.Database;
-            CivilDocument civilDoc = CivilApplication.ActiveDocument;
+            // Resolve the Civil 3D document from this drawing's database, not the focused one —
+            // otherwise collecting a background document silently reads the active drawing's data.
+            CivilDocument civilDoc = CivilDocument.GetCivilDocument(db);
 
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
@@ -400,7 +410,7 @@ namespace CADAgent
                 spatialHash.Build(lines, arcs, polylines);
                 root["adjacency"] = spatialHash.ToJson();
 
-                _lastJson = root.ToString(Newtonsoft.Json.Formatting.Indented);
+                _lastJsonByDoc[doc.Name] = root.ToString(Newtonsoft.Json.Formatting.Indented);
                 tr.Commit();
             }
         }

@@ -1,10 +1,17 @@
 ﻿import requests
 import json, openpyxl, os
+import base64, functools, inspect, time
+import socket, subprocess, sys, threading, webbrowser
+from urllib.parse import quote
 from collections import defaultdict
 from mcp.server.fastmcp import FastMCP
+import dashboard_events
+from dashboard_events import SESSION_ID, DashboardError, emit, resolve_file
 
 mcp     = FastMCP("CAD Agent")
-BASE    = "http://localhost:5199"
+# 127.0.0.1, not "localhost": localhost resolves to IPv6 ::1 first on this machine
+# and stalls ~2s per request before falling back to IPv4 (measured 2.06s vs 0.015s).
+BASE    = "http://127.0.0.1:5199"
 TIMEOUT = 30
 _NO_CONNECTION = '{"error": "Civil 3D is not reachable — make sure AutoCAD is open with the CADAgent plugin loaded."}'
 
@@ -16,31 +23,136 @@ _ALL_CATEGORIES = [
     "blocks", "layers", "adjacency",
 ]
 
-# Per-session state: populated on the initial (no-arg) call, reused for chunked follow-ups.
-_MS_CACHE: dict | None = None   # full raw data from one AutoCAD fetch
-_MS_ACCUM: dict        = {}     # merged result across all chunks this session
-_MS_SAVE_PATH = os.path.join(os.path.expanduser("~"), "Downloads", "model_space_full.json")
+# Per-drawing state, keyed by the `file` argument ("" means the focused drawing).
+# Claude Desktop reuses one server process across every chat, so this must never be
+# a single shared value -- one drawing's data would leak into another's queries.
+_MS_CACHE: dict = {}   # drawing key -> full raw data from one AutoCAD fetch
+_MS_ACCUM: dict = {}   # drawing key -> merged result across all chunks
 
 
-def _get(path: str) -> str:
+def _drawing_key(file: str | None) -> str:
+    return os.path.normcase(os.path.abspath(file)) if file else ""
+
+
+def _file_for(dashboard: str) -> str:
+    """The drawing the user assigned to this dashboard. Raises DashboardError,
+    which the @observed wrapper turns into an explanatory tool result."""
+    return resolve_file(dashboard)
+
+
+def _save_path(file: str | None) -> str:
+    stem = os.path.splitext(os.path.basename(file))[0] if file else "focused"
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)
+    return os.path.join(os.path.expanduser("~"), "Downloads", f"model_space_{safe}.json")
+
+
+def _get(path: str, file: str | None = None) -> str:
     try:
-        return requests.get(f"{BASE}{path}", timeout=TIMEOUT).text
+        return requests.get(f"{BASE}{path}",
+                            params={"file": file} if file else None,
+                            timeout=TIMEOUT).text
     except requests.exceptions.ConnectionError:
         return _NO_CONNECTION
 
 
-def _post(payload: dict) -> str:
+def _post(payload: dict, file: str | None = None) -> str:
     try:
+        if file:
+            payload = {**payload, "file": file}
         return requests.post(f"{BASE}/execute", json=payload, timeout=TIMEOUT).text
     except requests.exceptions.ConnectionError:
         return _NO_CONNECTION
 
 
+_PREVIEW_LEN = 300
+
+
+def _preview(value, limit: int = _PREVIEW_LEN) -> str:
+    s = value if isinstance(value, str) else json.dumps(value, default=str)
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def observed(func):
+    """Reports every call of a wrapped MCP tool to the local dashboard
+    (best-effort — see dashboard_events.emit). Must sit closer to the raw
+    function than @mcp.tool() so FastMCP still registers the real callable
+    and introspects the original signature via functools.wraps."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        bound = kwargs
+        if args:
+            try:
+                bound = dict(inspect.signature(func).bind_partial(*args, **kwargs).arguments)
+            except TypeError:
+                bound = kwargs
+        # Activity belongs to the dashboard the call names. One process serves every
+        # chat, so the dashboard -- not the chat -- is what separates the work.
+        board = bound.get("dashboard")
+
+        emit("tool_call_started", tool=func.__name__, dashboard=board,
+             args={k: _preview(v) for k, v in bound.items()})
+        start = time.monotonic()
+        try:
+            result = func(*args, **kwargs)
+            emit("tool_call_finished", tool=func.__name__, dashboard=board,
+                 duration_ms=round((time.monotonic() - start) * 1000),
+                 result=_preview(result))
+            return result
+        except DashboardError as e:
+            # Not an internal failure: the user simply hasn't assigned a drawing yet.
+            # Return it as the tool result so the agent can relay it, rather than
+            # raising and having the drawing silently go unset.
+            message = json.dumps({"error": str(e)})
+            emit("tool_call_finished", tool=func.__name__, dashboard=board,
+                 duration_ms=round((time.monotonic() - start) * 1000),
+                 error=str(e))
+            return message
+        except Exception as e:
+            emit("tool_call_finished", tool=func.__name__, dashboard=board,
+                 duration_ms=round((time.monotonic() - start) * 1000),
+                 error=str(e))
+            raise
+    return wrapper
+
+
 @mcp.tool()
-def get_model_space(categories: list[str] | None = None) -> str:
-    """Returns the current Civil 3D drawing as JSON.
+@observed
+def list_dashboards() -> str:
+    """Lists the dashboards the user has created and which drawing each is assigned to.
+
+    Every other tool works through a dashboard. You do NOT choose drawings — the user
+    assigns a drawing to each dashboard in the dashboard UI. Call this when you are
+    unsure which dashboard to work in, then ask the user if it's still ambiguous."""
+    boards = dashboard_events.list_dashboards()
+    if not boards:
+        return json.dumps({
+            "dashboards": [],
+            "note": ("No dashboards exist yet. Ask the user to open "
+                     "http://localhost:8765 and create one, then assign a drawing to it."),
+        })
+    return json.dumps({"dashboards": boards})
+
+
+@mcp.tool()
+@observed
+def list_drawings() -> str:
+    """Lists the drawings currently open in AutoCAD, with their full paths.
+    Informational only — use it to tell the user what's open. You cannot direct work
+    at these paths yourself; work is routed by the dashboard the user assigned."""
+    return _get("/documents")
+
+
+@mcp.tool()
+@observed
+def get_model_space(dashboard: str, categories: list[str] | None = None) -> str:
+    """Returns a Civil 3D drawing as JSON.
     YOU MUST call this before ANY other tool and before responding to ANY user message.
     Never skip this call — drawing state changes between messages.
+
+    dashboard: REQUIRED id of the dashboard to work through (e.g. "1"). The user
+    assigns a drawing to each dashboard; you never choose the drawing yourself.
+    Use the same dashboard for every call in a conversation. Call list_dashboards()
+    if you don't know which one, and ask the user if it's ambiguous.
 
     categories: optional list limiting which data categories are returned.
     Omit to request all. Valid values:
@@ -49,25 +161,26 @@ def get_model_space(categories: list[str] | None = None) -> str:
 
     CHUNKING: if the response approaches 1 MB, partial data is returned with a
     "__remaining_categories__" field. You MUST call get_model_space again with
-    those categories and repeat until "__remaining_categories__" is absent.
-    The server accumulates every chunk automatically; the full JSON is written
-    to disk once all chunks have been retrieved."""
+    those categories (and the same dashboard) and repeat until
+    "__remaining_categories__" is absent. The server accumulates every chunk
+    automatically; the full JSON is written to disk once all chunks are retrieved."""
 
-    global _MS_CACHE, _MS_ACCUM
+    file = _file_for(dashboard)
+    key = _drawing_key(file)
 
-    # Initial call: fetch fresh data from AutoCAD and reset accumulator.
+    # Initial call: fetch fresh data from AutoCAD and reset this drawing's accumulator.
     if categories is None:
-        raw = _get("/modelspace")
+        raw = _get("/modelspace", file)
         try:
-            _MS_CACHE = json.loads(raw)
+            _MS_CACHE[key] = json.loads(raw)
         except Exception:
             return raw
-        _MS_ACCUM = {}
+        _MS_ACCUM[key] = {}
     else:
-        if _MS_CACHE is None:
-            return '{"error": "Call get_model_space() without arguments first to load drawing data."}'
+        if key not in _MS_CACHE:
+            return '{"error": "Call get_model_space() without categories first to load drawing data."}'
 
-    data     = _MS_CACHE
+    data     = _MS_CACHE[key]
     pool     = _ALL_CATEGORIES if categories is None else categories
     to_fetch = [c for c in pool if c in data]
 
@@ -81,9 +194,10 @@ def get_model_space(categories: list[str] | None = None) -> str:
             break
         result[cat] = data[cat]
 
-    # Merge this chunk into the session accumulator.
+    # Merge this chunk into this drawing's accumulator.
+    accum = _MS_ACCUM.setdefault(key, {})
     for cat, val in result.items():
-        _MS_ACCUM[cat] = val
+        accum[cat] = val
 
     if remaining:
         result["__remaining_categories__"] = remaining
@@ -94,11 +208,12 @@ def get_model_space(categories: list[str] | None = None) -> str:
             f"Repeat until __remaining_categories__ is absent."
         )
     else:
-        # All chunks received — write the complete accumulated JSON to disk.
+        # All chunks received — write this drawing's accumulated JSON to disk.
         try:
-            os.makedirs(os.path.dirname(_MS_SAVE_PATH), exist_ok=True)
-            with open(_MS_SAVE_PATH, "w", encoding="utf-8") as f:
-                json.dump(_MS_ACCUM, f)
+            path = _save_path(file)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(accum, f)
         except Exception:
             pass  # don't fail the tool call if the save fails
 
@@ -106,55 +221,73 @@ def get_model_space(categories: list[str] | None = None) -> str:
 
 
 @mcp.tool()
-def query_model_space(category: str) -> str:
+@observed
+def query_model_space(category: str, dashboard: str) -> str:
     """Returns one category of data from the most recently fetched model space JSON.
     Use this to look up specific drawing data without re-fetching everything from AutoCAD.
     Prefer this over re-calling get_model_space when you only need one category.
-    Valid values: lines, arcs, polylines, alignments, pipe_networks,
-                  surfaces, corridors, blocks, layers, adjacency"""
-    # In-memory accumulator takes priority (current session, no disk I/O)
-    if category in _MS_ACCUM:
-        return json.dumps({category: _MS_ACCUM[category]})
+
+    dashboard: REQUIRED — the same dashboard you passed to get_model_space. Each
+    dashboard's drawing has its own cached data.
+
+    Valid categories: lines, arcs, polylines, alignments, pipe_networks,
+                      surfaces, corridors, blocks, layers, adjacency"""
+    file = _file_for(dashboard)
+    accum = _MS_ACCUM.get(_drawing_key(file), {})
+    # In-memory accumulator takes priority (already fetched, no disk I/O)
+    if category in accum:
+        return json.dumps({category: accum[category]})
     # Fall back to saved file (data from a previous session)
     try:
-        with open(_MS_SAVE_PATH, "r", encoding="utf-8") as f:
+        with open(_save_path(file), "r", encoding="utf-8") as f:
             data = json.load(f)
         if category in data:
             return json.dumps({category: data[category]})
         return json.dumps({"error": f"Category '{category}' not found.",
                            "available": list(data.keys())})
     except FileNotFoundError:
-        return '{"error": "No saved model space data. Call get_model_space() first."}'
+        return '{"error": "No saved model space data for that drawing. Call get_model_space() first."}'
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
+@observed
 def draw_line(start_x: float, start_y: float,
               end_x: float,   end_y: float,
-              layer: str) -> str:
-    """Draws a straight line in the active Civil 3D drawing.
+              layer: str,
+              dashboard: str) -> str:
+    """Draws a straight line in the drawing assigned to a dashboard.
     Only call when the user explicitly asks to draw or create a line or when markdown files need them.
-    If the user does not explicitly state a layer, use layer as '0' """
+    If the user does not explicitly state a layer, use layer as '0'.
+
+    dashboard: REQUIRED id of the dashboard to work through. The drawing behind it
+    is set by the user; you cannot target a drawing directly. If unsure which
+    dashboard, call list_dashboards() and ask the user rather than guessing."""
     return _post({
         "intent":      "draw_line",
         "start_point": [start_x, start_y, 0],
         "end_point":   [end_x,   end_y,   0],
         "layer":       layer,
-    })
+    }, _file_for(dashboard))
 
 @mcp.tool()
+@observed
 def draw_arc(center_x: float, center_y: float,
              radius: float,
              start_angle_deg: float, end_angle_deg: float,
-             layer: str) -> str:
-    """Draws an arc in the active Civil 3D drawing.
+             layer: str,
+             dashboard: str) -> str:
+    """Draws an arc in a Civil 3D drawing.
     center_x, center_y define the center of the circle the arc belongs to.
     radius is the radius of that circle.
     start_angle_deg and end_angle_deg are in degrees, measured counter-clockwise
     from the positive X axis. The arc always draws counter-clockwise from start to end.
     Only call when the user explicitly asks to draw or create an arc.
-    If the user does not explicitly state a layer, use layer as '0'"""
+    If the user does not explicitly state a layer, use layer as '0'.
+
+    dashboard: REQUIRED id of the dashboard to work through. The drawing behind it
+    is set by the user; call list_dashboards() if you are unsure which one."""
     import math
     return _post({
         "intent":      "draw_arc",
@@ -163,52 +296,75 @@ def draw_arc(center_x: float, center_y: float,
         "start_angle": math.radians(start_angle_deg),
         "end_angle":   math.radians(end_angle_deg),
         "layer":       layer,
-    })
+    }, _file_for(dashboard))
 
 
 @mcp.tool()
-def draw_shape(vertices: list[list[float]],
-               layer:    str,
-               closed:   bool = True) -> str:
-    """Draws a polyline shape in the drawing.
+@observed
+def draw_shape(vertices:  list[list[float]],
+               layer:     str,
+               dashboard: str,
+               closed:    bool = True) -> str:
+    """Draws a polyline shape in the drawing assigned to a dashboard.
     vertices is a list of [x, y] pairs, e.g. [[0,0],[10,0],[10,10]].
     Only call when the user asks to draw a shape or polygon or when markdown files need them.
-    If the user does not explicitly state a layer, use layer as '0' """
+    If the user does not explicitly state a layer, use layer as '0'.
+
+    dashboard: REQUIRED id of the dashboard to work through. The drawing behind it
+    is set by the user; call list_dashboards() if you are unsure which one."""
     return _post({
         "intent":   "draw_shape",
         "vertices": vertices,
         "layer":    layer,
         "closed":   closed,
-    })
+    }, _file_for(dashboard))
 
 
 @mcp.tool()
-def create_layer(name: str, color: int = 7) -> str:
-    """Creates a new layer in the drawing.
+@observed
+def create_layer(name: str, dashboard: str, color: int = 7) -> str:
+    """Creates a new layer in the drawing assigned to a dashboard.
     color is an AutoCAD color index (1=red, 2=yellow, 3=green, 7=white).
-    Only call when the user asks to create a layer."""
-    return _post({"intent": "create_layer", "name": name, "color": color})
+    Only call when the user asks to create a layer.
+
+    dashboard: REQUIRED id of the dashboard to work through. The drawing behind it
+    is set by the user; call list_dashboards() if you are unsure which one."""
+    return _post({"intent": "create_layer", "name": name, "color": color},
+                 _file_for(dashboard))
 
 
 @mcp.tool()
-def edit_layer(name: str, color: int | None = None, visible: bool | None = None) -> str:
+@observed
+def edit_layer(name: str, dashboard: str, color: int | None = None,
+               visible: bool | None = None) -> str:
     """Edits an existing layer's color or visibility.
-    Only call when the user asks to change a layer's properties."""
+    Only call when the user asks to change a layer's properties.
+
+    dashboard: REQUIRED id of the dashboard to work through. The drawing behind it
+    is set by the user; call list_dashboards() if you are unsure which one."""
     payload = {"intent": "edit_layer", "name": name}
     if color   is not None: payload["color"]   = color
     if visible is not None: payload["visible"] = visible
-    return _post(payload)
+    return _post(payload, _file_for(dashboard))
 
 
 @mcp.tool()
-def move_to_layer(handles: list[str], layer: str) -> str:
+@observed
+def move_to_layer(handles: list[str], layer: str, dashboard: str) -> str:
     """Moves objects (identified by their handle strings) to a layer.
-    Only call when the user asks to move or reassign objects to a layer."""
-    return _post({"intent": "add_to_layer", "layer": layer, "handles": handles})
+    Only call when the user asks to move or reassign objects to a layer.
+
+    dashboard: REQUIRED id of the dashboard to work through. The drawing behind it
+    is set by the user; call list_dashboards() if you are unsure which one."""
+    return _post({"intent": "add_to_layer", "layer": layer, "handles": handles},
+                 _file_for(dashboard))
 
 @mcp.tool()
-def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
+@observed
+def quantify(objOfInterest: list[str], quantitiesOfInterest: dict,
+             dashboard: str) -> str:
     """Writes a quantity takeoff Excel file for specific objects the user asked about.
+    dashboard: REQUIRED — the same dashboard you passed to get_model_space.
 
     BEFORE calling this tool you MUST complete both steps below — do not call
     the tool until it is done:
@@ -244,7 +400,8 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
       Pipe/structure handles are nested: pipe_networks[i].pipes[j].handle
                                          pipe_networks[i].structures[j].handle"""
 
-    raw = _get("/modelspace")
+    file = _file_for(dashboard)
+    raw = _get("/modelspace", file)
     try:
         data = json.loads(raw)
     except Exception:
@@ -332,7 +489,11 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
                         toAppend.append(f"{str(item)}: {val or ''}")
                 rows.append(toAppend)
 
-    path = os.path.join(os.path.expanduser("~"), "Downloads", "quantities.xlsx")
+    # Name the workbook after the drawing so quantifying two drawings doesn't
+    # have the second run overwrite the first one's takeoff.
+    stem = os.path.splitext(os.path.basename(file))[0] if file else "focused"
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)
+    path = os.path.join(os.path.expanduser("~"), "Downloads", f"quantities_{safe}.xlsx")
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     wb = openpyxl.Workbook()
@@ -371,6 +532,58 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
             f"DEBUG objOfInterest: {list(wanted)}\n"
             f"DEBUG quantitiesOfInterest: {quantitiesOfInterest}")
 
+@mcp.tool()
+@observed
+def classify_image(path: str) -> str:
+    """Classifies an image on disk and returns a short label + description.
+    Only call when the user explicitly asks you to classify or identify an
+    image and gives you a file path (e.g. an image uploaded via the dashboard,
+    whose path is shown in its UI)."""
+    try:
+        import anthropic
+    except ImportError:
+        return '{"error": "The anthropic package is not installed. Run: pip install anthropic"}'
+
+    try:
+        with open(path, "rb") as f:
+            image_bytes = f.read()
+    except OSError as e:
+        return json.dumps({"error": f"Could not read image at '{path}': {e}"})
+
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    media_type = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext or 'jpeg'}"
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return '{"error": "ANTHROPIC_API_KEY is not set."}'
+
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=200,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": media_type,
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                }},
+                {"type": "text", "text": (
+                    "Classify the main subject of this image. Respond with ONLY a JSON object "
+                    'of the form {"label": "<one or two words>", "description": "<one sentence>"} '
+                    "and nothing else."
+                )},
+            ],
+        }],
+    )
+    text = response.content[0].text.strip()
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        return json.dumps({"label": text[:60], "description": text})
+
+
 # @mcp.tool()
 # def delete_objects(handles: list[str]) -> str:
 #     """Permanently deletes objects from the drawing by their handle strings.
@@ -381,5 +594,75 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict) -> str:
 #         "objects": [{"object_handle": h, "object_type": "object"} for h in handles],
 #     })
 
+_DASHBOARD_PORT = 8765
+_DASHBOARD_URL  = f"http://localhost:{_DASHBOARD_PORT}"
+
+
+def _dashboard_already_running() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", _DASHBOARD_PORT), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_dashboard_running() -> None:
+    """Best-effort: launch the observability dashboard in the background and
+    open it in a browser tab, so the user never has to open a terminal.
+    Runs on a daemon thread so it can never delay the MCP stdio handshake;
+    if anything here fails, the CAD tools must still work normally."""
+    def _launch():
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+        if not _dashboard_already_running():
+            try:
+                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                subprocess.Popen(
+                    [sys.executable, "-m", "uvicorn", "dashboard.server:app",
+                     "--port", str(_DASHBOARD_PORT)],
+                    cwd=repo_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+            except Exception:
+                return  # dashboard is a nice-to-have; never break the CAD tools
+
+            for _ in range(20):  # wait up to ~5s for it to come up
+                if _dashboard_already_running():
+                    break
+                time.sleep(0.25)
+            else:
+                return  # never came up; don't open a dead tab
+
+        # Open the UI so the user never has to type a URL: dashboards are created by
+        # hand there, and nothing can be assigned a drawing until they do.
+        #
+        # Claude Desktop launches two cad_mcp_server.py processes about a second
+        # apart, so a short cooldown keeps that pair from opening two windows. Keep
+        # it small -- it should only dedupe that near-simultaneous pair, never
+        # suppress a genuine later restart.
+        marker = os.path.join(repo_dir, "dashboard", "uploads", ".last_browser_open")
+        try:
+            if time.time() - os.path.getmtime(marker) < 5:
+                return
+        except OSError:
+            pass
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            with open(marker, "w") as f:
+                f.write(str(time.time()))
+        except OSError:
+            pass
+
+        try:
+            webbrowser.open(_DASHBOARD_URL)
+        except Exception:
+            pass
+
+    threading.Thread(target=_launch, daemon=True).start()
+
+
 if __name__ == "__main__":
+    _ensure_dashboard_running()
     mcp.run()
