@@ -26,6 +26,13 @@ from fastapi import FastAPI, File, Query, Request, UploadFile, WebSocket, WebSoc
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+# Works both as a package ("uvicorn dashboard.server:app") and when this file's
+# own directory is on sys.path (running server.py directly).
+try:
+    from . import blocks
+except ImportError:  # pragma: no cover - depends only on how the app was started
+    import blocks
+
 # Overridable so the command runner can be exercised against a stub instead of a
 # live drawing (CAD_PLUGIN_BASE=http://127.0.0.1:5399).
 # 127.0.0.1, not "localhost": localhost resolves to IPv6 ::1 first on this machine
@@ -151,108 +158,28 @@ async def set_dashboard_file(dashboard_id: str, request: Request):
     return {"id": dashboard_id, "file": path}
 
 
-# ── Direct command sequences (no chat involved) ───────────────────────────────
+# ── Direct command sequences (no chat involved) ─────────────────────────────
 #
-# Commands typed into a dashboard run straight against its assigned drawing. This
-# is the only way to get two drawings worked simultaneously: Claude Desktop only
-# drives the chat you're looking at, so chat-driven work can't overlap. Each
-# dashboard's sequence runs as its own task, so several can run at once.
+# A dashboard's sequence is a list of function blocks, each with its own
+# parameters and repeat count, assembled in the browser and run in order against
+# that dashboard's assigned drawing. This is the only way to get two drawings
+# worked simultaneously: Claude Desktop only drives the chat you're looking at,
+# so chat-driven work can't overlap. Each dashboard's sequence runs as its own
+# task, so several can run at once.
+#
+# What a block is, which parameters it takes and how it becomes a plugin payload
+# all live in blocks.py — this module only sequences and dispatches them.
 
 # dashboard id -> asyncio.Task
 _runs: dict[str, asyncio.Task] = {}
 
 
-def _num(value: str, what: str) -> float:
-    try:
-        return float(value)
-    except ValueError:
-        raise ValueError(f"{what} must be a number, got '{value}'")
+@app.get("/blocks")
+async def list_blocks():
+    """The block palette. The browser builds every parameter form from this, so
+    adding a block to blocks.py is all it takes to expose it in the UI."""
+    return {"blocks": blocks.palette(), "max_repeat": blocks.MAX_REPEAT}
 
-
-def parse_command(line: str) -> dict:
-    """Turns one typed line into a plugin payload. Raises ValueError with a
-    human-readable message the UI shows verbatim."""
-    parts = line.split()
-    name = parts[0].lower()
-    args = parts[1:]
-
-    if name == "draw_line":
-        if len(args) < 4:
-            raise ValueError("draw_line needs: x1 y1 x2 y2 [layer]")
-        layer = args[4] if len(args) > 4 else "0"
-        return {
-            "intent": "draw_line",
-            "start_point": [_num(args[0], "x1"), _num(args[1], "y1"), 0],
-            "end_point": [_num(args[2], "x2"), _num(args[3], "y2"), 0],
-            "layer": layer,
-        }
-
-    if name == "draw_arc":
-        if len(args) < 5:
-            raise ValueError("draw_arc needs: cx cy radius start_deg end_deg [layer]")
-        import math
-        layer = args[5] if len(args) > 5 else "0"
-        return {
-            "intent": "draw_arc",
-            "center": [_num(args[0], "cx"), _num(args[1], "cy"), 0],
-            "radius": _num(args[2], "radius"),
-            "start_angle": math.radians(_num(args[3], "start_deg")),
-            "end_angle": math.radians(_num(args[4], "end_deg")),
-            "layer": layer,
-        }
-
-    if name == "create_layer":
-        if not args:
-            raise ValueError("create_layer needs: name [color]")
-        color = int(_num(args[1], "color")) if len(args) > 1 else 7
-        return {"intent": "create_layer", "name": args[0], "color": color}
-
-    if name == "edit_layer":
-        if not args:
-            raise ValueError("edit_layer needs: name [color]")
-        payload = {"intent": "edit_layer", "name": args[0]}
-        if len(args) > 1:
-            payload["color"] = int(_num(args[1], "color"))
-        return payload
-
-    raise ValueError(
-        f"Unknown command '{parts[0]}'. Supported: draw_line, draw_arc, "
-        "create_layer, edit_layer."
-    )
-
-
-def parse_script(script: str) -> list:
-    """Parses a whole script into commands. Lines may be prefixed with a repeat
-    count ('5x draw_line ...'); blank lines and # comments are ignored."""
-    commands = []
-    for lineno, raw in enumerate(script.splitlines(), start=1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        repeat = 1
-        first, _, rest = line.partition(" ")
-        if first.lower().endswith("x") and first[:-1].isdigit():
-            repeat = int(first[:-1])
-            line = rest.strip()
-            if not line:
-                raise ValueError(f"line {lineno}: '{raw.strip()}' has a repeat but no command")
-            if repeat < 1 or repeat > 500:
-                raise ValueError(f"line {lineno}: repeat must be between 1 and 500")
-
-        try:
-            payload = parse_command(line)
-        except ValueError as e:
-            raise ValueError(f"line {lineno}: {e}")
-        except IndexError:
-            raise ValueError(f"line {lineno}: '{raw.strip()}' is not a valid command")
-
-        for _ in range(repeat):
-            commands.append(payload)
-
-    if not commands:
-        raise ValueError("Nothing to run — enter at least one command.")
-    return commands
 
 
 async def _run_sequence(dashboard_id: str, commands: list, file: str) -> None:
@@ -263,11 +190,16 @@ async def _run_sequence(dashboard_id: str, commands: list, file: str) -> None:
         for index, payload in enumerate(commands, start=1):
             tool = payload["intent"]
             started = time.time()
+            # "block" travels with every event so the browser can highlight the
+            # block a step came from — a repeat fans one block out into many steps.
+            block_id = payload.get("_block")
             await _broadcast({"type": "tool_call_started", "dashboard": dashboard_id,
-                              "tool": tool, "args": {"step": f"{index}/{len(commands)}"},
+                              "tool": tool, "block": block_id,
+                              "args": {"step": f"{index}/{len(commands)}"},
                               "_ts": started})
 
-            body = {**payload, "file": file}
+            body = {k: v for k, v in payload.items() if k != "_block"}
+            body["file"] = file
             try:
                 response = await asyncio.to_thread(
                     requests.post, f"{PLUGIN_BASE}/execute", json=body, timeout=PLUGIN_TIMEOUT
@@ -278,7 +210,8 @@ async def _run_sequence(dashboard_id: str, commands: list, file: str) -> None:
                                        "open with the CADAgent plugin loaded.")
 
             await _broadcast({"type": "tool_call_finished", "dashboard": dashboard_id,
-                              "tool": tool, "result": (result or "")[:300], "error": error,
+                              "tool": tool, "block": block_id,
+                              "result": (result or "")[:300], "error": error,
                               "duration_ms": round((time.time() - started) * 1000),
                               "_ts": time.time()})
             if error:
@@ -312,9 +245,14 @@ async def run_script(dashboard_id: str, request: Request):
         return JSONResponse({"error": "This dashboard is already running a sequence."},
                             status_code=409)
 
-    script = (await request.json()).get("script", "")
+    body = await request.json()
     try:
-        commands = parse_script(script)
+        # "blocks" is what the dashboard's sequence builder sends; "script" is the
+        # equivalent typed syntax, kept for scripting the server without a browser.
+        if body.get("blocks") is not None:
+            commands = blocks.compile_blocks(body["blocks"])
+        else:
+            commands = blocks.parse_script(body.get("script", ""))
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

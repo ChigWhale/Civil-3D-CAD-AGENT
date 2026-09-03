@@ -46,11 +46,21 @@
       </div>
 
       <div class="lane-run">
-        <textarea class="script-input" spellcheck="false" rows="3"
-                  placeholder="Commands run directly on this dashboard's drawing — no chat needed.&#10;5x draw_line 0 0 10 10&#10;draw_arc 5 5 2 0 90 STORM&#10;create_layer STORM 1"></textarea>
+        <div class="palette-row">
+          <span class="palette-label">Add block</span>
+          <div class="palette"></div>
+        </div>
+
+        <ol class="sequence"></ol>
+        <p class="sequence-empty">
+          No blocks yet — pick one above. Blocks run top to bottom on this
+          dashboard's drawing, no chat needed.
+        </p>
+
         <div class="run-controls">
-          <button class="run-btn">Run</button>
+          <button class="run-btn">Run sequence</button>
           <button class="stop-btn" disabled>Stop</button>
+          <button class="clear-btn">Clear</button>
           <span class="run-status"></span>
         </div>
       </div>
@@ -69,11 +79,33 @@
           <div class="node" data-tool="move_to_layer" style="grid-area: n9;">move_to_layer</div>
           <div class="node" data-tool="quantify" style="grid-area: n10;">quantify</div>
           <div class="node" data-tool="classify_image" style="grid-area: n11;">classify_image</div>
+          <div class="node" data-tool="delete" style="grid-area: n12;">delete</div>
           <img class="avatar" alt="agent avatar">
         </div>
         <div class="log"></div>
       </div>
     </section>
+  </template>
+
+  <!-- One step in a dashboard's sequence. The parameter inputs inside
+       .block-params are generated from the block's spec served by /blocks. -->
+  <template id="blockTemplate">
+    <li class="block" draggable="true">
+      <div class="block-head">
+        <span class="block-grip" title="Drag to reorder">⠿</span>
+        <span class="block-step"></span>
+        <span class="block-label"></span>
+        <span class="block-desc"></span>
+        <label class="block-repeat" title="Run this block this many times">
+          ×<input type="number" class="repeat-input" min="1" value="1">
+        </label>
+        <button class="block-btn block-up" title="Move up">↑</button>
+        <button class="block-btn block-down" title="Move down">↓</button>
+        <button class="block-btn block-dup" title="Duplicate">⧉</button>
+        <button class="block-btn block-del" title="Remove">×</button>
+      </div>
+      <div class="block-params"></div>
+    </li>
   </template>
 
   <script src="app.js"></script>

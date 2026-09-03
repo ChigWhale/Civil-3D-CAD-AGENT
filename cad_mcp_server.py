@@ -597,13 +597,85 @@ def classify_image(path: str) -> str:
 _DASHBOARD_PORT = 8765
 _DASHBOARD_URL  = f"http://localhost:{_DASHBOARD_PORT}"
 
+# Health is probed over HTTP rather than by a bare socket connect. A dashboard
+# server left running from an older version of the code still holds the port and
+# still accepts TCP, so a connect test reports it as fine -- while the browser
+# gets routes that no longer exist and the UI comes up half-built (a stale server
+# missing /blocks renders every dashboard with an empty block palette, silently).
+# Point _HEALTH_PATH at a route the CURRENT server has and older ones don't.
+_HEALTH_PATH = "/blocks"
 
-def _dashboard_already_running() -> bool:
+# How long a server gets to answer before it counts as failed or stale. Covers
+# uvicorn's own startup plus the sibling-process case described in _launch.
+_STARTUP_WAIT = 15
+
+# uploads/ is already gitignored and already holds the browser-open marker.
+_LAUNCH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "dashboard", "uploads", "launcher.log")
+
+
+def _log(message: str) -> None:
+    """The dashboard is launched detached with no console, so this file is the
+    only place a launch failure can be seen. Best-effort, like everything here."""
+    try:
+        os.makedirs(os.path.dirname(_LAUNCH_LOG), exist_ok=True)
+        with open(_LAUNCH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{SESSION_ID}] {message}\n")
+    except OSError:
+        pass
+
+
+def _dashboard_port_open() -> bool:
     try:
         with socket.create_connection(("127.0.0.1", _DASHBOARD_PORT), timeout=0.5):
             return True
     except OSError:
         return False
+
+
+def _open_browser() -> bool:
+    """Opens the dashboard, reporting whether it actually worked.
+
+    webbrowser.open() signals failure by RETURNING False rather than raising, so
+    a bare try/except around it treats a silent no-op as success. os.startfile is
+    tried first on Windows because it raises a real OSError with a reason."""
+    if os.name == "nt":
+        try:
+            os.startfile(_DASHBOARD_URL)
+            return True
+        except OSError as e:
+            _log(f"os.startfile could not open {_DASHBOARD_URL}: {e}")
+
+    try:
+        if webbrowser.open(_DASHBOARD_URL):
+            return True
+        _log(f"webbrowser.open found no browser to open {_DASHBOARD_URL}")
+    except Exception as e:
+        _log(f"webbrowser.open failed for {_DASHBOARD_URL}: {e}")
+    return False
+
+
+def _dashboard_healthy() -> bool:
+    """True only when the port is owned by a server serving the current routes."""
+    try:
+        response = requests.get(
+            f"http://127.0.0.1:{_DASHBOARD_PORT}{_HEALTH_PATH}", timeout=1.0)
+        return response.status_code == 200
+    except requests.exceptions.RequestException:
+        return False
+
+
+def _wait_for_healthy(seconds: int = None) -> bool:
+    """Polls until the dashboard serves the current routes, or the wait runs out.
+
+    Generous on purpose: uvicorn binds the port well before it finishes starting,
+    and this is the only thing separating "still coming up" from "stale"."""
+    deadline = time.time() + (_STARTUP_WAIT if seconds is None else seconds)
+    while time.time() < deadline:
+        if _dashboard_healthy():
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def _ensure_dashboard_running() -> None:
@@ -614,26 +686,46 @@ def _ensure_dashboard_running() -> None:
     def _launch():
         repo_dir = os.path.dirname(os.path.abspath(__file__))
 
-        if not _dashboard_already_running():
-            try:
-                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                subprocess.Popen(
-                    [sys.executable, "-m", "uvicorn", "dashboard.server:app",
-                     "--port", str(_DASHBOARD_PORT)],
-                    cwd=repo_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=creationflags,
-                )
-            except Exception:
-                return  # dashboard is a nice-to-have; never break the CAD tools
-
-            for _ in range(20):  # wait up to ~5s for it to come up
-                if _dashboard_already_running():
-                    break
-                time.sleep(0.25)
+        if not _dashboard_healthy():
+            # Claude Desktop starts two of these processes about a second apart,
+            # so the port is often already bound by a server the sibling process
+            # started moments ago and that is still working through startup. A
+            # bound port therefore does NOT mean the owner is stale -- it has to
+            # be given time to answer before that conclusion is drawn, or the
+            # second process writes off a perfectly good server and no tab opens.
+            if _dashboard_port_open():
+                if not _wait_for_healthy():
+                    _log(f"Port {_DASHBOARD_PORT} is held by a process that never "
+                         f"served {_HEALTH_PATH} -- most likely a dashboard server "
+                         "left running from an older version of the code. Stop that "
+                         "process and restart Claude Desktop.")
+                    return
             else:
-                return  # never came up; don't open a dead tab
+                try:
+                    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                    os.makedirs(os.path.dirname(_LAUNCH_LOG), exist_ok=True)
+                    with open(_LAUNCH_LOG, "a", encoding="utf-8") as log:
+                        subprocess.Popen(
+                            [sys.executable, "-m", "uvicorn", "dashboard.server:app",
+                             "--port", str(_DASHBOARD_PORT), "--log-level", "warning"],
+                            cwd=repo_dir,
+                            # DEVNULL, not inherited: stdin here is the MCP stdio
+                            # transport Claude Desktop talks over. Handing the
+                            # dashboard a duplicate of it leaves that pipe held
+                            # open by a process that never reads it.
+                            stdin=subprocess.DEVNULL,
+                            stdout=log,
+                            stderr=log,  # a startup crash lands here, not in a void
+                            creationflags=creationflags,
+                        )
+                except Exception as e:
+                    _log(f"Could not start the dashboard server: {e}")
+                    return  # dashboard is a nice-to-have; never break the CAD tools
+
+                if not _wait_for_healthy():
+                    _log(f"Dashboard server did not answer within {_STARTUP_WAIT}s; "
+                         "not opening a tab.")
+                    return  # never came up; don't open a dead tab
 
         # Open the UI so the user never has to type a URL: dashboards are created by
         # hand there, and nothing can be assigned a drawing until they do.
@@ -648,16 +740,22 @@ def _ensure_dashboard_running() -> None:
                 return
         except OSError:
             pass
+
+        # Open FIRST, record second. The marker used to be written before the
+        # open, which loses the tab entirely: this runs on a daemon thread, and
+        # Claude Desktop tears a server down and restarts it (the transport
+        # closes and re-initializes within the same millisecond in its log). A
+        # process killed between the two statements leaves a fresh marker behind
+        # with no tab open, and the replacement process one second later reads
+        # that marker and suppresses itself. Recording only a *successful* open
+        # can cost a duplicate tab if the pair races; never opening is worse.
+        if not _open_browser():
+            return
         try:
             os.makedirs(os.path.dirname(marker), exist_ok=True)
             with open(marker, "w") as f:
                 f.write(str(time.time()))
         except OSError:
-            pass
-
-        try:
-            webbrowser.open(_DASHBOARD_URL)
-        except Exception:
             pass
 
     threading.Thread(target=_launch, daemon=True).start()
