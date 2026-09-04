@@ -140,6 +140,11 @@ async function assignFile(lane) {
   }
   lane.fileStatus.textContent = data.file ? "assigned" : "cleared";
   lane.fileStatus.className = "file-status ok";
+
+  // Alignment names come from the drawing, so a different drawing means a
+  // different list: drop the cache and redraw the forms against the new one.
+  forgetOptions(lane);
+  renderSequence(lane);
 }
 
 // ── Block palette and sequence ────────────────────────────────────────────────
@@ -269,6 +274,52 @@ function renderField(lane, block, field) {
   const swatch = field.type === "color" ? document.createElement("span") : null;
   let input;
 
+  if (field.type === "multichoice") {
+    input = document.createElement("select");
+    input.multiple = true;
+    input.size = 4;
+    const chosen = new Set(Array.isArray(value) ? value.map(String) : []);
+
+    /* Options come from the assigned drawing, not the block spec, so the list
+       is fetched per lane and cached. Until it arrives the select shows why it
+       is empty rather than looking broken. */
+    const placeholder = document.createElement("option");
+    placeholder.disabled = true;
+    placeholder.textContent = "loading\u2026";
+    input.appendChild(placeholder);
+
+    optionsFor(lane, field.options_from).then(({ names, why }) => {
+      input.textContent = "";
+      if (!names.length) {
+        const empty = document.createElement("option");
+        empty.disabled = true;
+        empty.textContent = why ? `none \u2014 ${why}` : "none in this drawing";
+        input.appendChild(empty);
+        return;
+      }
+      for (const name of names) {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        option.selected = chosen.has(name);
+        input.appendChild(option);
+      }
+    });
+
+    input.className = "param-input";
+    input.addEventListener("change", () => {
+      block.params[field.name] = Array.from(input.selectedOptions).map((o) => o.value);
+      saveSequence(lane);
+    });
+    wrap.appendChild(input);
+
+    const hint = document.createElement("span");
+    hint.className = "param-hint";
+    hint.textContent = "none = all";
+    wrap.appendChild(hint);
+    return wrap;
+  }
+
   if (field.type === "choice" || field.type === "bool") {
     input = document.createElement("select");
     const options =
@@ -324,6 +375,40 @@ function renderField(lane, block, field) {
 
   wrap.appendChild(input);
   return wrap;
+}
+
+/** Per-lane cache of drawing-sourced option lists (currently alignments).
+ *  Refetched when the lane's drawing changes, since the names come from it. */
+const optionCache = new Map();
+
+function optionsCacheKey(lane, source) {
+  return `${lane.id}:${source}:${lane.fileInput.value.trim()}`;
+}
+
+async function optionsFor(lane, source) {
+  const key = optionsCacheKey(lane, source);
+  if (optionCache.has(key)) return optionCache.get(key);
+
+  const pending = (async () => {
+    try {
+      const res = await fetch(
+        `/dashboards/${encodeURIComponent(lane.id)}/${source}`);
+      const body = await res.json();
+      return { names: body[source] || [], why: body.why || "" };
+    } catch (e) {
+      return { names: [], why: "the dashboard server did not answer" };
+    }
+  })();
+
+  optionCache.set(key, pending);
+  return pending;
+}
+
+/** The drawing changed, so anything sourced from it is stale. */
+function forgetOptions(lane) {
+  for (const key of Array.from(optionCache.keys())) {
+    if (key.startsWith(`${lane.id}:`)) optionCache.delete(key);
+  }
 }
 
 function paintSwatch(swatch, value) {

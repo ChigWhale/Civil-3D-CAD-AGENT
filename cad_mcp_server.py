@@ -1,11 +1,13 @@
 ﻿import requests
 import json, openpyxl, os
-import base64, functools, inspect, time
+import base64, functools, inspect, math, time
 import socket, subprocess, sys, threading, webbrowser
 from urllib.parse import quote
 from collections import defaultdict
 from mcp.server.fastmcp import FastMCP
 import dashboard_events
+import driveways
+import swales
 from dashboard_events import SESSION_ID, DashboardError, emit, resolve_file
 
 mcp     = FastMCP("CAD Agent")
@@ -532,6 +534,142 @@ def quantify(objOfInterest: list[str], quantitiesOfInterest: dict,
             f"DEBUG objOfInterest: {list(wanted)}\n"
             f"DEBUG quantitiesOfInterest: {quantitiesOfInterest}")
 
+def _get_nested(file: str | None, layer_suffixes: list) -> dict:
+    """Geometry from inside block references / xrefs, in world coordinates.
+
+    Filtered by layer suffix because a site xref carries far more than any one
+    caller wants. Returns empty on an older plugin that has no /nested route, so
+    a stale DLL degrades to "no pads found" rather than an unexplained failure."""
+    try:
+        response = requests.get(f"{BASE}/nested",
+                                params={"file": file, "layers": ",".join(layer_suffixes)},
+                                timeout=TIMEOUT)
+        data = response.json()
+        return data if isinstance(data, dict) and "error" not in data else {}
+    except (requests.exceptions.RequestException, ValueError):
+        return {}
+
+
+@mcp.tool()
+@observed
+def draw_driveways(dashboard: str, alignment: str = "", layer: str = "0",
+                   width: float = 20.0, radius: float = 5.0,
+                   max_offset: float = 150.0) -> str:
+    """Draws a driveway from every lot pad out to the back of road.
+
+    For each pad (a polyline on a lot pad layer -- "c-lots-pad" or one of the
+    width variants "c-lots-pad-30/-40/-50", matched on the end of the name so
+    xrefed layers count) this finds the
+    FRONTAGE edge facing the back of road (layer "C-ROAD-BACK") — an edge
+    crossing the pad's major axis, so the driveway runs down the length of the
+    lot rather than off its side — takes the upstream end of that edge, and runs
+    two lines perpendicular to the road `width` apart, each finished with a
+    `radius` arc tangent to both the driveway line and the road.
+
+    max_offset: only pads whose centroid is within this many feet of the
+    alignment are served. One alignment is one street while the pad layer covers
+    the whole subdivision, so pads beyond it front another street and are left
+    alone; they are reported as "not_on_this_alignment", not as failures.
+
+    alignment: the street or streets to work along, as one name or a comma
+    separated list ("RD-1, RD-2"). Leave it blank to use every alignment in the
+    drawing. Each pad is worked against the ONE street it fronts — decided by
+    which alignment its frontage edge faces — so a lot in reach of two streets
+    still gets a single driveway. The alignment also gives flow direction:
+    "upstream" is the lower station along it, and the driveway is offset
+    downstream from that corner. Call get_model_space for the available names.
+
+    dashboard: REQUIRED id of the dashboard to work through — the user assigns
+    its drawing; you never choose one. layer: layer to draw on ("0" by default).
+
+    Reports how many pads were drawn and, for any that were not, why."""
+    file = _file_for(dashboard)
+
+    raw = _get("/modelspace", file)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return raw
+    if isinstance(data, dict) and "error" in data:
+        return raw
+
+    # Pads are normally XREFED in, so they are not in model space at all -- the
+    # xref is one block reference there. Pull the nested geometry (already
+    # transformed to world coordinates by the plugin) and merge it in, so the
+    # planner sees pads and road whether they are drawn here or referenced.
+    nested = _get_nested(file, [*driveways.PAD_LAYER_SUFFIXES, driveways.ROAD_LAYER])
+    for category in ("polylines", "lines", "arcs"):
+        if nested.get(category):
+            data[category] = list(data.get(category) or []) + nested[category]
+
+    try:
+        payloads, summary = driveways.plan(data, alignment, layer, width, radius,
+                                           max_offset)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    for payload in payloads:
+        _post(payload, file)
+    return json.dumps(summary)
+
+
+@mcp.tool()
+@observed
+def draw_rear_swales(dashboard: str, alignment: str = "", layer: str = "0",
+                     offset: float = 5.0, first_leg: float = 10.0,
+                     lot_line_layer: str = "c-lots-line",
+                     max_offset: float = 150.0) -> str:
+    """Draws a rear yard swale behind every lot pad.
+
+    Per pad: the rear edge (the pad edge furthest from back of road) is offset
+    `offset` ft away from the road into the rear yard, split `first_leg` ft from
+    its upstream end into two polylines, and a 45-degree leg runs roadward from
+    each outer end until it meets a lot line.
+
+    lot_line_layer: layer the legs stop against, matched by suffix so an xrefed
+    "x-plat (ph1a)|c-lots-line" is found. Lot line naming varies between plats;
+    if none is found the error lists the layers the drawing actually has.
+
+    alignment: the street or streets to work along, as one name or a comma
+    separated list ("RD-1, RD-2"); blank means every alignment in the drawing.
+    Each pad is worked against the ONE street it fronts, exactly as
+    draw_driveways does, and that alignment's heading gives flow direction, so
+    "upstream" is the end the 10ft first part is measured from. max_offset:
+    only pads within this many feet of an alignment are served.
+
+    dashboard: REQUIRED id of the dashboard to work through — the user assigns
+    its drawing. layer: layer to draw on.
+
+    Reports how many pads were drawn and, for any that were not, why."""
+    file = _file_for(dashboard)
+
+    raw = _get("/modelspace", file)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return raw
+    if isinstance(data, dict) and "error" in data:
+        return raw
+
+    # Pads and lot lines are normally XREFED in, so model space holds only the
+    # xref's block reference — merge the nested geometry the same way.
+    nested = _get_nested(file, [*driveways.PAD_LAYER_SUFFIXES, driveways.ROAD_LAYER,
+                                lot_line_layer])
+    for category in ("polylines", "lines", "arcs"):
+        if nested.get(category):
+            data[category] = list(data.get(category) or []) + nested[category]
+
+    try:
+        payloads, summary = swales.plan(data, alignment, layer, offset, first_leg,
+                                        swales.LEG_ANGLE, lot_line_layer, max_offset)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    for payload in payloads:
+        _post(payload, file)
+    return json.dumps(summary)
+
+
 @mcp.tool()
 @observed
 def classify_image(path: str) -> str:
@@ -731,32 +869,30 @@ def _ensure_dashboard_running() -> None:
         # hand there, and nothing can be assigned a drawing until they do.
         #
         # Claude Desktop launches two cad_mcp_server.py processes about a second
-        # apart, so a short cooldown keeps that pair from opening two windows. Keep
-        # it small -- it should only dedupe that near-simultaneous pair, never
-        # suppress a genuine later restart.
-        marker = os.path.join(repo_dir, "dashboard", "uploads", ".last_browser_open")
+        # apart and BOTH arrive here, so something has to pick one. The dashboard
+        # server does it: /claim-browser runs on its single event loop with no
+        # await between check and update, so exactly one process is granted the
+        # open. This replaced a marker file, which could not do the job -- a
+        # check-then-write test is not atomic, and both processes could pass it
+        # before either wrote, opening two windows.
         try:
-            if time.time() - os.path.getmtime(marker) < 5:
-                return
-        except OSError:
-            pass
-
-        # Open FIRST, record second. The marker used to be written before the
-        # open, which loses the tab entirely: this runs on a daemon thread, and
-        # Claude Desktop tears a server down and restarts it (the transport
-        # closes and re-initializes within the same millisecond in its log). A
-        # process killed between the two statements leaves a fresh marker behind
-        # with no tab open, and the replacement process one second later reads
-        # that marker and suppresses itself. Recording only a *successful* open
-        # can cost a duplicate tab if the pair races; never opening is worse.
-        if not _open_browser():
+            granted = requests.post(
+                f"{dashboard_events.DASHBOARD_BASE}/claim-browser", timeout=3
+            ).json().get("open", False)
+        except Exception as e:
+            _log(f"Could not ask the dashboard which process should open a tab: {e}")
             return
-        try:
-            os.makedirs(os.path.dirname(marker), exist_ok=True)
-            with open(marker, "w") as f:
-                f.write(str(time.time()))
-        except OSError:
-            pass
+        if not granted:
+            return  # the sibling process is opening it
+
+        if not _open_browser():
+            # Give the claim back rather than letting the pair go silent: the
+            # sibling arriving a second later can then try instead.
+            try:
+                requests.post(f"{dashboard_events.DASHBOARD_BASE}/release-browser",
+                              timeout=3)
+            except Exception:
+                pass
 
     threading.Thread(target=_launch, daemon=True).start()
 

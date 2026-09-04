@@ -76,6 +76,15 @@ def _handles(raw, label: str) -> list:
     return handles
 
 
+def _names(raw, label: str) -> list:
+    """Accepts a list of names from a picker, or a comma separated string."""
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"{label} must be a list of names")
+    return [str(n).strip() for n in raw if str(n).strip()]
+
+
 def coerce_field(field: dict, raw):
     """Turns one raw form value into the typed value a builder expects.
 
@@ -121,6 +130,16 @@ def coerce_field(field: dict, raw):
         if len(points) < minimum:
             raise ValueError(f"{label} needs at least {minimum} points, got {len(points)}")
         return points
+
+    if kind == "multichoice":
+        # Options come from the assigned drawing rather than the spec, so the
+        # browser fills them in from "options_from" -- see /dashboards/{id}/
+        # alignments. An empty selection is meaningful (it means "all"), so it
+        # is passed through rather than treated as a missing value.
+        names = _names(raw, label)
+        if not names and field.get("min_items"):
+            raise ValueError(f"{label} needs at least one selection")
+        return names
 
     if kind == "handles":
         handles = _handles(raw, label)
@@ -316,6 +335,60 @@ BLOCK_SPECS = [
              "help": "Hex object handles, comma separated."},
         ],
     },
+    {
+        "type": "draw_driveways",
+        "label": "Draw Driveways",
+        "group": "Generated",
+        "description": ("A driveway on every lot pad: perpendicular to the back "
+                        "of road from the upstream pad corner, with tangent "
+                        "fillets. Reads the drawing when it runs."),
+        # No "build": unlike every other block this cannot become a payload up
+        # front. It has to read the live drawing first, so the runner expands it
+        # at run time -- see EXPANDING_BLOCKS and _expand_block in server.py.
+        "expand": "driveways",
+        "fields": [
+            {"name": "alignment", "label": "Alignments", "type": "multichoice",
+             "options_from": "alignments", "default": [],
+             "help": "Pick every street to draw driveways along. Each pad is "
+                     "worked against the one street it fronts, so a lot in "
+                     "reach of two still gets a single driveway. Select none "
+                     "to use every alignment in the drawing."},
+            {"name": "layer", "label": "Layer", "type": "text", "default": "0"},
+            {"name": "width", "label": "Driveway width", "type": "number", "default": 20},
+            {"name": "radius", "label": "Fillet radius", "type": "number", "default": 5},
+            {"name": "max_offset", "label": "Serve pads within", "type": "number",
+             "default": 150,
+             "help": "Feet from the alignment. Pads further off front a "
+                     "different street and are left alone."},
+        ],
+    },
+    {
+        "type": "draw_rear_swales",
+        "label": "Draw Rear Swales",
+        "group": "Generated",
+        "description": ("A rear yard swale behind every pad: the back of pad "
+                        "offset into the rear yard, split 10ft from its upstream "
+                        "end, with 45-degree legs run out to the lot lines."),
+        "expand": "swales",   # reads the live drawing; see _expand in server.py
+        "fields": [
+            {"name": "alignment", "label": "Alignments", "type": "multichoice",
+             "options_from": "alignments", "default": [],
+             "help": "Pick every street to run swales behind. Each pad is "
+                     "worked against the one street it fronts. Select none "
+                     "to use every alignment in the drawing."},
+            {"name": "layer", "label": "Layer", "type": "text", "default": "0"},
+            {"name": "offset", "label": "Rear offset", "type": "number", "default": 5},
+            {"name": "first_leg", "label": "First part length", "type": "number", "default": 10},
+            {"name": "lot_line_layer", "label": "Lot line layer", "type": "text",
+             "default": "c-lots-line",
+             "help": "Layer the 45-degree legs stop against. Matched by suffix, so "
+                     "an xrefed 'x-plat (ph1a)|c-lots-line' is found too."},
+            {"name": "max_offset", "label": "Serve pads within", "type": "number",
+             "default": 150,
+             "help": "Feet from the alignment. Pads further off front a "
+                     "different street and are left alone."},
+        ],
+    },
 ]
 
 SPECS_BY_TYPE = {spec["type"]: spec for spec in BLOCK_SPECS}
@@ -354,6 +427,11 @@ def build_block(block_type: str, values: dict) -> dict:
         value = coerce_field(field, (values or {}).get(field["name"]))
         if value is not _MISSING:
             resolved[field["name"]] = value
+
+    if "expand" in spec:
+        # Validated, but not buildable yet: carry the parameters through so the
+        # runner can turn this into real payloads once it has read the drawing.
+        return {"intent": "__expand__", "expander": spec["expand"], "params": resolved}
     return spec["build"](resolved)
 
 

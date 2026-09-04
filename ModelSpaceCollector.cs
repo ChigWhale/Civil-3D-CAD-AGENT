@@ -327,6 +327,7 @@ namespace CADAgent
                 foreach (var pl in polylines)
                 {
                     var verts = new JArray();
+                    var bulges = new JArray();
                     int numVert = pl.NumberOfVertices;
                     double[] xPoint = new double[numVert];
                     double[] yPoint = new double[numVert];
@@ -336,6 +337,11 @@ namespace CADAgent
                         xPoint[i] = pt.X;
                         yPoint[i] = pt.Y;
                         verts.Add(new JArray(pt.X, pt.Y));
+                        // Bulge i belongs to the segment leaving vertex i. Without
+                        // it a curved curb is read as a chord between its vertices,
+                        // a sagitta away from the real curb -- consumers that need
+                        // the true curve (driveways) rebuild the arc from this.
+                        bulges.Add(pl.GetBulgeAt(i));
                     }
                     var (eigenValues, mainEigenvector, secondaryEigenvector) = PolyPCA(xPoint, yPoint);
                     double[] scaledMainEigenvector = mainEigenvector.Select(v => v * Math.Sqrt(eigenValues[1])).ToArray();
@@ -360,6 +366,7 @@ namespace CADAgent
                         ["layer"]                = pl.Layer,
                         ["closed"]               = pl.Closed,
                         ["vertices"]             = verts,
+                        ["bulges"]               = bulges,
                         ["length"]               = pl.Length,
                         ["area"]                 = pl.Area,
                         ["centroid"]             = new JArray(cx, cy),

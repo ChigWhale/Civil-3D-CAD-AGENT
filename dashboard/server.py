@@ -15,6 +15,7 @@ Run with: uvicorn dashboard.server:app --port 8765
 
 import asyncio
 import hashlib
+import sys
 import os
 import shutil
 import time
@@ -32,6 +33,11 @@ try:
     from . import blocks
 except ImportError:  # pragma: no cover - depends only on how the app was started
     import blocks
+
+# Shared with the MCP tool of the same name, so both draw identical geometry.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import driveways
+import swales
 
 # Overridable so the command runner can be exercised against a stub instead of a
 # live drawing (CAD_PLUGIN_BASE=http://127.0.0.1:5399).
@@ -81,6 +87,39 @@ async def _broadcast(event: dict) -> None:
     for result in results:
         if isinstance(result, WebSocket):
             _clients.discard(result)
+
+
+# ── Browser-open arbitration ──────────────────────────────────────────────────
+
+_browser_claim_at = 0.0
+_BROWSER_CLAIM_WINDOW = 10.0
+
+
+@app.post("/claim-browser")
+async def claim_browser():
+    """Decides which cad_mcp_server.py process opens the browser window.
+
+    Claude Desktop starts two of them about a second apart and both reach the
+    point of wanting to open a tab. A marker file cannot settle this: check-then-
+    write is not atomic, so both can pass the check before either writes, and the
+    user gets two windows. This handler runs on the server's single event loop
+    with no await between the check and the update, so exactly one caller wins.
+    """
+    global _browser_claim_at
+    now = time.time()
+    if now - _browser_claim_at < _BROWSER_CLAIM_WINDOW:
+        return {"open": False}
+    _browser_claim_at = now
+    return {"open": True}
+
+
+@app.post("/release-browser")
+async def release_browser():
+    """Hands the claim back when the winner could not actually open a browser, so
+    its sibling a second later still gets a chance instead of no tab opening."""
+    global _browser_claim_at
+    _browser_claim_at = 0.0
+    return {"ok": True}
 
 
 # ── Dashboards (user-created workspaces) ──────────────────────────────────────
@@ -174,6 +213,36 @@ async def set_dashboard_file(dashboard_id: str, request: Request):
 _runs: dict[str, asyncio.Task] = {}
 
 
+@app.get("/dashboards/{dashboard_id}/alignments")
+async def list_alignment_names(dashboard_id: str):
+    """Alignment names in the dashboard's assigned drawing.
+
+    Backs the block palette's alignment picker, so streets are chosen from what
+    the drawing actually contains instead of being typed from memory."""
+    d = _dashboards.get(dashboard_id)
+    if d is None:
+        return JSONResponse({"error": f"No dashboard '{dashboard_id}'."},
+                            status_code=404)
+    if not d["file"]:
+        return {"alignments": [], "why": "no drawing assigned yet"}
+
+    try:
+        response = await asyncio.to_thread(
+            requests.get, f"{PLUGIN_BASE}/modelspace",
+            params={"file": d["file"]}, timeout=PLUGIN_TIMEOUT)
+        data = response.json()
+    except requests.exceptions.RequestException:
+        return {"alignments": [], "why": "Civil 3D is not reachable"}
+    except ValueError:
+        return {"alignments": [], "why": "the drawing data came back unreadable"}
+
+    if isinstance(data, dict) and "error" in data:
+        return {"alignments": [], "why": str(data["error"])}
+
+    names = [a.get("name") for a in (data.get("alignments") or []) if a.get("name")]
+    return {"alignments": names}
+
+
 @app.get("/blocks")
 async def list_blocks():
     """The block palette. The browser builds every parameter form from this, so
@@ -182,7 +251,100 @@ async def list_blocks():
 
 
 
+async def _expand(payload: dict, file: str) -> list:
+    """Turns an "__expand__" placeholder into real payloads.
+
+    Blocks like draw_driveways cannot be compiled up front: what they draw
+    depends on what is in the drawing right now. So the runner reads the model
+    space when it reaches one and expands it in place, keeping the block id on
+    every payload so the browser still highlights the block it came from."""
+    expander = payload.get("expander")
+    planners = {"driveways": driveways.plan, "swales": swales.plan}
+    if expander not in planners:
+        raise RuntimeError(f"Unknown expanding block '{expander}'.")
+
+    try:
+        response = await asyncio.to_thread(
+            requests.get, f"{PLUGIN_BASE}/modelspace",
+            params={"file": file}, timeout=PLUGIN_TIMEOUT)
+        data = response.json()
+    except requests.exceptions.RequestException:
+        raise RuntimeError("Civil 3D is not reachable — make sure AutoCAD is open "
+                           "with the CADAgent plugin loaded.")
+    except ValueError:
+        raise RuntimeError("The drawing data came back unreadable.")
+
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(str(data["error"]))
+
+    # Pads are usually XREFED in, so model space holds only the xref's block
+    # reference. Merge the nested geometry (world coordinates, done plugin-side)
+    # so the planner sees pads whether they are drawn here or referenced.
+    params = payload.get("params") or {}
+    lot_line_layer = str(params.get("lot_line_layer")
+                         or swales.LOT_LINE_SUFFIX).strip()
+    try:
+        nested_response = await asyncio.to_thread(
+            requests.get, f"{PLUGIN_BASE}/nested",
+            params={"file": file,
+                    "layers": ",".join([*driveways.PAD_LAYER_SUFFIXES,
+                                        driveways.ROAD_LAYER,
+                                        lot_line_layer])},
+            timeout=PLUGIN_TIMEOUT)
+        nested = nested_response.json()
+        if isinstance(nested, dict) and "error" not in nested:
+            for category in ("polylines", "lines", "arcs"):
+                if nested.get(category):
+                    data[category] = list(data.get(category) or []) + nested[category]
+    except (requests.exceptions.RequestException, ValueError):
+        pass  # older plugin without /nested: fall through to the model space data
+
+    try:
+        if expander == "driveways":
+            built, summary = planners[expander](
+                data,
+                params.get("alignment"),
+                params.get("layer", "0"),
+                float(params.get("width", 20.0)),
+                float(params.get("radius", 5.0)),
+                float(params.get("max_offset", driveways.MAX_OFFSET)),
+            )
+        else:
+            built, summary = planners[expander](
+                data,
+                params.get("alignment"),
+                params.get("layer", "0"),
+                float(params.get("offset", 5.0)),
+                float(params.get("first_leg", 10.0)),
+                swales.LEG_ANGLE,
+                lot_line_layer,
+                float(params.get("max_offset", driveways.MAX_OFFSET)),
+            )
+    except ValueError as e:
+        raise RuntimeError(str(e))  # no pads, no road, unknown alignment
+
+    if not built:
+        raise RuntimeError(f"Nothing to draw: {summary['skipped']} pad(s) skipped.")
+
+    block_id = payload.get("_block")
+    return [{**p, "_block": block_id} for p in built]
+
+
 async def _run_sequence(dashboard_id: str, commands: list, file: str) -> None:
+    try:
+        resolved = []
+        for payload in commands:
+            if payload.get("intent") == "__expand__":
+                resolved.extend(await _expand(payload, file))
+            else:
+                resolved.append(payload)
+        commands = resolved
+    except Exception as e:
+        await _broadcast({"type": "run_failed", "dashboard": dashboard_id,
+                          "completed": 0, "error": str(e), "_ts": time.time()})
+        _runs.pop(dashboard_id, None)
+        return
+
     await _broadcast({"type": "run_started", "dashboard": dashboard_id,
                       "total": len(commands), "_ts": time.time()})
     completed = 0

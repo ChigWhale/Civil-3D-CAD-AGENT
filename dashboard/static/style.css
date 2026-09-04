@@ -330,6 +330,17 @@ main {
   line-height: 1.4;
 }
 
+.param-multichoice { align-items: flex-start; }
+.param-multichoice .param-input {
+  width: 150px;
+  padding: 2px;
+}
+.param-hint {
+  color: var(--muted, #7a7a85);
+  font-size: 11px;
+  align-self: center;
+}
+
 .param-swatch {
   width: 11px;
   height: 11px;

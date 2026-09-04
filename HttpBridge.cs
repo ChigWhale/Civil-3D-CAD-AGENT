@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Text;
@@ -25,13 +26,28 @@ namespace CADAgent
         private readonly ConcurrentQueue<HttpListenerContext> _pending = new();
         private readonly object                        _startLock = new object();
 
-        public void Start(string prefix = "http://localhost:5199/")
+        // BOTH loopback spellings are registered on purpose. HttpListener matches
+        // on the request's Host header, so a client calling 127.0.0.1 against a
+        // listener registered only for "localhost" is rejected by http.sys with
+        // "Bad Request - Invalid Hostname" before this code ever sees it.
+        // Clients use 127.0.0.1 because resolving "localhost" tries IPv6 ::1
+        // first here and stalls ~2s per request before falling back to IPv4
+        // (measured 2.06s vs 0.015s), and every tool call makes several requests.
+        private static readonly string[] _defaultPrefixes =
+        {
+            "http://127.0.0.1:5199/",
+            "http://localhost:5199/",
+        };
+
+        public void Start(params string[] prefixes)
         {
             lock (_startLock)
             {
                 if (_listener?.IsListening == true) return;
                 _listener = new HttpListener();
-                _listener.Prefixes.Add(prefix);
+                foreach (string prefix in
+                         (prefixes == null || prefixes.Length == 0) ? _defaultPrefixes : prefixes)
+                    _listener.Prefixes.Add(prefix);
                 _listener.Start();
                 AcadApp.Idle += OnIdle;
                 BeginAccept();
@@ -103,6 +119,26 @@ namespace CADAgent
             {
                 string body; int status;
                 try   { body = HandleDocuments(); status = 200; }
+                catch (Exception ex) { body = Error(ex.Message); status = 500; }
+                Respond(ctx, body, status);
+                return;
+            }
+
+            if (path == "/nested" && method == "GET")
+            {
+                string body; int status;
+                try
+                {
+                    Document target = ResolveDocument(ctx.Request.QueryString["file"]);
+                    if (target == null) { body = Error("No active document"); status = 500; }
+                    else
+                    {
+                        string layers = ctx.Request.QueryString["layers"] ?? "";
+                        using (target.LockDocument())
+                            body = NestedCollector.Collect(target, layers.Split(','));
+                        status = 200;
+                    }
+                }
                 catch (Exception ex) { body = Error(ex.Message); status = 500; }
                 Respond(ctx, body, status);
                 return;
