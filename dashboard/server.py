@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover - depends only on how the app was starte
 # Shared with the MCP tool of the same name, so both draw identical geometry.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import driveways
+import spatial
 import swales
 
 # Overridable so the command runner can be exercised against a stub instead of a
@@ -243,6 +244,17 @@ async def list_alignment_names(dashboard_id: str):
     return {"alignments": names}
 
 
+# Bumped whenever the server or its static files change in a way a running
+# instance cannot pick up. cad_mcp_server.py probes /version on startup and
+# treats a server that doesn't answer with this value as stale.
+DASHBOARD_VERSION = "2026-09-08.2"
+
+
+@app.get("/version")
+async def version():
+    return {"version": DASHBOARD_VERSION, "blocks": len(blocks.BLOCK_SPECS)}
+
+
 @app.get("/blocks")
 async def list_blocks():
     """The block palette. The browser builds every parameter form from this, so
@@ -251,7 +263,7 @@ async def list_blocks():
 
 
 
-async def _expand(payload: dict, file: str) -> list:
+async def _expand(payload: dict, file: str, dashboard_id: str = None) -> list:
     """Turns an "__expand__" placeholder into real payloads.
 
     Blocks like draw_driveways cannot be compiled up front: what they draw
@@ -326,8 +338,53 @@ async def _expand(payload: dict, file: str) -> list:
     if not built:
         raise RuntimeError(f"Nothing to draw: {summary['skipped']} pad(s) skipped.")
 
+    # The dry-run gate: the planner's own output checked against the drawing
+    # before anything is posted. A warning, not a refusal -- a crossing is worth
+    # a look, and the first false positive would otherwise get the gate switched
+    # off. Touching at an end (a fillet on the curb, a leg on a lot line) does
+    # not count; only geometry that actually passes through something does.
+    if dashboard_id is not None:
+        try:
+            crossings = spatial.build(data).crossings(
+                built, tags=["pad", "lot_line", "curb", "driveway", "swale"])
+        except Exception as e:  # the gate must never take the run down with it
+            crossings = []
+            await _broadcast({"type": "run_warning", "dashboard": dashboard_id,
+                              "tool": expander, "message": f"dry-run check skipped: {e}",
+                              "_ts": time.time()})
+        if crossings:
+            by_tag = {}
+            for c in crossings:
+                by_tag[c["tag"]] = by_tag.get(c["tag"], 0) + 1
+            words = ", ".join(f"{n} cross a {t.replace('_', ' ')}"
+                              for t, n in sorted(by_tag.items()))
+            await _broadcast({"type": "run_warning", "dashboard": dashboard_id,
+                              "tool": expander,
+                              "message": f"{len(built)} payloads planned; {words}",
+                              "crossings": crossings[:50], "_ts": time.time()})
+
     block_id = payload.get("_block")
     return [{**p, "_block": block_id} for p in built]
+
+
+def _plugin_failure(response) -> str | None:
+    """The plugin answers a failed command with HTTP 200 and a JSON body that says
+    so ({"ok": false, "message": ...} from the drafting command set, or
+    {"error": ...}), or with a 500. Any of those is a failed step: later blocks
+    usually depend on the earlier ones, so the run stops there."""
+    if response.status_code >= 400:
+        return f"plugin returned HTTP {response.status_code}: {response.text[:200]}"
+    try:
+        body = response.json()
+    except ValueError:
+        return None  # legacy plain-text replies ("Line created.") are successes
+    if not isinstance(body, dict):
+        return None
+    if body.get("error"):
+        return str(body["error"])
+    if body.get("ok") is False:
+        return str(body.get("message") or "the plugin reported a failure")
+    return None
 
 
 async def _run_sequence(dashboard_id: str, commands: list, file: str) -> None:
@@ -335,7 +392,7 @@ async def _run_sequence(dashboard_id: str, commands: list, file: str) -> None:
         resolved = []
         for payload in commands:
             if payload.get("intent") == "__expand__":
-                resolved.extend(await _expand(payload, file))
+                resolved.extend(await _expand(payload, file, dashboard_id))
             else:
                 resolved.append(payload)
         commands = resolved
@@ -366,7 +423,7 @@ async def _run_sequence(dashboard_id: str, commands: list, file: str) -> None:
                 response = await asyncio.to_thread(
                     requests.post, f"{PLUGIN_BASE}/execute", json=body, timeout=PLUGIN_TIMEOUT
                 )
-                result, error = response.text, None
+                result, error = response.text, _plugin_failure(response)
             except requests.exceptions.RequestException:
                 result, error = None, ("Civil 3D is not reachable — make sure AutoCAD is "
                                        "open with the CADAgent plugin loaded.")

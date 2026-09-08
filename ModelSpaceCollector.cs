@@ -187,6 +187,15 @@ namespace CADAgent
                 var arcs          = new List<Arc>();
                 var polylines     = new List<Polyline>();
                 var blocks        = new List<BlockReference>();
+                // Entity types the general drafting command set can create; summarised so the
+                // agent gets their handles back from get_model_space and can act on them.
+                var circles       = new List<AcadEntity>();
+                var ellipses      = new List<AcadEntity>();
+                var splines       = new List<AcadEntity>();
+                var points        = new List<AcadEntity>();
+                var texts         = new List<AcadEntity>();
+                var dimensions    = new List<AcadEntity>();
+                var hatches       = new List<AcadEntity>();
                 var standardEntities = new Dictionary<string, int>();
 
                 foreach (ObjectId objId in ms)
@@ -211,6 +220,13 @@ namespace CADAgent
                         if (entity is Arc            ar) { arcs.Add(ar);         continue; }
                         if (entity is Polyline       pl) { polylines.Add(pl);    continue; }
                         if (entity is BlockReference br) { blocks.Add(br);       continue; }
+                        if (entity is Circle)            { circles.Add(entity);    continue; }
+                        if (entity is Ellipse)           { ellipses.Add(entity);   continue; }
+                        if (entity is Spline)            { splines.Add(entity);    continue; }
+                        if (entity is DBPoint)           { points.Add(entity);     continue; }
+                        if (entity is DBText || entity is MText || entity is MLeader) { texts.Add(entity); continue; }
+                        if (entity is Dimension)         { dimensions.Add(entity); continue; }
+                        if (entity is Hatch)             { hatches.Add(entity);    continue; }
 
                         string typeName = entity.GetType().Name;
                         standardEntities[typeName] =
@@ -406,6 +422,47 @@ namespace CADAgent
                     catch { }
                 }
                 root["blocks"] = blockArray;
+
+                // Circles, ellipses, splines, points, text, dimensions, hatches: compact summaries
+                // (handle, layer, key geometry) from the same code select_entities uses.
+                JArray Summaries(List<AcadEntity> list)
+                {
+                    var arr = new JArray();
+                    foreach (var e in list)
+                    {
+                        try { arr.Add(CadCommands.Summarize(tr, e, false)); } catch { }
+                    }
+                    return arr;
+                }
+                root["circles"]    = Summaries(circles);
+                root["ellipses"]   = Summaries(ellipses);
+                root["splines"]    = Summaries(splines);
+                root["points"]     = Summaries(points);
+                root["texts"]      = Summaries(texts);
+                root["dimensions"] = Summaries(dimensions);
+                root["hatches"]    = Summaries(hatches);
+
+                // Layers (name, colour, state) — previously advertised as a category but never emitted.
+                var layerArray = new JArray();
+                try
+                {
+                    var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+                    foreach (ObjectId lid in lt)
+                    {
+                        var ltr = (LayerTableRecord)tr.GetObject(lid, OpenMode.ForRead);
+                        layerArray.Add(new JObject
+                        {
+                            ["name"]    = ltr.Name,
+                            ["color"]   = ltr.Color.ColorIndex,
+                            ["on"]      = !ltr.IsOff,
+                            ["frozen"]  = ltr.IsFrozen,
+                            ["locked"]  = ltr.IsLocked,
+                            ["current"] = lid == db.Clayer,
+                        });
+                    }
+                }
+                catch { }
+                root["layers"] = layerArray;
 
                 // Standard AutoCAD entities (all other types, by count)
                 root["standard_entities"] = new JArray(

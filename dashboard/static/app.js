@@ -16,12 +16,10 @@ let blockSpecs = [];
 let specsByType = new Map();
 let maxRepeat = 500;
 
-// The board draws the agent's MCP tools; a sequence sends raw plugin intents.
-// These are the two names for the same square.
-const NODE_ALIASES = {
-  add_to_layer: "move_to_layer",
-  remove_from_layer: "move_to_layer",
-};
+// How long a finished tool stays in the bubble before the agent goes back to idle.
+const BUBBLE_HOLD_MS = 1200;
+// How many recent tools the trail under the agent keeps.
+const TRAIL_LEN = 8;
 
 // Standard AutoCAD Color Index entries worth previewing. Anything outside this
 // set just gets no swatch rather than a wrong one.
@@ -48,20 +46,22 @@ function createLane(board) {
   avatar.src = avatarUrl;
   thumb.src = avatarUrl;
 
-  const nodes = {};
-  el.querySelectorAll(".node").forEach((n) => (nodes[n.dataset.tool] = n));
-
   const lane = {
     id: board.id,
     el,
     avatar,
     thumb,
-    nodes,
-    board: el.querySelector(".board"),
+    bubble: el.querySelector(".tool-bubble"),
+    bubbleName: el.querySelector(".tool-bubble-name"),
+    bubbleDetail: el.querySelector(".tool-bubble-detail"),
+    trail: el.querySelector(".tool-trail"),
     log: el.querySelector(".log"),
     fileInput: el.querySelector(".file-input"),
     fileStatus: el.querySelector(".file-status"),
     palette: el.querySelector(".palette"),
+    paletteSearch: el.querySelector(".palette-search"),
+    paletteMenu: el.querySelector(".palette-menu"),
+    paletteCount: el.querySelector(".palette-count"),
     sequenceEl: el.querySelector(".sequence"),
     sequenceEmpty: el.querySelector(".sequence-empty"),
     runBtn: el.querySelector(".run-btn"),
@@ -97,8 +97,6 @@ function createLane(board) {
   lanesEl.appendChild(el);
   lanes.set(String(board.id), lane);
   emptyState.hidden = true;
-
-  requestAnimationFrame(() => moveAvatarTo(lane, lane.nodes.idle));
   return lane;
 }
 
@@ -149,23 +147,98 @@ async function assignFile(lane) {
 
 // ── Block palette and sequence ────────────────────────────────────────────────
 
+/** A search box over a grouped menu. With 100+ blocks a row of buttons would be
+ *  most of the screen, so the menu only opens on focus and narrows as you type;
+ *  Enter adds the first match. */
 function buildPalette(lane) {
-  let group = null;
+  const menu = lane.paletteMenu;
+  const search = lane.paletteSearch;
+  const groups = new Map(); // group name -> [{spec, button}]
+
   for (const spec of blockSpecs) {
-    if (spec.group && spec.group !== group) {
-      group = spec.group;
-      const label = document.createElement("span");
-      label.className = "palette-group";
-      label.textContent = group;
-      lane.palette.appendChild(label);
-    }
+    const group = spec.group || "Other";
+    if (!groups.has(group)) groups.set(group, []);
     const btn = document.createElement("button");
+    btn.type = "button";
     btn.className = "palette-btn";
-    btn.textContent = spec.label;
-    btn.title = `${spec.description}\n\ntyped form: ${spec.usage}`;
-    btn.addEventListener("click", () => addBlock(lane, spec.type));
-    lane.palette.appendChild(btn);
+    btn.innerHTML = `<span class="palette-btn-label"></span><span class="palette-btn-desc"></span>`;
+    btn.querySelector(".palette-btn-label").textContent = spec.label;
+    btn.querySelector(".palette-btn-desc").textContent = spec.description;
+    btn.title = `${spec.help || spec.description}\n\ntyped form: ${spec.usage}`;
+    // mousedown, not click: the search box blurs on click and would close the menu first.
+    btn.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      addBlock(lane, spec.type);
+      search.value = "";
+      filterPalette(lane, "");
+      closePalette(lane);
+    });
+    groups.get(group).push({ spec, button: btn });
   }
+
+  lane.paletteGroups = [];
+  for (const [name, items] of groups) {
+    const section = document.createElement("div");
+    section.className = "palette-section";
+    const head = document.createElement("div");
+    head.className = "palette-group";
+    head.textContent = name;
+    section.appendChild(head);
+    const list = document.createElement("div");
+    list.className = "palette-list";
+    for (const { button } of items) list.appendChild(button);
+    section.appendChild(list);
+    menu.appendChild(section);
+    lane.paletteGroups.push({ section, items });
+  }
+  lane.paletteCount.textContent = `${blockSpecs.length} commands`;
+
+  search.addEventListener("focus", () => openPalette(lane));
+  search.addEventListener("input", () => {
+    openPalette(lane);
+    filterPalette(lane, search.value);
+  });
+  search.addEventListener("blur", () => closePalette(lane));
+  search.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      search.value = "";
+      filterPalette(lane, "");
+      search.blur();
+    } else if (e.key === "Enter") {
+      const first = menu.querySelector(".palette-btn:not([hidden])");
+      if (first) {
+        e.preventDefault();
+        first.dispatchEvent(new MouseEvent("mousedown", { cancelable: true }));
+      }
+    }
+  });
+}
+
+function openPalette(lane) {
+  lane.paletteMenu.hidden = false;
+}
+
+function closePalette(lane) {
+  lane.paletteMenu.hidden = true;
+}
+
+function filterPalette(lane, query) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  let shown = 0;
+  for (const { section, items } of lane.paletteGroups) {
+    let visible = 0;
+    for (const { spec, button } of items) {
+      const hay = `${spec.type} ${spec.label} ${spec.description} ${spec.group}`.toLowerCase();
+      const match = terms.every((t) => hay.includes(t));
+      button.hidden = !match;
+      if (match) visible++;
+    }
+    section.hidden = visible === 0;
+    shown += visible;
+  }
+  lane.paletteCount.textContent = terms.length
+    ? `${shown} of ${blockSpecs.length} commands`
+    : `${blockSpecs.length} commands`;
 }
 
 /** A block's starting parameters: whatever the spec calls a default, as a
@@ -236,6 +309,7 @@ function renderBlock(lane, block, index) {
   el.querySelector(".block-step").textContent = index + 1;
   el.querySelector(".block-label").textContent = spec ? spec.label : block.type;
   el.querySelector(".block-desc").textContent = spec ? spec.description : "unknown block";
+  if (spec && spec.help) el.querySelector(".block-desc").title = spec.help;
 
   const repeat = el.querySelector(".repeat-input");
   repeat.max = maxRepeat;
@@ -345,6 +419,21 @@ function renderField(lane, block, field) {
     input = document.createElement("input");
     input.type = "text";
     input.placeholder = "2A1, 2A2";
+    input.value = value;
+  } else if (field.type === "point") {
+    input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = optionalBlank ? "x,y (optional)" : "x,y";
+    input.value = value;
+  } else if (field.type === "strings") {
+    input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = optionalBlank ? "a, b (optional)" : "a, b";
+    input.value = value;
+  } else if (field.type === "json") {
+    input = document.createElement("textarea");
+    input.rows = 2;
+    input.placeholder = optionalBlank ? '{"TAG": "value"} (optional)' : "JSON";
     input.value = value;
   } else if (field.type === "number" || field.type === "int" || field.type === "color") {
     input = document.createElement("input");
@@ -562,22 +651,68 @@ async function uploadAvatar(lane, file) {
   lane.thumb.src = url;
 }
 
-function moveAvatarTo(lane, nodeEl) {
-  if (!nodeEl) return;
-  const boardRect = lane.board.getBoundingClientRect();
-  const nodeRect = nodeEl.getBoundingClientRect();
-  const x = nodeRect.left - boardRect.left + nodeRect.width / 2 - lane.avatar.offsetWidth / 2;
-  const y = nodeRect.top - boardRect.top + nodeRect.height / 2 - lane.avatar.offsetHeight / 2;
-  lane.avatar.style.transform = `translate(${x}px, ${y}px)`;
-}
+// ── Stage: the agent stays put and the tool it is using appears above it ────
 
-function clearNodeStates(lane) {
-  Object.values(lane.nodes).forEach((n) => n.classList.remove("active", "success", "error"));
+const STATES = ["idle", "active", "success", "error"];
+
+/** Puts a tool name (and a one-line detail) in the bubble over the avatar. */
+function showTool(lane, tool, state, detail) {
+  lane.bubble.classList.remove(...STATES, "pop");
   lane.avatar.classList.remove("active", "success", "error");
+  lane.bubbleName.textContent = tool;
+  lane.bubbleDetail.textContent = detail || "";
+  lane.bubbleDetail.hidden = !detail;
+  lane.bubble.classList.add(state);
+  if (state !== "idle") {
+    lane.avatar.classList.add(state);
+    // Restart the pop animation even when the same tool fires twice in a row.
+    void lane.bubble.offsetWidth;
+    lane.bubble.classList.add("pop");
+  }
 }
 
-function nodeFor(lane, tool) {
-  return lane.nodes[tool] || lane.nodes[NODE_ALIASES[tool]] || lane.nodes.idle;
+function setIdle(lane) {
+  showTool(lane, "idle", "idle", "");
+}
+
+/** Adds a chip for a finished call under the avatar, newest first. */
+function pushTrail(lane, tool, ok, durationMs) {
+  const chip = document.createElement("span");
+  chip.className = `trail-chip ${ok ? "ok" : "err"}`;
+  chip.textContent = tool;
+  chip.title = ok ? `${durationMs} ms` : "failed";
+  lane.trail.prepend(chip);
+  while (lane.trail.children.length > TRAIL_LEN) lane.trail.lastElementChild.remove();
+}
+
+/** A short, readable preview of a call's arguments for the bubble. */
+function argsPreview(args) {
+  if (!args || typeof args !== "object") return "";
+  const parts = [];
+  for (const [key, value] of Object.entries(args)) {
+    if (key === "dashboard") continue;
+    let text = typeof value === "string" ? value : JSON.stringify(value);
+    if (text.length > 24) text = text.slice(0, 23) + "…";
+    parts.push(`${key}=${text}`);
+    if (parts.length === 3) break;
+  }
+  return parts.join("  ");
+}
+
+/** The first thing a result says, if it is the JSON the plugin returns. */
+function resultPreview(result) {
+  if (!result) return "";
+  try {
+    const parsed = JSON.parse(result);
+    if (parsed && typeof parsed === "object") {
+      const created = Array.isArray(parsed.created) ? parsed.created.length : 0;
+      const msg = parsed.message || parsed.error || "";
+      return created ? `${msg} → ${created} handle(s)` : msg;
+    }
+  } catch (e) {
+    /* plain text result */
+  }
+  return String(result).slice(0, 80);
 }
 
 function handleEvent(event) {
@@ -622,15 +757,18 @@ function handleEvent(event) {
     setRunStatus(lane, `failed after ${event.completed}: ${event.error}`, "err");
     return;
   }
+  if (event.type === "run_warning") {
+    // The dry-run gate: a generated block checked its own output against the
+    // drawing before posting. A crossing is worth a look, not a refusal, so it
+    // lands in the log and the run carries on.
+    addLogEntry(lane, { tool: event.tool, _ts: event._ts, warning: event.message }, "warning");
+    return;
+  }
 
   if (event.type === "tool_call_started") {
     clearTimeout(lane.returnTimer);
     lane.runToken += 1;
-    const node = nodeFor(lane, event.tool);
-    clearNodeStates(lane);
-    node.classList.add("active");
-    lane.avatar.classList.add("active");
-    moveAvatarTo(lane, node);
+    showTool(lane, event.tool, "active", argsPreview(event.args));
 
     const card = blockCard(lane, event.block);
     if (card) {
@@ -639,12 +777,10 @@ function handleEvent(event) {
     }
     addLogEntry(lane, event, "started");
   } else if (event.type === "tool_call_finished") {
-    const node = nodeFor(lane, event.tool);
     const ok = !event.error;
-    node.classList.remove("active");
-    node.classList.add(ok ? "success" : "error");
-    lane.avatar.classList.remove("active");
-    lane.avatar.classList.add(ok ? "success" : "error");
+    showTool(lane, event.tool, ok ? "success" : "error",
+             ok ? resultPreview(event.result) : String(event.error).slice(0, 80));
+    pushTrail(lane, event.tool, ok, event.duration_ms);
 
     const card = blockCard(lane, event.block);
     if (card) {
@@ -661,9 +797,8 @@ function handleEvent(event) {
     const myToken = lane.runToken;
     lane.returnTimer = setTimeout(() => {
       if (myToken !== lane.runToken) return; // a newer call started meanwhile
-      clearNodeStates(lane);
-      moveAvatarTo(lane, lane.nodes.idle);
-    }, 1000);
+      setIdle(lane);
+    }, BUBBLE_HOLD_MS);
   }
 }
 
@@ -674,6 +809,8 @@ function addLogEntry(lane, event, phase) {
   const detail =
     phase === "started"
       ? JSON.stringify(event.args || {})
+      : phase === "warning"
+      ? `WARNING: ${event.warning}`
       : event.error
       ? `ERROR: ${event.error}`
       : `${event.result || ""} (${event.duration_ms}ms)`;
@@ -725,9 +862,6 @@ async function loadDashboards() {
 }
 
 newDashboardBtn.addEventListener("click", createDashboard);
-window.addEventListener("resize", () =>
-  lanes.forEach((lane) => moveAvatarTo(lane, lane.nodes.idle))
-);
 window.addEventListener("load", async () => {
   // Specs first: a lane can't build its palette or restore a saved sequence
   // without them.

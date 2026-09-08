@@ -7,6 +7,7 @@ from collections import defaultdict
 from mcp.server.fastmcp import FastMCP
 import dashboard_events
 import driveways
+import spatial
 import swales
 from dashboard_events import SESSION_ID, DashboardError, emit, resolve_file
 
@@ -23,6 +24,8 @@ _ALL_CATEGORIES = [
     "lines", "arcs", "polylines", "alignments",
     "pipe_networks", "surfaces", "corridors",
     "blocks", "layers", "adjacency",
+    # Entity types the general drafting tools (drafting_tools.py) create and edit.
+    "circles", "ellipses", "splines", "points", "texts", "dimensions", "hatches",
 ]
 
 # Per-drawing state, keyed by the `file` argument ("" means the focused drawing).
@@ -62,6 +65,20 @@ def _post(payload: dict, file: str | None = None) -> str:
         if file:
             payload = {**payload, "file": file}
         return requests.post(f"{BASE}/execute", json=payload, timeout=TIMEOUT).text
+    except requests.exceptions.ConnectionError:
+        return _NO_CONNECTION
+
+
+def _post_handler(handler: str, stage: str, request: dict, file: str | None = None) -> str:
+    """Dispatch one ICadObjectHandler stage (context | compute | draw) through the
+    plugin /handler endpoint. The C# side computes and returns a structured JSON
+    report -- conflicts included -- and never mutates the drawing unless stage is
+    "draw" AND the report is clean."""
+    try:
+        payload = {"handler": handler, "stage": stage, "request": request}
+        if file:
+            payload["file"] = file
+        return requests.post(f"{BASE}/handler", json=payload, timeout=TIMEOUT).text
     except requests.exceptions.ConnectionError:
         return _NO_CONNECTION
 
@@ -159,7 +176,10 @@ def get_model_space(dashboard: str, categories: list[str] | None = None) -> str:
     categories: optional list limiting which data categories are returned.
     Omit to request all. Valid values:
       "lines", "arcs", "polylines", "alignments", "pipe_networks",
-      "surfaces", "corridors", "blocks", "layers", "adjacency"
+      "surfaces", "corridors", "blocks", "layers", "adjacency",
+      "circles", "ellipses", "splines", "points", "texts", "dimensions", "hatches"
+    Every entity carries a "handle"; handles are what the drafting tools
+    (select_entities, offset_entities, trim_entities, ...) take as input.
 
     CHUNKING: if the response approaches 1 MB, partial data is returned with a
     "__remaining_categories__" field. You MUST call get_model_space again with
@@ -233,7 +253,8 @@ def query_model_space(category: str, dashboard: str) -> str:
     dashboard's drawing has its own cached data.
 
     Valid categories: lines, arcs, polylines, alignments, pipe_networks,
-                      surfaces, corridors, blocks, layers, adjacency"""
+                      surfaces, corridors, blocks, layers, adjacency,
+                      circles, ellipses, splines, points, texts, dimensions, hatches"""
     file = _file_for(dashboard)
     accum = _MS_ACCUM.get(_drawing_key(file), {})
     # In-memory accumulator takes priority (already fetched, no disk I/O)
@@ -338,15 +359,25 @@ def create_layer(name: str, dashboard: str, color: int = 7) -> str:
 @mcp.tool()
 @observed
 def edit_layer(name: str, dashboard: str, color: int | None = None,
-               visible: bool | None = None) -> str:
-    """Edits an existing layer's color or visibility.
-    Only call when the user asks to change a layer's properties.
+               visible: bool | None = None, frozen: bool | None = None,
+               locked: bool | None = None, plottable: bool | None = None,
+               linetype: str | None = None, lineweight: str | float | None = None,
+               rgb: list[int] | None = None, description: str | None = None,
+               new_name: str | None = None) -> str:
+    """Edits an existing layer: color (ACI index) or rgb [r,g,b], visible (on/off),
+    frozen, locked, plottable, linetype (loaded from acad.lin if needed), lineweight
+    (mm or "bylayer"), description, or new_name to rename it.
+    Only call when the user asks to change a layer's properties. Use layer_state to
+    change many layers at once and list_layers to see what exists.
 
     dashboard: REQUIRED id of the dashboard to work through. The drawing behind it
     is set by the user; call list_dashboards() if you are unsure which one."""
     payload = {"intent": "edit_layer", "name": name}
-    if color   is not None: payload["color"]   = color
-    if visible is not None: payload["visible"] = visible
+    for key, value in dict(color=color, visible=visible, frozen=frozen, locked=locked,
+                           plottable=plottable, linetype=linetype, lineweight=lineweight,
+                           rgb=rgb, description=description, new_name=new_name).items():
+        if value is not None:
+            payload[key] = value
     return _post(payload, _file_for(dashboard))
 
 
@@ -672,6 +703,253 @@ def draw_rear_swales(dashboard: str, alignment: str = "", layer: str = "0",
 
 @mcp.tool()
 @observed
+def pipe_network_context(dashboard: str, structure: str = "", network: str = "") -> str:
+    """Read-only snapshot of a pipe network: every structure (rim, sump, surface
+    elevation, connected pipes) and every pipe (from/to, diameter, inverts, slope,
+    cover at both ends, rule-set minimum cover, and whether Civil 3D flags a cover
+    violation). Nothing is modified.
+
+    structure: name or hex handle of a structure -- its network is used and the
+    structure itself is described in detail. network: name or handle, used when no
+    structure is given. With neither, the first network in the drawing is used.
+
+    dashboard: REQUIRED id of the dashboard whose drawing to read."""
+    file = _file_for(dashboard)
+    request = {}
+    if structure:
+        request["structure"] = structure
+    if network:
+        request["network"] = network
+    return _post_handler("pipe_elevation", "context", request, file)
+
+
+@mcp.tool()
+@observed
+def solve_pipe_elevations(dashboard: str, structure: str,
+                          cover_minimum: float | None = None,
+                          offset_mode: str = "MatchCrowns",
+                          manual_drop: float = 0.0,
+                          pipes: list[str] | None = None,
+                          governing_pipe: str | None = None,
+                          structure_invert_override: float | None = None,
+                          max_depth_below_surface: float = 50.0,
+                          slope_units: str = "auto",
+                          apply: bool = False) -> str:
+    """Solve (and optionally set) the start/end invert elevations of the
+    same-diameter pipes meeting at one structure so that minimum cover from the
+    network reference surface holds along each pipe (full length) and the pipes
+    keep the requested relationship at the structure.
+
+    The plugin does the geometry; YOU do the reasoning about conflicts. Call with
+    apply=False first and read the report:
+      * ok=true, conflicts=[]  -> safe; call again with apply=True to write all
+        pipes in one transaction (all-or-nothing, verified against the Civil 3D
+        cover check before commit).
+      * conflicts=[...]        -> the solver refused to guess. Each conflict names
+        the pipe, both constraints, the delta, and usually a
+        suggestedStructureInvert; pass that as structure_invert_override (or pick
+        a governing_pipe, relax cover_minimum, change offset_mode) and re-run.
+      * errors=[...]           -> precondition failed (mixed diameters, no reference
+        surface, no surface coverage at a pipe end, implausible depth). Fix the
+        drawing or the inputs; nothing was changed.
+
+    structure: name or hex handle of the shared manhole/junction (from
+    get_model_space or pipe_network_context).
+    cover_minimum: feet from surface to the OUTSIDE top of the pipe. Omit to use
+    the rule set of each pipe (Cover And Slope / Cover Only rule).
+    offset_mode: "MatchCrowns" (default), "MatchInverts", or "ManualDrop" with
+    manual_drop = feet the outgoing invert sits below the lowest incoming invert.
+    pipes: optional explicit pipe names/handles; omit to auto-discover every
+    connected pipe of the dominant diameter (others are listed under warnings).
+    governing_pipe: pipe that fixes the datum at the structure; omit for the most
+    restrictive cover. structure_invert_override: explicit invert for the governing
+    pipe at the structure. slope_units: "auto" (calibrated against Pipe.Slope),
+    "ratio", or "percent" for how rule-set slope values are read.
+
+    dashboard: REQUIRED id of the dashboard whose drawing to work on."""
+    file = _file_for(dashboard)
+    request: dict = {
+        "structure": structure,
+        "offsetMode": offset_mode,
+        "manualDrop": manual_drop,
+        "maxDepthBelowSurface": max_depth_below_surface,
+        "slopeUnits": slope_units,
+    }
+    if cover_minimum is not None:
+        request["coverMinimum"] = cover_minimum
+    if pipes:
+        request["pipes"] = pipes
+    if governing_pipe:
+        request["governingPipe"] = governing_pipe
+    if structure_invert_override is not None:
+        request["structureInvertOverride"] = structure_invert_override
+    return _post_handler("pipe_elevation", "draw" if apply else "compute", request, file)
+
+
+# ── Spatial reasoning ────────────────────────────────────────────────────────
+#
+# A grid index over the drawing (spatial.py) rendered into words, so the agent
+# can orient on a whole site in a few hundred tokens and only reach for handles
+# once it has reasoned its way to an area. Nothing here draws.
+
+_SPATIAL_LAYERS = [*driveways.PAD_LAYER_SUFFIXES, driveways.ROAD_LAYER,
+                   "c-lots-line", "c-lots-stbk", "c-rway-center", "c-rway-line",
+                   "c-bndy", "c-esmt"]
+
+
+def _snapshot(file: str) -> dict:
+    """Model space plus the xrefed layers the index cares about, merged."""
+    raw = _get("/modelspace", file)
+    data = json.loads(raw)
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(str(data["error"]))
+    nested = _get_nested(file, _SPATIAL_LAYERS)
+    for category in ("polylines", "lines", "arcs"):
+        if nested.get(category):
+            data[category] = list(data.get(category) or []) + nested[category]
+    return data
+
+
+def _index_for(dashboard: str):
+    return spatial.build(_snapshot(_file_for(dashboard)))
+
+
+@mcp.tool()
+@observed
+def spatial_map(dashboard: str) -> str:
+    """The drawing as a coarse character map, north up, plus its regions.
+
+    Read this FIRST to orient: one glyph per 200ft cell (R curb, P pads, + both,
+    L lot lines, d driveways/swales, . empty) with the x/y of the top-left, then
+    every corridor (one per alignment) and block with what it holds. A whole
+    subdivision fits in a few hundred tokens. Drill in with describe_location
+    and find_entities; nothing here draws."""
+    try:
+        index = _index_for(dashboard)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    return index.site_map() + "\n\n" + index.summary()
+
+
+@mcp.tool()
+@observed
+def describe_location(dashboard: str, x: float, y: float) -> str:
+    """What is at a point, in words and in civil terms.
+
+    Returns the 50ft cell's description -- region, nearest alignment with
+    station range, side and offset, what is drawn there and which way it runs
+    -- plus the same frame as data, the region id, and what the eight
+    neighbouring cells hold. Use it to check a spot before drawing there."""
+    try:
+        index = _index_for(dashboard)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    loc = index.locate(x, y)
+    return json.dumps({"description": index.describe(loc["key"]),
+                       "cell": list(loc["key"]), "bounds": list(loc["bounds"]),
+                       "tags": loc["tags"], "frame": loc["frame"],
+                       "region": loc["region"], "neighbours": loc["neighbours"]})
+
+
+@mcp.tool()
+@observed
+def find_entities(dashboard: str, tag: str, x: float, y: float,
+                  radius: float = 100.0) -> str:
+    """Handles of entities of one tag within `radius` ft of a point.
+
+    tag is one of: pad, curb, lot_line, setback, centreline, right_of_way,
+    boundary, easement, driveway, swale, other. Handles are what move_to_layer,
+    edit_layer and delete take, so this is how a reasoned-about area becomes
+    something to act on."""
+    try:
+        index = _index_for(dashboard)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    handles = index.entities(tag, point=(x, y), radius=radius)
+    return json.dumps({"tag": tag, "count": len(handles), "handles": handles,
+                       "region": index.region_of(point=(x, y))})
+
+
+@mcp.tool()
+@observed
+def solve_pipe_run(dashboard: str,
+                   alignment: str = "",
+                   offset_tolerance: float = 25.0,
+                   network: str = "",
+                   structures: list[str] | None = None,
+                   start_structure: str = "",
+                   end_structure: str = "",
+                   flow_direction: str = "auto",
+                   cover_minimum: float | None = None,
+                   offset_mode: str = "MatchCrowns",
+                   manual_drop: float = 0.0,
+                   hold_start: bool = False,
+                   hold_end: bool = False,
+                   fixed_inverts: dict | None = None,
+                   overrides: dict | None = None,
+                   max_depth_below_surface: float = 50.0,
+                   slope_units: str = "auto",
+                   apply: bool = False) -> str:
+    """Solve (and optionally set) the inverts of a WHOLE RUN of pipes at once --
+    every structure along an alignment, an explicit ordered list of structures,
+    or the shortest network path between two structures -- using the same
+    criteria as solve_pipe_elevations: minimum cover from the reference surface
+    along each pipe, rule-set min/max slope, and the offset rule (MatchCrowns /
+    MatchInverts / ManualDrop) at every structure. The result is the SHALLOWEST
+    feasible profile: upstream end as high as cover allows, each pipe at minimum
+    slope unless cover or a tie-in forces it deeper.
+
+    Pick the run with ONE of: alignment (+ offset_tolerance ft, structures within
+    it in station order; network optional), structures (ordered names/handles),
+    or start_structure + end_structure (network path).
+    flow_direction: "auto" reads the pipes' flow directions, else falls back to
+    the ground falling end to end; set "downstation" / "upstation" explicitly
+    when the network has no flow directions.
+    hold_start / hold_end keep the existing invert at the run ends (tie-ins);
+    fixed_inverts = {"MH-7": 94.25} pins the incoming invert at named structures.
+    overrides = {"P-3": {"up": 95.1, "down": 94.6}} sets pipes by hand on top of
+    the solve; they go through the same cover/slope checks.
+
+    Read the report before applying: ok=true + conflicts=[] means safe (re-run
+    with apply=True to write all pipes in ONE transaction, verified against the
+    Civil 3D cover check). A "fixed_invert" conflict tells you how far a tie-in is
+    above the shallowest reachable profile (delta) -- lower it, relax cover, or
+    allow a steeper slope. Structures that also connect pipes outside the run are
+    listed under warnings; those laterals are untouched (use
+    solve_pipe_elevations there afterwards).
+
+    dashboard: REQUIRED id of the dashboard whose drawing to work on."""
+    file = _file_for(dashboard)
+    request: dict = {
+        "offsetTolerance": offset_tolerance,
+        "flowDirection": flow_direction,
+        "offsetMode": offset_mode,
+        "manualDrop": manual_drop,
+        "holdStart": hold_start,
+        "holdEnd": hold_end,
+        "maxDepthBelowSurface": max_depth_below_surface,
+        "slopeUnits": slope_units,
+    }
+    if alignment:
+        request["alignment"] = alignment
+    if network:
+        request["network"] = network
+    if structures:
+        request["structures"] = structures
+    if start_structure and end_structure:
+        request["startStructure"] = start_structure
+        request["endStructure"] = end_structure
+    if cover_minimum is not None:
+        request["coverMinimum"] = cover_minimum
+    if fixed_inverts:
+        request["fixedInverts"] = fixed_inverts
+    if overrides:
+        request["overrides"] = overrides
+    return _post_handler("pipe_run", "draw" if apply else "compute", request, file)
+
+
+@mcp.tool()
+@observed
 def classify_image(path: str) -> str:
     """Classifies an image on disk and returns a short label + description.
     Only call when the user explicitly asks you to classify or identify an
@@ -722,6 +1000,15 @@ def classify_image(path: str) -> str:
         return json.dumps({"label": text[:60], "description": text})
 
 
+# ── General 2D drafting command set ─────────────────────────────────────────
+#
+# One tool per intent in Commands/CadCommands.*.cs (draw, modify, annotate,
+# organise, query, plus run_sequence for all-or-nothing chains). Registered from a
+# separate module so this file keeps the Civil 3D specific tools only.
+import drafting_tools
+drafting_tools.register(mcp, observed, _post, _file_for)
+
+
 # @mcp.tool()
 # def delete_objects(handles: list[str]) -> str:
 #     """Permanently deletes objects from the drawing by their handle strings.
@@ -740,8 +1027,10 @@ _DASHBOARD_URL  = f"http://localhost:{_DASHBOARD_PORT}"
 # still accepts TCP, so a connect test reports it as fine -- while the browser
 # gets routes that no longer exist and the UI comes up half-built (a stale server
 # missing /blocks renders every dashboard with an empty block palette, silently).
-# Point _HEALTH_PATH at a route the CURRENT server has and older ones don't.
-_HEALTH_PATH = "/blocks"
+# Point _HEALTH_PATH at a route the CURRENT server has and older ones don't, and
+# require the version stamp to match so a server running older code is replaced.
+_HEALTH_PATH = "/version"
+_DASHBOARD_VERSION = "2026-09-08.2"   # must equal dashboard/server.py DASHBOARD_VERSION
 
 # How long a server gets to answer before it counts as failed or stale. Covers
 # uvicorn's own startup plus the sibling-process case described in _launch.
@@ -798,8 +1087,10 @@ def _dashboard_healthy() -> bool:
     try:
         response = requests.get(
             f"http://127.0.0.1:{_DASHBOARD_PORT}{_HEALTH_PATH}", timeout=1.0)
-        return response.status_code == 200
-    except requests.exceptions.RequestException:
+        if response.status_code != 200:
+            return False
+        return response.json().get("version") == _DASHBOARD_VERSION
+    except (requests.exceptions.RequestException, ValueError):
         return False
 
 

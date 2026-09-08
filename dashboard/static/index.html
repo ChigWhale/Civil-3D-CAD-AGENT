@@ -4,7 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CAD Agent Dashboards</title>
-  <link rel="stylesheet" href="style.css">
+  <!-- The query string is a cache-buster: bump it with DASHBOARD_VERSION in server.py. -->
+  <link rel="stylesheet" href="style.css?v=2026-09-08.2">
 </head>
 <body>
   <header>
@@ -46,9 +47,15 @@
       </div>
 
       <div class="lane-run">
+        <!-- 100+ blocks: a search box with a grouped menu instead of a wall of buttons. -->
         <div class="palette-row">
           <span class="palette-label">Add block</span>
-          <div class="palette"></div>
+          <div class="palette">
+            <input type="search" class="palette-search" spellcheck="false" autocomplete="off"
+                   placeholder="Search commands… draw, offset, trim, dimension, layer">
+            <div class="palette-menu" hidden></div>
+          </div>
+          <span class="palette-count"></span>
         </div>
 
         <ol class="sequence"></ol>
@@ -66,21 +73,17 @@
       </div>
 
       <div class="lane-body">
-        <div class="board">
-          <div class="node" data-tool="idle" style="grid-area: idle;">idle</div>
-          <div class="node" data-tool="list_dashboards" style="grid-area: n1;">list_dashboards</div>
-          <div class="node" data-tool="get_model_space" style="grid-area: n2;">get_model_space</div>
-          <div class="node" data-tool="query_model_space" style="grid-area: n3;">query_model_space</div>
-          <div class="node" data-tool="draw_line" style="grid-area: n4;">draw_line</div>
-          <div class="node" data-tool="draw_arc" style="grid-area: n5;">draw_arc</div>
-          <div class="node" data-tool="draw_shape" style="grid-area: n6;">draw_shape</div>
-          <div class="node" data-tool="create_layer" style="grid-area: n7;">create_layer</div>
-          <div class="node" data-tool="edit_layer" style="grid-area: n8;">edit_layer</div>
-          <div class="node" data-tool="move_to_layer" style="grid-area: n9;">move_to_layer</div>
-          <div class="node" data-tool="quantify" style="grid-area: n10;">quantify</div>
-          <div class="node" data-tool="classify_image" style="grid-area: n11;">classify_image</div>
-          <div class="node" data-tool="delete" style="grid-area: n12;">delete</div>
-          <img class="avatar" alt="agent avatar">
+        <!-- The agent stays put; whatever tool it is using pops up above it, and the
+             last few tools trail off underneath. -->
+        <div class="stage">
+          <div class="stage-agent">
+            <div class="tool-bubble idle">
+              <span class="tool-bubble-name">idle</span>
+              <span class="tool-bubble-detail"></span>
+            </div>
+            <img class="avatar" alt="agent avatar">
+          </div>
+          <div class="tool-trail"></div>
         </div>
         <div class="log"></div>
       </div>
@@ -108,6 +111,6 @@
     </li>
   </template>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=2026-09-08.2"></script>
 </body>
 </html>

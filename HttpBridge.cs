@@ -14,7 +14,8 @@ namespace CADAgent
     /// <summary>
     /// Listens on http://localhost:5199/ and exposes two endpoints:
     ///   GET  /modelspace  — collects the drawing and returns LastJson
-    ///   POST /execute     — dispatches a single agent step to ModelSpaceBuilder
+    ///   POST /execute     — dispatches a single agent step to ModelSpaceBuilder / CadCommands
+    ///   GET  /intents     — lists every intent CadCommands accepts
     ///
     /// Requests are accepted asynchronously (BeginGetContext) and queued.
     /// They are processed during AutoCAD's Idle event, which fires on the
@@ -182,6 +183,24 @@ namespace CADAgent
                     return;
                 }
 
+                // Intents that need Editor / LayoutManager / xref loading run right here on the
+                // application thread; the rest go to a worker holding the document lock.
+                if (ModelSpaceBuilder.RequiresAppThread(intent, requestBody))
+                {
+                    string body; int status;
+                    try
+                    {
+                        using (doc.LockDocument())
+                        {
+                            body   = ModelSpaceBuilder.ExecuteStep(intent, requestBody, doc);
+                            status = 200;
+                        }
+                    }
+                    catch (Exception ex) { body = Error(ex.Message); status = 500; }
+                    Respond(ctx, body, status);
+                    return;
+                }
+
                 // LockDocument is per-document: writes to different drawings proceed in
                 // parallel, writes to the same drawing queue behind each other.
                 Task.Run(() =>
@@ -198,6 +217,55 @@ namespace CADAgent
                     catch (Exception ex) { body = Error(ex.Message); status = 500; }
                     try { Respond(ctx, body, status); } catch { }
                 });
+                return;
+            }
+
+            if (path == "/intents" && method == "GET")
+            {
+                Respond(ctx, new JObject { ["intents"] = new JArray(CadCommands.Intents) }.ToString(), 200);
+                return;
+            }
+
+            if (path == "/handlers" && method == "GET")
+            {
+                Respond(ctx, new JObject { ["handlers"] = new JArray(PipeInvertSetter.HandlerRegistry.Names) }.ToString(), 200);
+                return;
+            }
+
+            // Generic ICadObjectHandler dispatch:  { "handler": "pipe_elevation", "stage": "context|compute|draw",
+            //                                       "file": "...dwg", "request": { ...handler-specific... } }
+            // Runs inline on the application thread; handlers lock the document themselves and
+            // return a JSON report (conflicts included) rather than throwing across the boundary.
+            if (path == "/handler" && method == "POST")
+            {
+                if (ctx.Request.ContentLength64 > MaxBodyBytes)
+                {
+                    Respond(ctx, Error("Request body too large"), 413);
+                    return;
+                }
+
+                string body; int status;
+                try
+                {
+                    string raw;
+                    using (var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8))
+                        raw = reader.ReadToEnd();
+
+                    JObject env = JObject.Parse(raw);
+                    string handler = env["handler"]?.ToString() ?? "";
+                    string stage   = env["stage"]?.ToString() ?? "compute";
+                    string request = env["request"]?.ToString(Newtonsoft.Json.Formatting.None) ?? "{}";
+
+                    Document doc = ResolveDocument(env["file"]?.ToString());
+                    if (doc == null) { body = Error("No active document"); status = 500; }
+                    else
+                    {
+                        body   = PipeInvertSetter.HandlerRegistry.Run(handler, stage, doc, request);
+                        status = 200;
+                    }
+                }
+                catch (Exception ex) { body = Error(ex.Message); status = 500; }
+                Respond(ctx, body, status);
                 return;
             }
 

@@ -92,9 +92,16 @@ namespace CADAgent
                 case "edit_layer":        return EditLayer(json, doc);
                 case "remove_from_layer": return RemoveFromLayer(json, doc);
                 case "delete":            return Delete(json, doc);
-                default:                  return $"Unknown intent: {intent}";
+                default:
+                    // Everything else lives in the general drafting command set (Commands/CadCommands.*.cs).
+                    return CadCommands.Has(intent)
+                        ? CadCommands.Execute(intent, json, doc)
+                        : CadCommands.Fail($"Unknown intent: {intent}. Known: draw_line, draw_arc, draw_shape, create_layer, add_to_layer, edit_layer, remove_from_layer, delete, " + string.Join(", ", CadCommands.Intents));
             }
         }
+
+        /// <summary>True when this intent must run on the AutoCAD application thread (Editor, LayoutManager, xref loading).</summary>
+        public static bool RequiresAppThread(string intent, string json) => CadCommands.RequiresAppThread(intent, json);
 
         /// <summary>
         /// Returns the "intent" field from the LLM's JSON envelope, or "chat" if unparseable.
@@ -234,11 +241,11 @@ namespace CADAgent
                     var line = new Line(Pt3(sp), Pt3(ep));
                     ms.AppendEntity(line);
                     tr.AddNewlyCreatedDBObject(line, true);
-                    LayerTable lt = tr.GetObject(db.LayerTableId, OpenMode.ForRead) as LayerTable;
-                    line.Layer = (lt != null && lt.Has(layer)) ? layer : "0";
+                    line.Layer = CadCommands.EnsureLayer(tr, db, layer);
                     tr.Commit();
+                    return CadCommands.Created("Line created.", new[] { line.ObjectId },
+                        new JObject { ["length"] = CadCommands.R(line.Length) });
                 }
-                return "Line created.";
             }
             catch (SysException ex) { return $"draw_line failed: {ex.Message}"; }
         }
@@ -264,11 +271,15 @@ namespace CADAgent
                     var arc = new Arc(Pt3(center), Vector3d.ZAxis, radius, startAng, endAng);
                     ms.AppendEntity(arc);
                     tr.AddNewlyCreatedDBObject(arc, true);
-                    LayerTable lt = tr.GetObject(db.LayerTableId, OpenMode.ForRead) as LayerTable;
-                    arc.Layer = (lt != null && lt.Has(layer)) ? layer : "0";
+                    arc.Layer = CadCommands.EnsureLayer(tr, db, layer);
                     tr.Commit();
+                    return CadCommands.Created("Arc created.", new[] { arc.ObjectId }, new JObject
+                    {
+                        ["start_point"] = CadCommands.Arr(arc.StartPoint),
+                        ["end_point"]   = CadCommands.Arr(arc.EndPoint),
+                        ["length"]      = CadCommands.R(arc.Length),
+                    });
                 }
-                return "Arc created.";
             }
             catch (SysException ex) { return $"draw_arc failed: {ex.Message}"; }
         }
@@ -299,11 +310,14 @@ namespace CADAgent
                         pl.AddVertexAt(i, Pt2(vertices[i] as JArray), 0, 0, 0);
                     ms.AppendEntity(pl);
                     tr.AddNewlyCreatedDBObject(pl, true);
-                    LayerTable lt = tr.GetObject(db.LayerTableId, OpenMode.ForRead) as LayerTable;
-                    pl.Layer = (lt != null && lt.Has(layer)) ? layer : "0";
+                    pl.Layer = CadCommands.EnsureLayer(tr, db, layer);
                     tr.Commit();
+                    return CadCommands.Created("Shape created.", new[] { pl.ObjectId }, new JObject
+                    {
+                        ["length"] = CadCommands.R(pl.Length),
+                        ["area"]   = pl.Closed ? CadCommands.R(pl.Area) : 0,
+                    });
                 }
-                return "Shape created.";
             }
             catch (SysException ex) { return $"draw_shape failed: {ex.Message}"; }
         }
@@ -416,6 +430,27 @@ namespace CADAgent
 
                     if (root["visible"] != null)
                         ltr.IsOff = !root["visible"].Value<bool>();
+
+                    // Extended LAYER properties (added with the general drafting command set).
+                    if (root["frozen"] != null)
+                    {
+                        if (root["frozen"].Value<bool>() && lt[name] == db.Clayer)
+                            { tr.Abort(); return CadCommands.Fail($"edit_layer failed: '{name}' is the current layer and cannot be frozen."); }
+                        ltr.IsFrozen = root["frozen"].Value<bool>();
+                    }
+                    if (root["locked"] != null)    ltr.IsLocked    = root["locked"].Value<bool>();
+                    if (root["plottable"] != null) ltr.IsPlottable = root["plottable"].Value<bool>();
+                    if (root["linetype"] != null)  ltr.LinetypeObjectId = CadCommands.LinetypeId(tr, db, root["linetype"].ToString());
+                    if (root["lineweight"] != null) ltr.LineWeight = CadCommands.LineWeightFrom(root["lineweight"]);
+                    if (root["description"] != null) ltr.Description = root["description"].ToString();
+                    if (root["rgb"] is JArray rgb && rgb.Count == 3)
+                        ltr.Color = CadCommands.ColorFrom(rgb);
+                    string newName = root["new_name"]?.ToString();
+                    if (!string.IsNullOrWhiteSpace(newName) && newName != name)
+                    {
+                        if (lt.Has(newName)) { tr.Abort(); return CadCommands.Fail($"edit_layer failed: layer '{newName}' already exists."); }
+                        ltr.Name = newName;
+                    }
 
                     tr.Commit();
                 }

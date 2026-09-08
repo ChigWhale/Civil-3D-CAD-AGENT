@@ -57,4 +57,17 @@
     </Reference>
   </ItemGroup>
 
+  <!-- PipeInvertSetter is its own project; keep its sources out of this assembly -->
+  <ItemGroup>
+    <Compile Remove="PipeInvertSetter\**" />
+    <None Remove="PipeInvertSetter\**" />
+    <Compile Remove="PipeInvertSetter.Tests\**" />
+    <None Remove="PipeInvertSetter.Tests\**" />
+  </ItemGroup>
+
+  <!-- Pipe elevation solver (ICadObjectHandler) exposed through /handler -->
+  <ItemGroup>
+    <ProjectReference Include="PipeInvertSetter\PipeInvertSetter.csproj" />
+  </ItemGroup>
+
 </Project>

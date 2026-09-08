@@ -16,7 +16,19 @@ payload entirely -- edit_layer's color, for instance, should not be forced to a
 value just because the user never touched it.
 """
 
+import inspect
+import json
 import math
+import re
+import sys
+import types
+import typing
+from pathlib import Path
+
+# drafting_tools.py lives in the repo root; server.py adds that to sys.path only
+# after importing this module, so do it here as well.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import drafting_tools
 
 # -- Field coercion -----------------------------------------------------------
 
@@ -146,6 +158,25 @@ def coerce_field(field: dict, raw):
         if not handles:
             raise ValueError(f"{label} needs at least one object handle")
         return handles
+
+    if kind == "point":
+        # One x,y pair: "10,20" typed, or [10, 20] from a form.
+        points = _points(raw, label)
+        if len(points) != 1:
+            raise ValueError(f"{label} must be a single x,y point")
+        return points[0]
+
+    if kind == "strings":
+        # Names that are not handles (layers, types, style names): comma separated.
+        return _names(raw, label)
+
+    if kind == "json":
+        if isinstance(raw, (dict, list)):
+            return raw
+        try:
+            return json.loads(str(raw))
+        except ValueError as e:
+            raise ValueError(f"{label} must be valid JSON ({e})")
 
     if kind == "choice":
         text = str(raw).strip()
@@ -390,6 +421,179 @@ BLOCK_SPECS = [
         ],
     },
 ]
+
+# -- Generated blocks: one per general drafting tool ---------------------------
+#
+# drafting_tools.py holds ~95 MCP tools (draw, modify, annotate, organise, query).
+# Their block specs are derived from the tool signatures here, and their payloads
+# are produced by calling the very same tool functions against a recording stub,
+# so a block always sends exactly what the agent's tool would send.
+
+_HANDLE_FIELDS = {"handles", "targets", "tools", "cutting_handles", "boundary_handles",
+                  "tangent_handles", "against"}
+
+_GROUP_RULES = [
+    ("Draw", ("draw_", "create_region", "region_boolean", "trace_boundary")),
+    ("Annotate", ("dimension_", "edit_dimension", "edit_text", "create_hatch", "edit_hatch",
+                  "create_table", "set_table_cell", "list_styles", "create_text_style",
+                  "create_dim_style")),
+    ("Modify", ("move_entities", "copy_entities", "rotate_entities", "scale_entities",
+                "mirror_entities", "stretch_entities", "align_entities", "offset_entities",
+                "array_entities", "fillet_", "chamfer_", "trim_entities", "extend_entities",
+                "break_entity", "lengthen_entity", "join_entities", "explode_entities",
+                "mark_along_entity", "edit_polyline", "edit_spline", "reverse_curves",
+                "set_properties", "match_properties", "set_draw_order")),
+    ("Layers & Settings", ("list_layers", "layer_state", "isolate_layers", "set_current_layer",
+                           "purge_unused", "rename_named_object", "get_drawing_settings",
+                           "set_drawing_settings")),
+    ("Blocks & References", ("define_block", "insert_block", "list_block_definitions",
+                             "set_block_attributes", "define_attribute", "sync_block_attributes",
+                             "export_block", "attach_", "group_entities")),
+    ("Layouts & File", ("manage_layouts", "create_viewport", "zoom_view", "save_drawing")),
+    ("Query", ("get_properties", "select_entities", "entity_key_points", "closest_point_on",
+               "intersections", "tangent_points", "measure_entities", "angle_between",
+               "point_along", "bounding_box", "find_duplicates", "list_cad_commands")),
+    ("Advanced", ("run_sequence",)),
+]
+
+# Annotation-derived draw tools are text, leaders and tolerances rather than geometry.
+_ANNOTATE_DRAW = {"draw_text", "draw_mtext", "draw_leader", "draw_tolerance"}
+
+
+def _group_for(name: str) -> str:
+    if name in _ANNOTATE_DRAW:
+        return "Annotate"
+    for group, prefixes in _GROUP_RULES:
+        if any(name == p or name.startswith(p) for p in prefixes):
+            return group
+    return "Other"
+
+
+def _label_for(name: str) -> str:
+    return name.replace("_", " ").title().replace("Mtext", "MText").replace("Xref", "Xref").replace("Pdf", "PDF")
+
+
+def _description_for(fn) -> str:
+    doc = inspect.getdoc(fn) or ""
+    doc = " ".join(doc.split())
+    # First sentence, trimmed; the full docstring goes into the help tooltip.
+    match = re.match(r"(.+?\.)(\s|$)", doc)
+    return (match.group(1) if match else doc)[:160]
+
+
+def _unwrap_optional(annotation):
+    """Returns (inner_type, optional) for `T | None`; the annotation otherwise."""
+    if isinstance(annotation, types.UnionType) or typing.get_origin(annotation) is typing.Union:
+        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+        optional = len(args) < len(typing.get_args(annotation))
+        return (args[0] if len(args) == 1 else tuple(args)), optional
+    return annotation, False
+
+
+def _field_type(name: str, annotation) -> str:
+    inner, _ = _unwrap_optional(annotation)
+    if isinstance(inner, tuple):
+        # str | int | list[int] etc. -- free text is the only form that fits every arm.
+        return "text"
+    origin = typing.get_origin(inner)
+    if inner is bool:
+        return "bool"
+    if inner is int:
+        return "int"
+    if inner is float:
+        return "number"
+    if inner is dict:
+        return "json"
+    if origin is list:
+        (item,) = typing.get_args(inner) or (str,)
+        if item is float:
+            return "point"
+        if typing.get_origin(item) is list:
+            return "points"
+        if item is dict:
+            return "json"
+        if item is int:
+            return "strings"
+        return "handles" if name in _HANDLE_FIELDS else "strings"
+    return "text"
+
+
+class _Recorder:
+    """Stands in for FastMCP: collects the tool functions instead of serving them."""
+
+    def __init__(self):
+        self.tools = {}
+
+    def tool(self):
+        def decorate(fn):
+            self.tools[fn.__name__] = fn
+            return fn
+        return decorate
+
+
+_captured = []
+
+
+def _capture_post(payload, file=None):
+    _captured.append(payload)
+    return "{}"
+
+
+_recorder = _Recorder()
+drafting_tools.register(_recorder, lambda fn: fn, _capture_post, lambda dashboard: None)
+
+
+def _make_builder(fn):
+    def build(values):
+        del _captured[:]
+        fn(dashboard="block", **values)
+        if not _captured:
+            raise ValueError(f"{fn.__name__} produced no command")
+        return dict(_captured[-1])
+    return build
+
+
+def _generated_specs() -> list:
+    specs = []
+    for name, fn in _recorder.tools.items():
+        params = inspect.signature(fn).parameters
+        if "dashboard" not in params:
+            continue  # pure helpers (polar_point, ...) talk to no drawing
+        fields = []
+        for pname, param in params.items():
+            if pname == "dashboard":
+                continue
+            ftype = _field_type(pname, param.annotation)
+            field = {"name": pname, "label": pname.replace("_", " "), "type": ftype}
+            if param.default is inspect.Parameter.empty:
+                pass
+            elif param.default is None:
+                field["optional"] = True
+            elif ftype == "bool":
+                field["default"] = bool(param.default)
+            elif ftype in ("point", "points", "json", "strings", "handles"):
+                field["default"] = (json.dumps(param.default)
+                                    if isinstance(param.default, (list, dict)) else param.default)
+            else:
+                field["default"] = param.default
+            if ftype == "points":
+                field["min_items"] = 1
+            fields.append(field)
+        specs.append({
+            "type": name,
+            "label": _label_for(name),
+            "group": _group_for(name),
+            "description": _description_for(fn),
+            "help": inspect.getdoc(fn) or "",
+            "build": _make_builder(fn),
+            "fields": fields,
+        })
+    order = [g for g, _ in _GROUP_RULES] + ["Other"]
+    specs.sort(key=lambda s: (order.index(s["group"]), s["type"]))
+    return specs
+
+
+BLOCK_SPECS.extend(_generated_specs())
 
 SPECS_BY_TYPE = {spec["type"]: spec for spec in BLOCK_SPECS}
 
