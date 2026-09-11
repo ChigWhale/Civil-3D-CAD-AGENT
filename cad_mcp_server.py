@@ -1,6 +1,6 @@
 ﻿import requests
 import json, openpyxl, os
-import base64, functools, inspect, math, time
+import base64, functools, hashlib, inspect, math, time
 import socket, subprocess, sys, threading, webbrowser
 from urllib.parse import quote
 from collections import defaultdict
@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 import dashboard_events
 import driveways
 import spatial
+import spatial_cache
 import swales
 from dashboard_events import SESSION_ID, DashboardError, emit, resolve_file
 
@@ -16,14 +17,15 @@ mcp     = FastMCP("CAD Agent")
 # and stalls ~2s per request before falling back to IPv4 (measured 2.06s vs 0.015s).
 BASE    = "http://127.0.0.1:5199"
 TIMEOUT = 30
+HANDLER_TIMEOUT = 900   # compute/draw stages walk whole drawings; minutes, not seconds
 _NO_CONNECTION = '{"error": "Civil 3D is not reachable — make sure AutoCAD is open with the CADAgent plugin loaded."}'
 
 _SIZE_LIMIT = 950_000  # bytes — 50 KB buffer below the 1 MB MCP threshold
 
 _ALL_CATEGORIES = [
     "lines", "arcs", "polylines", "alignments",
-    "pipe_networks", "surfaces", "corridors",
-    "blocks", "layers", "adjacency",
+    "pipe_networks", "surfaces", "corridors", "feature_lines",
+    "blocks", "labels", "layers", "adjacency",
     # Entity types the general drafting tools (drafting_tools.py) create and edit.
     "circles", "ellipses", "splines", "points", "texts", "dimensions", "hatches",
 ]
@@ -60,7 +62,7 @@ def _get(path: str, file: str | None = None) -> str:
         return _NO_CONNECTION
 
 
-def _post(payload: dict, file: str | None = None) -> str:
+def _post_raw(payload: dict, file: str | None = None) -> str:
     try:
         if file:
             payload = {**payload, "file": file}
@@ -69,18 +71,277 @@ def _post(payload: dict, file: str | None = None) -> str:
         return _NO_CONNECTION
 
 
-def _post_handler(handler: str, stage: str, request: dict, file: str | None = None) -> str:
-    """Dispatch one ICadObjectHandler stage (context | compute | draw) through the
-    plugin /handler endpoint. The C# side computes and returns a structured JSON
-    report -- conflicts included -- and never mutates the drawing unless stage is
-    "draw" AND the report is clean."""
+# ── The gate around every write ──────────────────────────────────────────────
+#
+# Every payload that changes the drawing goes through here. Before it is posted,
+# the proposed geometry is checked against the cached spatial index (spatial.py):
+# a line through a pad, a text inside a lot pad, a box over the curb. Conflicts
+# come back as a structured result with a token instead of being drawn through;
+# the agent reads them, calls acknowledge_conflicts(token) if it means it, and
+# repeats the call. After the write the index is rebuilt and compared with the
+# one from before, so every write answers with what actually changed -- in the
+# same cells and words it was planned in -- and flags any change outside the
+# area the request should have touched.
+#
+# CAD_SPATIAL_GATE=0 / CAD_SPATIAL_VERIFY=0 switch either half off.
+
+_GATE_ON = os.environ.get("CAD_SPATIAL_GATE", "1") != "0"
+_VERIFY_ON = os.environ.get("CAD_SPATIAL_VERIFY", "1") != "0"
+
+_HANDLE_KEYS = ("handles", "handle", "target", "tools", "objects", "source", "sources",
+                "entities", "boundary", "path", "curve", "reference")
+
+
+def _payload_handles(payloads: list) -> list:
+    """Handles a request names, so cells they occupy count as planned."""
+    out = []
+
+    def walk(value):
+        if isinstance(value, str):
+            s = value.strip()
+            if s and not s.startswith("@") and len(s) <= 16:
+                out.append(s)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                if k in _HANDLE_KEYS:
+                    walk(v)
+                elif k == "steps" and isinstance(v, list):
+                    for step in v:
+                        walk(step)
+        elif isinstance(value, list):
+            for v in value:
+                if isinstance(v, dict) and "object_handle" in v:
+                    walk(v["object_handle"])
+                else:
+                    walk(v)
+
+    for p in payloads:
+        if isinstance(p, dict):
+            walk({k: v for k, v in p.items() if k != "intent"})
+    return out
+
+
+def _is_read_only(payload: dict) -> bool:
+    intent = str(payload.get("intent") or "")
+    if intent == "sequence":
+        return all(_is_read_only(s) for s in payload.get("steps") or [] if isinstance(s, dict))
+    return intent in spatial.READ_ONLY_INTENTS
+
+
+def _blocked(conflicts: list, token: str, file: str | None) -> str:
+    by_kind = {}
+    for c in conflicts:
+        by_kind[c["kind"]] = by_kind.get(c["kind"], 0) + 1
+    return json.dumps({
+        "ok": False,
+        "blocked": True,
+        "message": ("Not drawn: the proposed geometry conflicts with what is already in the "
+                    "drawing. Read `conflicts`, decide, and if you still mean it call "
+                    "acknowledge_conflicts(dashboard, token) then repeat this exact call. "
+                    "Or change the request so it no longer conflicts."),
+        "summary": by_kind,
+        "conflicts": conflicts[:60],
+        "conflict_count": len(conflicts),
+        "token": token,
+    })
+
+
+def _index_before(file: str | None):
+    """The pre-write index, or (None, reason) when it cannot be had."""
+    try:
+        return spatial_cache.get(file).index, None
+    except spatial_cache.PluginError as e:
+        return None, f"spatial check skipped: {e}"
+    except Exception as e:                       # the gate must never take the write down
+        return None, f"spatial check skipped: {e}"
+
+
+def _verify_after(before, file: str | None, payloads: list, handles=None) -> dict:
+    spatial_cache.invalidate(file)
+    if before is None or not _VERIFY_ON:
+        return {"verified": False, "note": "post-write check not run"}
+    try:
+        after = spatial_cache.get(file).index
+    except Exception as e:
+        return {"verified": False, "note": f"post-write check skipped: {e}"}
+    try:
+        return before.verify(after, payloads, handles or _payload_handles(payloads))
+    except Exception as e:
+        return {"verified": False, "note": f"post-write check failed: {e}"}
+
+
+def _merge_result(text: str, extra: dict) -> str:
+    """The plugin's own reply with `spatial` attached; legacy plain-text replies
+    are wrapped so nothing is lost."""
+    if text == _NO_CONNECTION:
+        return text
+    try:
+        body = json.loads(text)
+    except ValueError:
+        body = {"result": text}
+    if not isinstance(body, dict):
+        body = {"result": body}
+    body.update(extra)
+    return json.dumps(body)
+
+
+def _post_many(payloads: list, file: str | None = None, stop_on_error: bool = False) -> tuple:
+    """Gate, post, verify -- for one payload or a whole planned batch (one index
+    build before, one after, however many payloads). Returns (results, spatial)
+    where results are the plugin's replies in order and spatial is the
+    verification report, or the blocked result under "blocked"."""
+    if not payloads:
+        return [], {"verified": False, "note": "nothing to post"}
+    if all(_is_read_only(p) for p in payloads):
+        return [_post_raw(p, file) for p in payloads], None
+
+    before, why = _index_before(file) if (_GATE_ON or _VERIFY_ON) else (None, "spatial check off")
+    if before is not None and _GATE_ON:
+        try:
+            conflicts = before.conflicts(payloads)
+        except Exception as e:
+            conflicts, why = [], f"spatial check skipped: {e}"
+        if conflicts:
+            token = spatial_cache.conflict_token(conflicts)
+            if not spatial_cache.acknowledged(file, token):
+                return [], {"blocked": _blocked(conflicts, token, file)}
+            spatial_cache.consume(file, token)
+
+    results = []
+    for p in payloads:
+        text = _post_raw(p, file)
+        results.append(text)
+        if stop_on_error:
+            try:
+                body = json.loads(text)
+                if isinstance(body, dict) and (body.get("error") or body.get("ok") is False):
+                    break
+            except ValueError:
+                pass
+    report = _verify_after(before, file, payloads)
+    if why and isinstance(report, dict):
+        report.setdefault("note", why)
+    return results, report
+
+
+def _post(payload: dict, file: str | None = None) -> str:
+    results, report = _post_many([payload], file)
+    if report and "blocked" in report:
+        return report["blocked"]
+    text = results[0] if results else _NO_CONNECTION
+    return _merge_result(text, {"spatial": report}) if report is not None else text
+
+
+# Compute-stage reports remembered per (drawing, handler, request) so the draw
+# stage can be gated on the conflicts the compute stage found without running the
+# (often minutes-long) compute twice.
+_COMPUTES: dict = {}
+
+
+def _handler_key(handler: str, request: dict, file: str | None) -> tuple:
+    body = json.dumps(request, sort_keys=True, default=str)
+    return (spatial_cache.drawing_key(file), handler, hashlib.sha1(body.encode()).hexdigest()[:16])
+
+
+def _post_handler_raw(handler: str, stage: str, request: dict, file: str | None = None) -> str:
     try:
         payload = {"handler": handler, "stage": stage, "request": request}
         if file:
             payload["file"] = file
-        return requests.post(f"{BASE}/handler", json=payload, timeout=TIMEOUT).text
+        return requests.post(f"{BASE}/handler", json=payload, timeout=HANDLER_TIMEOUT).text
     except requests.exceptions.ConnectionError:
         return _NO_CONNECTION
+
+
+def _handler_conflicts(before, report: dict, request: dict) -> list:
+    proposed = report.get("proposed") if isinstance(report, dict) else None
+    if before is None or not proposed or not _GATE_ON:
+        return []
+    try:
+        return before.conflicts([{"proposed": proposed, "layer": request.get("layer", "")}])
+    except Exception:
+        return []
+
+
+def _post_handler(handler: str, stage: str, request: dict, file: str | None = None) -> str:
+    """Dispatch one ICadObjectHandler stage (context | compute | draw) through the
+    plugin /handler endpoint. The C# side computes and returns a structured JSON
+    report -- conflicts included -- and never mutates the drawing unless stage is
+    "draw" AND the report is clean.
+
+    Around that, the spatial gate: a compute report that carries `proposed`
+    geometry is checked against the index and answers with spatial_conflicts and
+    a token; the draw stage is refused while those conflicts stand unacknowledged,
+    and after it runs the index is rebuilt and the change reported under
+    `spatial`."""
+    if stage == "context":
+        return _post_handler_raw(handler, stage, request, file)
+
+    key = _handler_key(handler, request, file)
+    before, why = _index_before(file) if (_GATE_ON or _VERIFY_ON) else (None, "spatial check off")
+
+    if stage == "compute":
+        text = _post_handler_raw(handler, stage, request, file)
+        try:
+            report = json.loads(text)
+        except ValueError:
+            return text
+        if not isinstance(report, dict):
+            return text
+        conflicts = _handler_conflicts(before, report, request)
+        token = spatial_cache.conflict_token(conflicts) if conflicts else None
+        _COMPUTES[key] = (token, conflicts, time.time())
+        if conflicts:
+            report["spatial_conflicts"] = conflicts[:60]
+            report["spatial_conflict_count"] = len(conflicts)
+            report["conflict_token"] = token
+            report["spatial_note"] = ("The proposed labels/geometry conflict with the drawing (see "
+                                      "spatial_conflicts). apply=True will be refused until you call "
+                                      "acknowledge_conflicts(dashboard, conflict_token) or change the request.")
+        elif why:
+            report["spatial_note"] = why
+        return json.dumps(report)
+
+    # draw / apply
+    remembered = _COMPUTES.get(key)
+    if remembered is None and before is not None and _GATE_ON:
+        # No compute was run for this exact request: run one, so the gate has
+        # something to judge. Its report is what the agent should have read.
+        text = _post_handler_raw(handler, "compute", request, file)
+        try:
+            report = json.loads(text)
+        except ValueError:
+            report = None
+        if isinstance(report, dict) and report.get("ok") is False:
+            return text
+        conflicts = _handler_conflicts(before, report, request) if isinstance(report, dict) else []
+        token = spatial_cache.conflict_token(conflicts) if conflicts else None
+        remembered = (token, conflicts, time.time())
+        _COMPUTES[key] = remembered
+    if remembered is not None:
+        token, conflicts, _ = remembered
+        if conflicts and _GATE_ON and not spatial_cache.acknowledged(file, token):
+            return _blocked(conflicts, token, file)
+        if token:
+            spatial_cache.consume(file, token)
+
+    text = _post_handler_raw(handler, stage, request, file)
+    _COMPUTES.pop(key, None)
+    try:
+        report = json.loads(text)
+    except ValueError:
+        spatial_cache.invalidate(file)
+        return text
+    if not isinstance(report, dict):
+        spatial_cache.invalidate(file)
+        return text
+    proposed = report.get("proposed")
+    if proposed:
+        report["spatial"] = _verify_after(before, file, [{"proposed": proposed, "layer": request.get("layer", "")}],
+                                          handles=list(report.get("created") or []))
+    else:
+        spatial_cache.invalidate(file)      # inverts changed, plan geometry did not: nothing to diff
+    return json.dumps(report)
 
 
 _PREVIEW_LEN = 300
@@ -639,8 +900,10 @@ def draw_driveways(dashboard: str, alignment: str = "", layer: str = "0",
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
-    for payload in payloads:
-        _post(payload, file)
+    _, report = _post_many(payloads, file)
+    if report and "blocked" in report:
+        return report["blocked"]
+    summary["spatial"] = report
     return json.dumps(summary)
 
 
@@ -696,9 +959,271 @@ def draw_rear_swales(dashboard: str, alignment: str = "", layer: str = "0",
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
-    for payload in payloads:
-        _post(payload, file)
+    _, report = _post_many(payloads, file)
+    if report and "blocked" in report:
+        return report["blocked"]
+    summary["spatial"] = report
     return json.dumps(summary)
+
+
+# ── Grading sheet labels ─────────────────────────────────────────────────────
+#
+# Surface elevation / slope labels on the finished grade surface, worked out in
+# the plugin from ordinary 2D linework (Commands/GradingLabels.cs). The plugin
+# does every intersection and projection and returns a report; nothing here
+# reasons about geometry.
+
+GRADING_LABEL_KINDS = ("pad_fp", "lot_row", "lot_setback", "swale_meet", "swale_high",
+                       "lot_corner", "curb_transition", "drive_curb", "drive_slope",
+                       "swale_slope")
+
+
+@mcp.tool()
+@observed
+def grading_label_context(dashboard: str, surface: str = "") -> str:
+    """Read-only: the surfaces in the drawing -- data-shortcut references included,
+    each flagged is_reference with reference_valid / reference_stale / source_exists
+    -- plus surface_pick (the surface label_grading would use for `surface`, or
+    "FG" when blank, or the reason it cannot choose), the surface elevation / slope
+    label styles, marker styles and the drawing defaults by exact name, how many
+    pieces of linework each grading layer contributes (model space and xrefs
+    together), and how many surface labels already exist. Call this first to see
+    which FG surface will be labelled, or why a layer is coming up empty.
+
+    surface: optional name to test the pick with, exactly as label_grading takes it.
+    dashboard: REQUIRED id of the dashboard whose drawing to read."""
+    file = _file_for(dashboard)
+    request = {"surface": surface} if surface else {}
+    return _post_handler("grading_labels", "context", request, file)
+
+
+@mcp.tool()
+@observed
+def label_grading(dashboard: str, apply: bool = False, surface: str = "",
+                  kinds: list[str] | None = None, window: list[list[float]] | None = None,
+                  layer: str = "0", fp_style: str = "", elevation_style: str = "",
+                  tc_style: str = "", slope_style: str = "", marker_style: str = "",
+                  existing_tolerance: float = 1.0, pad_reach: float = 60.0,
+                  drive_curb_side: str = "right", background: bool = True) -> str:
+    """Places the grading-sheet labels on the finished grade (FG) surface, one label
+    per target point, from the drawing's 2D linework. Pads, lot lines, curb,
+    driveways and swales are found by layer suffix in model space AND inside
+    xrefs, so "x-plat (ph1a)|c-lots-line" counts as a lot line.
+
+    Styles are optional. Left blank, every label takes the drawing's default
+    surface spot elevation / slope label style (its Surface feature settings).
+    Name a style to use it for that group; a name that does not exist is NOT an
+    error -- the report warns and the default is used instead.
+
+    Surface elevation labels (SEL):
+      pad_fp          FP style     centre of each pad (c-lots-pad*)
+      lot_row         elevation    lot line (c-lots-line) meets right of way (c-rway-line)
+      lot_setback     elevation    lot line meets setback line (c-lots-stbk)
+      swale_meet      elevation    rear swale (c-lots-fl) meets a lot line -- where neighbours' swales meet
+      swale_high      elevation    highest FG elevation along each pad's swale
+      lot_corner      elevation    lot line meets lot line away from the right of way (rear corners)
+      curb_transition TC style     back of curb (c-road-back) changes between arc and straight
+      drive_curb      TC style     where the driveway's flare arc lands on the back of curb
+                                   (drive_curb_side: right (default, looking from pad to road), left, both)
+    Surface slope labels (SSL, two-point, slope style):
+      drive_slope     middle of the driveway's pad edge -> straight out to the right of way
+      swale_slope     each swale bend -> straight back (away from the road) to the lot line; two per pad
+
+    The plugin does the geometry; YOU read the report. Call with apply=False first:
+      * labels=[...]   every point that would be labelled, with kind, style and pad;
+      * skipped=[...]  targets left alone and why: "already labelled" (a surface
+        label of the same type sits within existing_tolerance), no surface
+        coverage, a driveway that never reaches the curb, a pad with no swale...;
+      * warnings=[...] a requested style that was not found (with the names that
+        exist) and the default used instead, layers that came up empty, pads with
+        an odd number of driveway lines or swale bends;
+      * styles={...}   per group: requested, used, and whether that is the default;
+      * errors=[...]   nothing was placed: no FG surface, no linework at all.
+    Then call again with apply=True to create every label in one transaction. Labels
+    land on `layer` ("0") and carry a tag naming their kind, which space_labels uses
+    to decide how to place them. Placement itself is not done here.
+
+    surface: FG surface name; omit for the one surface whose name contains "FG".
+    Surfaces brought in by data reference count -- they are surfaces in this
+    drawing -- and the report's surface_info says if the one used is a reference
+    and whether it is stale. Several "FG" matches are an error that lists them.
+    kinds: subset of the kinds above; omit for all of them.
+    window: [[xmin, ymin], [xmax, ymax]] to label one sheet's area only.
+    fp_style / elevation_style / tc_style / slope_style / marker_style: optional
+    names, matched exactly first, then as a unique case-insensitive substring
+    ("TC" finds "Top Curb (TC)"); grading_label_context lists them and the defaults.
+
+    background (default True): this command walks the whole drawing and takes
+    minutes, longer than a chat tool call may stay open, so it is handed to the
+    dashboard runner and this call returns at once with a run id. Read the
+    report with run_results after wait_for_dashboards. background=False runs it
+    inline (only for a small window). A window forces inline.
+
+    dashboard: REQUIRED id of the dashboard whose drawing to work on."""
+    if background and not window:
+        params: dict = {"apply": bool(apply), "layer": layer,
+                        "existing_tolerance": existing_tolerance, "pad_reach": pad_reach,
+                        "drive_curb_side": drive_curb_side}
+        if surface:
+            params["surface"] = surface
+        for key, value in (("fp_style", fp_style), ("elevation_style", elevation_style),
+                           ("tc_style", tc_style), ("slope_style", slope_style),
+                           ("marker_style", marker_style)):
+            if value and value.strip():
+                params[key] = value.strip()
+        if kinds:
+            unknown = [k for k in kinds if k not in GRADING_LABEL_KINDS]
+            if unknown:
+                return json.dumps({"error": f"unknown label kind(s) {unknown}; "
+                                            f"known: {list(GRADING_LABEL_KINDS)}"})
+            params["kinds"] = list(kinds)
+        return _run_in_background(dashboard, "label_grading", params,
+                                  "grading labels" + (" (apply)" if apply else " (report)"))
+
+    file = _file_for(dashboard)
+    request: dict = {
+        "layer": layer,
+        "existing_tolerance": existing_tolerance,
+        "pad_reach": pad_reach,
+        "drive_curb_side": drive_curb_side,
+    }
+    if surface:
+        request["surface"] = surface
+    for key, value in (("fp_style", fp_style), ("elevation_style", elevation_style),
+                       ("tc_style", tc_style), ("slope_style", slope_style),
+                       ("marker_style", marker_style)):
+        if value and value.strip():
+            request[key] = value.strip()
+    if kinds:
+        unknown = [k for k in kinds if k not in GRADING_LABEL_KINDS]
+        if unknown:
+            return json.dumps({"error": f"unknown label kind(s) {unknown}; "
+                                        f"known: {list(GRADING_LABEL_KINDS)}"})
+        request["kinds"] = list(kinds)
+    if window:
+        request["window"] = window
+    return _post_handler("grading_labels", "draw" if apply else "compute", request, file)
+
+
+@mcp.tool()
+@observed
+def space_labels(dashboard: str, apply: bool = False, handles: list[str] | None = None,
+                 layer: str = "", types: str = "surface", window: list[list[float]] | None = None,
+                 mode: str = "auto", kinds: list[str] | None = None, include_other: bool = False,
+                 curb_layer: str = "c-road-back", curb_tolerance: float = 1.0,
+                 include_dragged: bool = False, include_pinned: bool = False,
+                 obstacle_layers: list[str] | None = None, ignore_layers: list[str] | None = None,
+                 clearance: float = 0.5, cell_size: float = 0.0,
+                 leader_lengths: list[float] | None = None, directions: list[float] | None = None,
+                 allow_undragged: bool = True, weights: dict | None = None,
+                 max_passes: int = 10, background: bool = True) -> str:
+    """Puts grading labels where they belong, two treatments chosen per label:
+      position  the finished-grade elevation labels (lot_row, lot_setback, swale_meet,
+                swale_high, lot_corner) are dragged clear of linework and each other;
+      align     the top-of-curb labels (curb_transition, drive_curb) are rotated to
+                follow the back of curb (curb_layer) at their anchor, nothing else.
+    Which is which comes from the kind tag label_grading writes on its labels; an
+    untagged spot elevation is aligned when its anchor sits within curb_tolerance of
+    the back of curb and positioned otherwise. Pad (pad_fp) and slope labels are
+    outside the spec and are listed as skipped unless include_other=True. mode
+    forces one treatment on everything selected; kinds limits the run to those tags.
+
+    Positioning is greedy candidate placement with local-search repair, scored on a
+    raster occupancy grid of the linework (model space AND xrefs, every visible layer
+    unless obstacle_layers / ignore_layers say otherwise). The plugin does all of it
+    and reports per label; nothing here reasons about geometry.
+
+    Each label is tried undragged (at its anchor) and dragged in each of 8 directions
+    at 1, 2 and 3 text heights of leader. Every candidate is measured for real -- the
+    offset is applied and the extents read back -- so the text box is exactly what
+    Civil 3D draws. Cost = linework under the text (x10) + other labels under the
+    text (x25) + linework under the leader (x1) + leader length in text heights (x1)
+    + direction preference (x0.5), minus 2 for staying where it is. Labels are placed
+    most-constrained first, then repair passes revisit any that still overlap.
+
+    Call with apply=False first and read the report:
+      * aligned / clean / overlapping / moved / skipped counts, and labels=[...] with,
+        per label, its mode and kind, then for aligned ones rotation_deg and
+        curb_distance, for positioned ones the
+        chosen offset (or undragged), its text box, line_hits, label_hits and cost --
+        a label with line_hits or label_hits > 0 could not be made clear with these
+        candidates (longer leader_lengths, more directions or a smaller clearance
+        usually fix it);
+      * warnings: no linework in reach, grid coarsened for a huge region (pass a
+        window and work one sheet at a time), labels that could not be measured.
+    Then apply=True writes every offset in one transaction. Compute leaves the drawing
+    untouched: every temporary measurement is rolled back.
+
+    handles: explicit label handles (e.g. `created` from label_grading); otherwise
+    every label matching types ("elevation", "slope", "surface" = both, "all" = any
+    Civil 3D label), layer (suffix) and window is taken.
+    include_dragged: also move labels somebody already dragged (default: leave them
+    and treat them as obstacles). include_pinned: same for pinned labels.
+    clearance: feet of padding around linework. cell_size: grid cell in feet
+    (default half the text height). leader_lengths / directions (degrees, in
+    preference order) override the candidate set. weights: {line, label, leader,
+    length, direction, stay}.
+
+    background (default True): measuring every candidate for every label takes
+    minutes, longer than a chat tool call may stay open, so the command is
+    handed to the dashboard runner and this call returns at once with a run id.
+    Read the report with run_results after wait_for_dashboards. Explicit
+    handles, window, kinds, directions or weights force an inline call;
+    background=False does too.
+
+    dashboard: REQUIRED id of the dashboard whose drawing to work on."""
+    if background and not (handles or window or kinds or directions or weights):
+        params: dict = {"apply": bool(apply), "types": types, "mode": mode,
+                        "include_other": include_other, "curb_layer": curb_layer,
+                        "include_dragged": include_dragged, "include_pinned": include_pinned,
+                        "clearance": clearance, "max_passes": max_passes}
+        if layer:
+            params["layer"] = layer
+        if obstacle_layers:
+            params["obstacle_layers"] = list(obstacle_layers)
+        if ignore_layers:
+            params["ignore_layers"] = list(ignore_layers)
+        if cell_size and cell_size > 0:
+            params["cell_size"] = cell_size
+        if leader_lengths:
+            params["leader_lengths"] = list(leader_lengths)
+        return _run_in_background(dashboard, "space_labels", params,
+                                  "label spacing" + (" (apply)" if apply else " (report)"))
+
+    file = _file_for(dashboard)
+    request: dict = {
+        "types": types,
+        "mode": mode,
+        "include_other": include_other,
+        "curb_layer": curb_layer,
+        "curb_tolerance": curb_tolerance,
+        "include_dragged": include_dragged,
+        "include_pinned": include_pinned,
+        "clearance": clearance,
+        "allow_undragged": allow_undragged,
+        "max_passes": max_passes,
+    }
+    if handles:
+        request["handles"] = list(handles)
+    if kinds:
+        request["kinds"] = list(kinds)
+    if layer:
+        request["layer"] = layer
+    if window:
+        request["window"] = window
+    if obstacle_layers:
+        request["obstacle_layers"] = list(obstacle_layers)
+    if ignore_layers:
+        request["ignore_layers"] = list(ignore_layers)
+    if cell_size and cell_size > 0:
+        request["cell_size"] = cell_size
+    if leader_lengths:
+        request["leader_lengths"] = list(leader_lengths)
+    if directions:
+        request["directions"] = list(directions)
+    if weights:
+        request["weights"] = weights
+    return _post_handler("label_spacing", "draw" if apply else "compute", request, file)
 
 
 @mcp.tool()
@@ -790,28 +1315,14 @@ def solve_pipe_elevations(dashboard: str, structure: str,
 #
 # A grid index over the drawing (spatial.py) rendered into words, so the agent
 # can orient on a whole site in a few hundred tokens and only reach for handles
-# once it has reasoned its way to an area. Nothing here draws.
-
-_SPATIAL_LAYERS = [*driveways.PAD_LAYER_SUFFIXES, driveways.ROAD_LAYER,
-                   "c-lots-line", "c-lots-stbk", "c-rway-center", "c-rway-line",
-                   "c-bndy", "c-esmt"]
-
-
-def _snapshot(file: str) -> dict:
-    """Model space plus the xrefed layers the index cares about, merged."""
-    raw = _get("/modelspace", file)
-    data = json.loads(raw)
-    if isinstance(data, dict) and "error" in data:
-        raise RuntimeError(str(data["error"]))
-    nested = _get_nested(file, _SPATIAL_LAYERS)
-    for category in ("polylines", "lines", "arcs"):
-        if nested.get(category):
-            data[category] = list(data.get(category) or []) + nested[category]
-    return data
+# once it has reasoned its way to an area. The index is cached per drawing
+# (spatial_cache.py) and rebuilt only when the plugin's change counter moves,
+# the vocabulary changes, or a write goes through this process. Nothing here
+# draws.
 
 
 def _index_for(dashboard: str):
-    return spatial.build(_snapshot(_file_for(dashboard)))
+    return spatial_cache.get(_file_for(dashboard)).index
 
 
 @mcp.tool()
@@ -819,16 +1330,363 @@ def _index_for(dashboard: str):
 def spatial_map(dashboard: str) -> str:
     """The drawing as a coarse character map, north up, plus its regions.
 
-    Read this FIRST to orient: one glyph per 200ft cell (R curb, P pads, + both,
-    L lot lines, d driveways/swales, . empty) with the x/y of the top-left, then
-    every corridor (one per alignment) and block with what it holds. A whole
-    subdivision fits in a few hundred tokens. Drill in with describe_location
-    and find_entities; nothing here draws."""
+    Read this FIRST to orient: one glyph per 200ft cell (legend printed with the
+    map: curb, pads, lot lines, driveways/swales, utilities ...) with the x/y of
+    the top-left, then every corridor (one per alignment) and block with what
+    it holds, and the busiest layers the vocabulary has no word for yet (name
+    them with define_tag). A whole subdivision fits in a few hundred tokens.
+    Drill in with describe_location and find_entities; nothing here draws."""
     try:
         index = _index_for(dashboard)
     except Exception as e:
         return json.dumps({"error": str(e)})
-    return index.site_map() + "\n\n" + index.summary()
+    text = index.site_map() + "\n\n" + index.summary()
+    if len(text) > _MAP_MAX_CHARS:          # never hand the chat something it cannot hold
+        text = text[:_MAP_MAX_CHARS] + "\n... (map truncated; ask describe_location for detail)"
+    return text
+
+
+_MAP_MAX_CHARS = 60_000
+
+
+@mcp.tool()
+@observed
+def list_tags(dashboard: str) -> str:
+    """The vocabulary the spatial tools speak: every tag, the rule that assigns
+    it (layer suffix / block name / entity type), its map glyph, which xref
+    layers are merged into the index, and -- for this dashboard's drawing --
+    the busiest layers no rule names, so you can decide what to call them.
+    Tags are the words describe_location and find_entities use."""
+    out = spatial.TAGS.describe()
+    try:
+        index = _index_for(dashboard)
+        out["unmatched_linework"] = [{"layer": layer, "feet": round(ft, 1)}
+                                     for layer, ft in index.unmatched.most_common(25)]
+        out["type_tagged_points"] = [{"layer": layer, "count": n}
+                                     for layer, n in index.unmatched_points.most_common(25)]
+    except Exception as e:
+        out["drawing_note"] = str(e)
+    return json.dumps(out)
+
+
+@mcp.tool()
+@observed
+def define_tag(dashboard: str, tag: str, needle: str, match: str = "contains",
+               on: str = "layer", glyph: str = "", priority: int = 80,
+               persist: bool = True) -> str:
+    """Teaches the spatial index a word. From now on an entity whose layer name
+    (on="layer"), block name (on="name") or type (on="type": line, arc,
+    polyline, block, text, point, circle, dimension, pipe, structure,
+    feature_line, label) matches `needle` by `match` (contains | endswith |
+    startswith | equals | regex, case-insensitive) is tagged `tag`, shows on the
+    site map as `glyph` (one character, optional) and can be asked for by
+    find_entities. Lower priority wins over higher; existing rules sit at 10-90.
+    An endswith/equals layer rule also joins the xref merge list. persist=True
+    saves the rule to layer_tags.json for every later session. Every cached
+    index is rebuilt on its next use, so call spatial_map again to see the
+    effect. Use list_tags first to see the busiest unnamed layers."""
+    try:
+        rule = spatial.TAGS.define(tag, needle, match=match, on=on, glyph=glyph,
+                                   priority=priority, persist=persist)
+    except (ValueError, OSError) as e:
+        return json.dumps({"error": str(e)})
+    spatial_cache.invalidate_all()
+    return json.dumps({"ok": True, "rule": rule, "vocabulary_version": spatial.TAGS.version,
+                       "saved": bool(persist), "tags": spatial.TAGS.tags()})
+
+
+@mcp.tool()
+@observed
+def acknowledge_conflicts(dashboard: str, token: str, reason: str = "") -> str:
+    """Accepts the conflicts a blocked write reported, so the SAME call succeeds
+    when repeated. A write (any draw/modify tool, label_grading or space_labels
+    with apply=True, draw_driveways ...) is refused when its proposed geometry
+    crosses existing linework, lands inside a pad, or sits too close to
+    something; the refusal carries `conflicts` and a `token`. Only call this
+    after reading the conflicts and deciding they are acceptable -- say why in
+    `reason`; it is logged with the decision. The acknowledgement is good for
+    15 minutes and for that exact set of conflicts; change the request and the
+    conflicts change with it."""
+    file = _file_for(dashboard)
+    token = str(token or "").strip()
+    if not token:
+        return json.dumps({"error": "token is required; it comes from the blocked result"})
+    spatial_cache.acknowledge(file, token)
+    return json.dumps({"ok": True, "token": token, "reason": reason,
+                       "note": "Repeat the blocked call now, unchanged."})
+
+
+# ── Driving dashboards from the chat ─────────────────────────────────────────
+#
+# The free worker: a dashboard runs a sequence of blocks on its own drawing as
+# its own background task, gated and verified by the spatial index, with no
+# model in the loop. The chat composes the sequence (spatial_map, then
+# list_blocks, then run_on_dashboard) and reads back later. Claude Desktop
+# only acts inside a turn and cannot be pinged, so everything here is a pull:
+# a digest per dashboard, the events since a cursor, and an attention queue of
+# the things that need a decision. wait_for_dashboards blocks briefly so a
+# pull can look like a push.
+
+_DASH_TIMEOUT = 10
+_cursor = {"seen": -1}       # last event sequence this process has reported
+
+
+def _dash_get(path: str, params: dict | None = None, timeout: float = _DASH_TIMEOUT):
+    try:
+        r = requests.get(f"{dashboard_events.DASHBOARD_BASE}{path}", params=params, timeout=timeout)
+    except requests.exceptions.RequestException as e:
+        return {"error": f"The dashboard server is not reachable ({e.__class__.__name__}). "
+                         "Ask the user to open the dashboard at http://localhost:8765."}
+    try:
+        body = r.json()
+    except ValueError:
+        return {"error": f"The dashboard server answered HTTP {r.status_code} without JSON."}
+    if r.status_code >= 400 and isinstance(body, dict) and "error" not in body:
+        body["error"] = f"HTTP {r.status_code}"
+    return body
+
+
+def _dash_post(path: str, body: dict | None = None, timeout: float = _DASH_TIMEOUT):
+    try:
+        r = requests.post(f"{dashboard_events.DASHBOARD_BASE}{path}", json=body or {}, timeout=timeout)
+    except requests.exceptions.RequestException as e:
+        return {"error": f"The dashboard server is not reachable ({e.__class__.__name__}). "
+                         "Ask the user to open the dashboard at http://localhost:8765."}
+    try:
+        out = r.json()
+    except ValueError:
+        return {"error": f"The dashboard server answered HTTP {r.status_code} without JSON."}
+    if r.status_code >= 400 and isinstance(out, dict) and "error" not in out:
+        out["error"] = f"HTTP {r.status_code}"
+    return out
+
+
+def _compact_block(spec: dict, with_help: bool) -> dict:
+    fields = []
+    for f in spec.get("fields") or []:
+        c = {"name": f["name"], "type": f.get("type", "text")}
+        if "default" in f:
+            c["default"] = f["default"]
+        elif f.get("optional"):
+            c["optional"] = True
+        for k in ("choices", "min_items", "help"):
+            if k in f and f[k] not in (None, "", []):
+                c[k] = f[k]
+        fields.append(c)
+    out = {"type": spec["type"], "group": spec.get("group"), "description": spec.get("description"),
+           "fields": fields}
+    if with_help and spec.get("help"):
+        out["help"] = str(spec["help"])[:600]
+    return out
+
+
+@mcp.tool()
+@observed
+def list_blocks(dashboard: str, group: str = "", block_type: str = "", with_help: bool = False) -> str:
+    """The blocks a dashboard run can be built from, with their parameters --
+    the same palette the dashboard UI shows. A block is {"type": ..., "params":
+    {...}, "repeat": n}; params use the field names listed here (a "points"
+    field takes [[x,y],...], "handles" a list of handle strings, "multichoice"
+    a list of names). Generated blocks (draw_driveways, draw_rear_swales,
+    label_grading, space_labels) read the drawing when they run, so they need
+    no coordinates. group narrows the list (Geometry, Generated, Layers, Draw,
+    Modify, Annotate, Query ...); block_type returns one block with its full
+    help. Read spatial_map for the dashboard first, then compose, then call
+    run_on_dashboard."""
+    body = _dash_get("/blocks")
+    if "error" in body:
+        return json.dumps(body)
+    specs = body.get("blocks") or []
+    if block_type:
+        specs = [s for s in specs if s.get("type") == block_type]
+        with_help = True
+    if group:
+        specs = [s for s in specs if str(s.get("group", "")).lower() == group.lower()]
+    groups = sorted({str(s.get("group")) for s in (body.get("blocks") or [])})
+    return json.dumps({"count": len(specs), "groups": groups, "max_repeat": body.get("max_repeat"),
+                       "blocks": [_compact_block(s, with_help) for s in specs]})
+
+
+@mcp.tool()
+@observed
+def run_on_dashboard(dashboard: str, blocks: list[dict], on_conflict: str = "pause",
+                     label: str = "") -> str:
+    """Commits a sequence of blocks to a dashboard and sets it running on that
+    dashboard's drawing, in the background, with no model in the loop. Returns
+    at once with the run id; the run continues after this chat turn ends and
+    after the user walks away. Several dashboards can run at the same time,
+    one run each.
+
+    blocks: [{"type": "draw_driveways", "params": {"alignment": ["RD-1"],
+    "width": 20}}, {"type": "draw_rear_swales", "params": {...}}, {"type":
+    "label_grading", "params": {"apply": true}}] -- see list_blocks. Blocks run
+    top to bottom; generated blocks read the drawing as it is when their turn
+    comes, so driveways then swales then labels in one run works.
+
+    on_conflict: what the run does when the pre-run check finds its proposed
+    geometry crossing linework or landing inside a pad. "pause" (default,
+    for unattended runs): draw nothing, put the conflicts on the attention
+    queue and wait for resume_dashboard or stop_dashboard. "warn": log it and
+    draw anyway (what the browser's Run button does). "stop": fail the run.
+    After the run the index is rebuilt and the change verified; a change
+    outside the planned area also lands on the attention queue.
+
+    label: a few words naming the run, shown in status. dashboard: REQUIRED id
+    of the dashboard; its drawing is set by the user."""
+    if not isinstance(blocks, list) or not blocks:
+        return json.dumps({"error": "blocks must be a non-empty list of {type, params, repeat}"})
+    on_conflict = str(on_conflict or "pause").strip().lower()
+    if on_conflict not in ("pause", "warn", "stop"):
+        return json.dumps({"error": "on_conflict must be pause, warn or stop"})
+    body = _dash_post(f"/dashboards/{dashboard}/run",
+                      {"blocks": blocks, "policy": {"on_conflict": on_conflict},
+                       "label": label, "source": "desktop"})
+    if "error" not in body:
+        body["note"] = ("Running in the background. Check dashboard_status later, or call "
+                        "wait_for_dashboards to hold until it needs a decision or finishes.")
+    return json.dumps(body)
+
+
+@mcp.tool()
+@observed
+def dashboard_status(dashboard: str = "", since: int = -2) -> str:
+    """What every dashboard is doing, in a few lines each: idle or the current
+    run's status (checking, paused, running, finished, failed, stopped), steps
+    done of total, conflicts found, the post-run verification, and any
+    decisions taken. Plus `attention`: the open items that need a decision (a
+    run paused on conflicts, a failed run, a change outside the planned area)
+    with ids for resume_dashboard / resolve_attention, and `events` since the
+    last time this was asked (pass since=-1 for the full recent history, or a
+    cursor to continue from). dashboard narrows to one. Nothing here can be
+    pushed to you -- ask when you want to know."""
+    cursor = _cursor["seen"] if since == -2 else since
+    params = {"since": cursor}
+    if dashboard:
+        params["dashboard"] = dashboard
+    body = _dash_get("/status", params)
+    if "error" in body:
+        return json.dumps(body)
+    _cursor["seen"] = max(_cursor["seen"], int(body.get("cursor") or -1))
+    return json.dumps(_trim_status(body))
+
+
+def _trim_status(body: dict) -> dict:
+    """The digest without the parts a chat never needs to see whole."""
+    out = dict(body)
+    out["events"] = [{k: v for k, v in e.items() if k in ("seq", "type", "dashboard", "run", "message",
+                                                           "error", "ok", "attention", "kind", "completed",
+                                                           "total", "tool", "_ts")}
+                     for e in body.get("events") or []][-60:]
+    out["attention"] = [{k: v for k, v in i.items() if k != "detail"} | {"detail": _preview(i.get("detail"), 600)}
+                        for i in body.get("attention") or []]
+    return out
+
+
+@mcp.tool()
+@observed
+def wait_for_dashboards(dashboard: str = "", timeout: float = 40.0) -> str:
+    """Holds until a run pauses, fails, finishes or stops, or an attention item
+    appears -- or until `timeout` seconds pass (capped at 45, so the call never
+    hangs). Returns the same digest as dashboard_status plus `woke`, the events
+    that ended the wait, and `timed_out`. Call it again to keep waiting. Use it
+    right after run_on_dashboard when the user wants to watch; otherwise let
+    the runs go and use dashboard_status when they ask."""
+    params = {"since": _cursor["seen"], "timeout": max(1.0, min(float(timeout), 45.0))}
+    if dashboard:
+        params["dashboard"] = dashboard
+    body = _dash_get("/wait", params, timeout=params["timeout"] + 10)
+    if "error" in body:
+        return json.dumps(body)
+    _cursor["seen"] = max(_cursor["seen"], int(body.get("cursor") or -1))
+    return json.dumps(_trim_status(body))
+
+
+@mcp.tool()
+@observed
+def run_results(dashboard: str, step: int = 0) -> str:
+    """The full plugin reply for each step of the dashboard's latest run: the
+    label_grading / space_labels reports (compute and apply stages), created
+    handles, per-step errors. dashboard_status only previews these. step
+    narrows to one step (1-based); 0 returns all, each reply parsed as JSON
+    when it is JSON."""
+    params = {"step": step} if step and step > 0 else None
+    body = _dash_get(f"/dashboards/{dashboard}/results", params)
+    if "error" in body:
+        return json.dumps(body)
+    budget = 90_000
+    out = []
+    for r in body.get("results") or []:
+        text = r.get("result") or ""
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = text
+        entry = {k: v for k, v in r.items() if k != "result"}
+        entry["result"] = parsed
+        blob = json.dumps(entry)
+        if len(blob) > budget:
+            entry["result"] = _preview(parsed, max(2000, budget))
+            entry["truncated"] = True
+            blob = json.dumps(entry)
+        budget -= len(blob)
+        out.append(entry)
+        if budget <= 0:
+            out.append({"note": "further results omitted for size; ask for one step at a time"})
+            break
+    return json.dumps({"run": body.get("run"), "results": out})
+
+
+def _run_in_background(dashboard: str, block_type: str, params: dict, label: str) -> str:
+    """Hands a slow command to the dashboard runner as a one-block run and
+    returns at once, so the chat never holds a tool call open for minutes.
+    The report comes back through run_results."""
+    body = _dash_post(f"/dashboards/{dashboard}/run",
+                      {"blocks": [{"type": block_type, "params": params}],
+                       "policy": {"on_conflict": "pause"}, "label": label, "source": "desktop"})
+    if "error" in body:
+        return json.dumps(body)
+    body["background"] = True
+    body["note"] = ("Started on the dashboard; this call does not wait. Call "
+                    "wait_for_dashboards (or dashboard_status later), then run_results to read "
+                    "the report. With apply=True the run pauses if the proposed labels conflict "
+                    "with the drawing; resume_dashboard lets it go ahead.")
+    return json.dumps(body)
+
+
+@mcp.tool()
+@observed
+def resume_dashboard(dashboard: str, reason: str) -> str:
+    """Lets a run that paused on conflicts go ahead and draw. Only call after
+    reading the conflicts in dashboard_status (attention item of kind
+    "conflicts") and deciding they are acceptable; `reason` is recorded with
+    the decision. To change the plan instead, stop_dashboard and run a new
+    sequence."""
+    reason = str(reason or "").strip()
+    if not reason:
+        return json.dumps({"error": "reason is required; it is logged with the decision"})
+    return json.dumps(_dash_post(f"/dashboards/{dashboard}/resume", {"reason": reason, "by": "desktop"}))
+
+
+@mcp.tool()
+@observed
+def stop_dashboard(dashboard: str) -> str:
+    """Stops a dashboard's current run -- paused or running. Steps already
+    posted stay in the drawing; the post-run verification still reports what
+    they changed."""
+    return json.dumps(_dash_post(f"/dashboards/{dashboard}/stop"))
+
+
+@mcp.tool()
+@observed
+def resolve_attention(item: str, note: str) -> str:
+    """Clears an attention item once it has been dealt with -- a failed run
+    that was re-run, an unexpected change that was checked and is fine.
+    Paused runs clear themselves on resume or stop; use this for the others.
+    `note` says what was decided and is kept with the item."""
+    note = str(note or "").strip()
+    if not note:
+        return json.dumps({"error": "note is required"})
+    return json.dumps(_dash_post(f"/attention/{item}/resolve", {"note": note}))
 
 
 @mcp.tool()
@@ -857,10 +1715,12 @@ def find_entities(dashboard: str, tag: str, x: float, y: float,
                   radius: float = 100.0) -> str:
     """Handles of entities of one tag within `radius` ft of a point.
 
-    tag is one of: pad, curb, lot_line, setback, centreline, right_of_way,
-    boundary, easement, driveway, swale, other. Handles are what move_to_layer,
-    edit_layer and delete take, so this is how a reasoned-about area becomes
-    something to act on."""
+    tag is any word from list_tags: pad, curb, lot_line, setback, centreline,
+    right_of_way, boundary, easement, driveway, swale, storm, sanitary, water,
+    contour, pipe, structure, feature_line, label, text, block ... or other.
+    Point entities (labels, blocks, structures, text) match on their anchor.
+    Handles are what move_to_layer, edit_layer and the modify tools take, so
+    this is how a reasoned-about area becomes something to act on."""
     try:
         index = _index_for(dashboard)
     except Exception as e:
@@ -1030,7 +1890,7 @@ _DASHBOARD_URL  = f"http://localhost:{_DASHBOARD_PORT}"
 # Point _HEALTH_PATH at a route the CURRENT server has and older ones don't, and
 # require the version stamp to match so a server running older code is replaced.
 _HEALTH_PATH = "/version"
-_DASHBOARD_VERSION = "2026-09-08.2"   # must equal dashboard/server.py DASHBOARD_VERSION
+_DASHBOARD_VERSION = "2026-09-10.3"   # must equal dashboard/server.py DASHBOARD_VERSION
 
 # How long a server gets to answer before it counts as failed or stale. Covers
 # uvicorn's own startup plus the sibling-process case described in _launch.
@@ -1082,16 +1942,60 @@ def _open_browser() -> bool:
     return False
 
 
-def _dashboard_healthy() -> bool:
-    """True only when the port is owned by a server serving the current routes."""
+def _dashboard_version() -> str | None:
+    """The version stamp the server on the port reports, or None when nothing
+    there answers like a dashboard server."""
     try:
         response = requests.get(
             f"http://127.0.0.1:{_DASHBOARD_PORT}{_HEALTH_PATH}", timeout=1.0)
         if response.status_code != 200:
-            return False
-        return response.json().get("version") == _DASHBOARD_VERSION
+            return None
+        version = response.json().get("version")
+        return str(version) if version else None
     except (requests.exceptions.RequestException, ValueError):
+        return None
+
+
+def _dashboard_healthy() -> bool:
+    """True only when the port is owned by a server serving the current routes."""
+    return _dashboard_version() == _DASHBOARD_VERSION
+
+
+def _stop_stale_dashboard() -> bool:
+    """Ends a dashboard server left running from an older version of the code.
+
+    Only a process that answers /version with a stamp that is not ours is
+    touched -- that is a dashboard server of ours and nothing else -- and it is
+    found by the port it holds. Windows only; elsewhere the log line tells the
+    user what to stop."""
+    if os.name != "nt":
         return False
+    try:
+        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
+                             timeout=10, creationflags=subprocess.CREATE_NO_WINDOW).stdout
+    except Exception as e:
+        _log(f"could not list listeners to find the stale dashboard server: {e}")
+        return False
+    pids = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[1].endswith(f":{_DASHBOARD_PORT}") \
+                and parts[3].upper() == "LISTENING":
+            pids.add(parts[4])
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True, text=True,
+                           timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+            _log(f"stopped stale dashboard server (pid {pid}) so the current one can start")
+        except Exception as e:
+            _log(f"could not stop stale dashboard server pid {pid}: {e}")
+            return False
+    deadline = time.time() + 5
+    while time.time() < deadline and _dashboard_port_open():
+        time.sleep(0.25)
+    return not _dashboard_port_open()
 
 
 def _wait_for_healthy(seconds: int = None) -> bool:
@@ -1105,6 +2009,28 @@ def _wait_for_healthy(seconds: int = None) -> bool:
             return True
         time.sleep(0.25)
     return False
+
+
+@mcp.tool()
+@observed
+def open_dashboard() -> str:
+    """Opens the dashboard UI (http://localhost:8765) in the user's browser,
+    starting the dashboard server first if it is not running. The tab is
+    normally opened once when this server process starts, and Claude Desktop
+    keeps that process alive across chats and window closes, so call this when
+    the user asks for the dashboard and no tab is open."""
+    if not _dashboard_healthy():
+        _ensure_dashboard_running()
+        if not _wait_for_healthy():
+            return json.dumps({"ok": False, "url": _DASHBOARD_URL,
+                               "error": "The dashboard server did not come up; see "
+                                        f"{_LAUNCH_LOG} for why."})
+        return json.dumps({"ok": True, "url": _DASHBOARD_URL,
+                           "note": "Server started; the launcher opens the tab itself."})
+    opened = _open_browser()
+    return json.dumps({"ok": opened, "url": _DASHBOARD_URL,
+                       "note": None if opened else f"No browser could be opened; see {_LAUNCH_LOG}. "
+                                                   f"Ask the user to open {_DASHBOARD_URL}."})
 
 
 def _ensure_dashboard_running() -> None:
@@ -1122,14 +2048,21 @@ def _ensure_dashboard_running() -> None:
             # bound port therefore does NOT mean the owner is stale -- it has to
             # be given time to answer before that conclusion is drawn, or the
             # second process writes off a perfectly good server and no tab opens.
-            if _dashboard_port_open():
+            launch_new = not _dashboard_port_open()
+            if not launch_new:
                 if not _wait_for_healthy():
-                    _log(f"Port {_DASHBOARD_PORT} is held by a process that never "
-                         f"served {_HEALTH_PATH} -- most likely a dashboard server "
-                         "left running from an older version of the code. Stop that "
-                         "process and restart Claude Desktop.")
-                    return
-            else:
+                    stale = _dashboard_version()
+                    if stale is not None and stale != _DASHBOARD_VERSION and _stop_stale_dashboard():
+                        # Our own older server: replaced, so the browser gets the
+                        # routes this code expects instead of a half-built UI.
+                        _log(f"dashboard server {stale} replaced by {_DASHBOARD_VERSION}")
+                        launch_new = True
+                    else:
+                        _log(f"Port {_DASHBOARD_PORT} is held by a process that never "
+                             f"served {_HEALTH_PATH} as a dashboard server of ours. Stop "
+                             "that process and restart Claude Desktop.")
+                        return
+            if launch_new:
                 try:
                     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
                     os.makedirs(os.path.dirname(_LAUNCH_LOG), exist_ok=True)

@@ -25,20 +25,42 @@ Structure, bottom up:
 
 Geometry is inserted only at level 0, by exact grid traversal (a segment marks
 the cells it crosses, not its bounding box). Everything above is aggregation.
+Linework (lines, arcs, polylines, circles, pipes, feature lines) contributes
+length and direction; point entities (blocks, texts, labels, structures,
+points, dimensions) contribute a count and sit in exactly one cell.
+
+  words     the vocabulary is layer_tags.json (see Vocabulary): layer suffix,
+            block name or entity type -> tag, glyph, xref merge list. Rules can
+            be added at runtime and saved; the version bumps so cached indexes
+            rebuild.
+  gate      conflicts(payloads): proposed geometry (draw_* payloads, sequences,
+            a handler report's "proposed" block) checked for crossings, for
+            landing inside a pad, and for proximity.
+  check     verify(after, payloads): what a write changed, in these words, and
+            whether any changed cell lies outside the area the write should
+            have touched.
+
+The index is cached per drawing by spatial_cache.py, keyed on the plugin's
+change counter and this vocabulary's version.
 
 Nothing here decides what an operation acts on. Queries return handles; the
 operations take handles.
 """
 
 import hashlib
+import json
 import math
+import os
+import re
 from collections import defaultdict, Counter
 from dataclasses import dataclass, field
 
 from driveways import (
+    PAD_LAYER_SUFFIXES,
     ROAD_LAYER,
     _add,
     _alignment_points,
+    _bulge_arc,
     _chords,
     _dot,
     _mid,
@@ -96,43 +118,255 @@ CORRIDOR_HALF_WIDTH = 40.0  # ft off an alignment that still counts as road
 
 # ── Tags ──────────────────────────────────────────────────────────────────────
 #
-# The vocabulary an agent sees. Layer names map to tags by the same suffix
-# habits the planners use, so "x-plat (ph1a)|c-lots-line" is a lot line here
-# exactly as it is there. First rule to match wins; pads are checked first
-# through is_pad_layer so the width variants are covered. Extend by adding a
-# row -- the renderer picks new tags up without change.
-TAG_RULES = (
-    ("curb",         "equals",   ROAD_LAYER),
-    ("lot_line",     "endswith", "c-lots-line"),
-    ("setback",      "endswith", "c-lots-stbk"),
-    ("centreline",   "endswith", "c-rway-center"),
-    ("right_of_way", "endswith", "c-rway-line"),
-    ("boundary",     "contains", "c-bndy"),
-    ("easement",     "contains", "c-esmt"),
-    ("driveway",     "contains", "drive"),
-    ("swale",        "contains", "swale"),
-)
+# The vocabulary an agent sees, read from layer_tags.json beside this file. A
+# layer name (or a block name, or an entity type) maps to a tag by the same
+# suffix habits the planners use, so "x-plat (ph1a)|c-lots-line" is a lot line
+# here exactly as it is there. First rule to match wins. Pads are also checked
+# through driveways.is_pad_layer so the planners and the index can never
+# disagree about what a pad is. Rules can be added at runtime (define_tag) and
+# saved back to the file; every change bumps the vocabulary version, which the
+# index cache keys on, so a renamed layer family shows on the next query.
 
-MAP_GLYPHS = (  # first matching rule paints the cell; order is priority
-    ("+", lambda c: c.length.get("curb", 0) > 0 and c.count("pad") > 0),
-    ("R", lambda c: c.length.get("curb", 0) > 0),
-    ("P", lambda c: c.count("pad") > 0),
-    ("L", lambda c: c.length.get("lot_line", 0) > 0),
-    ("d", lambda c: c.count("driveway") > 0 or c.count("swale") > 0),
-    ("o", lambda c: c.total_length() > 0),
-)
+TAGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layer_tags.json")
+
+_FALLBACK_RULES = [   # used only when layer_tags.json is missing or unreadable
+    {"tag": "curb",         "on": "layer", "match": "equals",   "needle": ROAD_LAYER,      "glyph": "R"},
+    {"tag": "lot_line",     "on": "layer", "match": "endswith", "needle": "c-lots-line",   "glyph": "L"},
+    {"tag": "setback",      "on": "layer", "match": "endswith", "needle": "c-lots-stbk"},
+    {"tag": "centreline",   "on": "layer", "match": "endswith", "needle": "c-rway-center"},
+    {"tag": "right_of_way", "on": "layer", "match": "endswith", "needle": "c-rway-line"},
+    {"tag": "boundary",     "on": "layer", "match": "contains", "needle": "c-bndy"},
+    {"tag": "easement",     "on": "layer", "match": "contains", "needle": "c-esmt"},
+    {"tag": "driveway",     "on": "layer", "match": "contains", "needle": "drive",         "glyph": "d"},
+    {"tag": "swale",        "on": "layer", "match": "contains", "needle": "swale",         "glyph": "d"},
+]
+
+_MATCHERS = {
+    "equals":     lambda value, needle: value == needle,
+    "endswith":   lambda value, needle: value.endswith(needle),
+    "startswith": lambda value, needle: value.startswith(needle),
+    "contains":   lambda value, needle: needle in value,
+    "regex":      lambda value, needle: re.search(needle, value) is not None,
+}
 
 
-def tag_for(layer) -> str:
-    lower = str(layer or "").lower()
-    if is_pad_layer(lower):
-        return "pad"
-    for tag, kind, needle in TAG_RULES:
-        if (kind == "equals" and lower == needle) or \
-           (kind == "endswith" and lower.endswith(needle)) or \
-           (kind == "contains" and needle in lower):
-            return tag
-    return "other"
+class Vocabulary:
+    """The tag rules, glyphs and merge list, with a version that changes on
+    every edit so cached indexes built with the old words are rebuilt."""
+
+    def __init__(self, path=TAGS_FILE):
+        self.path = path
+        self.version = 0
+        self.rules: list = []
+        self.combos: list = []
+        self.glyph_priority: list = []
+        self.merge: list = []
+        self.conflicts: dict = {}
+        self.load()
+
+    # -- loading / saving ---------------------------------------------------
+
+    def load(self):
+        raw = None
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            raw = None
+        if not isinstance(raw, dict):
+            raw = {"rules": list(_FALLBACK_RULES)}
+        self.rules = [self._normalise(r) for r in (raw.get("rules") or []) if isinstance(r, dict)]
+        self.rules = [r for r in self.rules if r]
+        self.combos = [c for c in (raw.get("combos") or []) if isinstance(c, dict) and c.get("glyph")]
+        self.glyph_priority = [str(t) for t in (raw.get("glyph_priority") or [])]
+        self.merge = [str(s).lower() for s in (raw.get("merge") or []) if str(s).strip()]
+        self.conflicts = raw.get("conflicts") if isinstance(raw.get("conflicts"), dict) else {}
+        self._sort()
+        self.version += 1
+
+    def save(self):
+        data = {
+            "rules": [dict(r) for r in self.rules],
+            "combos": self.combos,
+            "glyph_priority": self.glyph_priority,
+            "merge": self.merge,
+            "conflicts": self.conflicts,
+        }
+        try:                                    # keep the file's own notes
+            with open(self.path, "r", encoding="utf-8") as f:
+                about = json.load(f).get("_about")
+            if about:
+                data = {"_about": about, **data}
+        except (OSError, ValueError, AttributeError):
+            pass
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, self.path)
+
+    @staticmethod
+    def _normalise(rule: dict):
+        tag = str(rule.get("tag") or "").strip().lower().replace(" ", "_")
+        needle = str(rule.get("needle") or "").strip().lower()
+        match = str(rule.get("match") or "contains").strip().lower()
+        on = str(rule.get("on") or "layer").strip().lower()
+        if not tag or not needle or match not in _MATCHERS or on not in ("layer", "name", "type"):
+            return None
+        out = {"tag": tag, "on": on, "match": match, "needle": needle}
+        glyph = str(rule.get("glyph") or "").strip()
+        if glyph:
+            out["glyph"] = glyph[0]
+        try:
+            out["priority"] = int(rule.get("priority", 100))
+        except (TypeError, ValueError):
+            out["priority"] = 100
+        return out
+
+    def _sort(self):
+        self.rules.sort(key=lambda r: r.get("priority", 100))   # stable: file order within a priority
+
+    # -- the one question ---------------------------------------------------
+
+    def tag_for(self, layer=None, name=None, type=None) -> str:
+        """The tag for an entity. Layer wins when a layer rule matches; then a
+        block-name rule, then a type rule; then the type itself; then 'other'."""
+        layer_l = str(layer or "").lower()
+        name_l = str(name or "").lower()
+        type_l = str(type or "").lower()
+        if layer_l and is_pad_layer(layer_l):
+            return "pad"
+        for r in self.rules:
+            value = {"layer": layer_l, "name": name_l, "type": type_l}[r["on"]]
+            if not value:
+                continue
+            try:
+                if _MATCHERS[r["match"]](value, r["needle"]):
+                    return r["tag"]
+            except re.error:
+                continue
+        return type_l or "other"
+
+    # -- editing ------------------------------------------------------------
+
+    def define(self, tag, needle, match="contains", on="layer", glyph="", priority=None, persist=True):
+        rule = self._normalise({"tag": tag, "needle": needle, "match": match, "on": on,
+                                "glyph": glyph, "priority": 80 if priority is None else priority})
+        if rule is None:
+            raise ValueError(f"bad rule: tag={tag!r} needle={needle!r} match={match!r} on={on!r}; "
+                             f"match must be one of {sorted(_MATCHERS)} and on one of layer, name, type")
+        # Replace a rule with the same needle/on/match rather than shadowing it.
+        self.rules = [r for r in self.rules
+                      if not (r["on"] == rule["on"] and r["match"] == rule["match"] and r["needle"] == rule["needle"])]
+        self.rules.append(rule)
+        if rule["on"] == "layer" and rule["match"] in ("endswith", "equals") and rule["needle"] not in self.merge:
+            self.merge.append(rule["needle"])
+        self._sort()
+        self.version += 1
+        if persist:
+            self.save()
+        return rule
+
+    def forget(self, tag, persist=True) -> int:
+        before = len(self.rules)
+        self.rules = [r for r in self.rules if r["tag"] != tag]
+        self.version += 1
+        if persist:
+            self.save()
+        return before - len(self.rules)
+
+    # -- what the agent may ask ----------------------------------------------
+
+    def tags(self) -> list:
+        seen, out = set(), []
+        for r in self.rules:
+            if r["tag"] not in seen:
+                seen.add(r["tag"])
+                out.append(r["tag"])
+        if "pad" not in seen:
+            out.insert(0, "pad")
+        return out
+
+    def glyph_for(self, tag) -> str:
+        for r in self.rules:
+            if r["tag"] == tag and r.get("glyph"):
+                return r["glyph"]
+        return ""
+
+    def describe(self) -> dict:
+        return {
+            "version": self.version,
+            "file": self.path,
+            "tags": self.tags(),
+            "rules": [dict(r) for r in self.rules],
+            "combos": self.combos,
+            "glyph_priority": self.glyph_priority,
+            "merge_layers": list(self.merge),
+            "conflicts": dict(self.conflicts),
+            "fallback": "an entity no rule matches is tagged by its type (block, text, pipe ...) "
+                        "or 'other' for plain linework",
+        }
+
+
+TAGS = Vocabulary()
+
+
+def tag_for(layer=None, name=None, type=None) -> str:
+    return TAGS.tag_for(layer, name, type)
+
+
+def merge_layers() -> list:
+    """Layer suffixes to pull out of xrefs into a snapshot before indexing."""
+    return [*TAGS.merge, *[s for s in PAD_LAYER_SUFFIXES if s not in TAGS.merge]]
+
+
+def cell_glyph(cell) -> str:
+    """The site-map character for a cell: combos first, then tags in the
+    configured priority, then any tag with a glyph, then 'o' for linework."""
+    present = set(cell.tags())
+    for combo in TAGS.combos:
+        wanted = [str(t) for t in (combo.get("all") or [])]
+        if wanted and all(t in present for t in wanted):
+            return str(combo["glyph"])[0]
+    for tag in TAGS.glyph_priority:
+        if tag in present and TAGS.glyph_for(tag):
+            return TAGS.glyph_for(tag)
+    for tag in sorted(present):
+        g = TAGS.glyph_for(tag)
+        if g:
+            return g
+    return "o" if (cell.total_length() > 0 or cell.total_points() > 0) else "."
+
+
+def map_legend() -> str:
+    parts = []
+    for combo in TAGS.combos:
+        parts.append(f"{combo['glyph']} {'+'.join(combo.get('all') or [])}")
+    by_glyph, order = {}, []
+    for tag in [*TAGS.glyph_priority, *TAGS.tags()]:
+        g = TAGS.glyph_for(tag)
+        if not g:
+            continue
+        if g not in by_glyph:
+            by_glyph[g] = []
+            order.append(g)
+        if tag not in by_glyph[g]:
+            by_glyph[g].append(tag)
+    for g in order:
+        parts.append(f"{g} {'/'.join(t.replace('_', ' ') for t in by_glyph[g])}")
+    parts.append("o other linework")
+    parts.append(". empty")
+    return "legend: " + "  ".join(parts)
+
+
+# Intents that read the drawing without changing it. Posting one of these never
+# needs the gate and never invalidates a cached index.
+READ_ONLY_INTENTS = frozenset({
+    "get_drawing_settings", "list_styles", "list_layers", "list_block_definitions",
+    "get_properties", "select_entities", "entity_key_points", "closest_point_on",
+    "intersections", "tangent_points", "measure_entities", "angle_between",
+    "point_along", "bounding_box", "find_duplicates", "zoom_view",
+    "list_surface_label_styles", "export_block", "save_drawing",
+})
 
 
 # ── Grid maths ────────────────────────────────────────────────────────────────
@@ -252,20 +486,25 @@ def _point_in_polygon(p, verts) -> bool:
 
 # ── Pieces ────────────────────────────────────────────────────────────────────
 #
-# Everything is reduced to segments and true arcs, carrying tag and handle.
+# Everything is reduced to segments, true arcs and points, carrying tag and
+# handle. A point piece ("pt") is anything that sits at one place -- a block,
+# a text, a label anchor, a pipe structure -- and lands in exactly one cell.
 
 
 @dataclass(frozen=True)
 class Piece:
-    kind: str          # "seg" | "arc"
-    geom: tuple        # seg: (a, b)   arc: (centre, r, a0, a1)
+    kind: str          # "seg" | "arc" | "pt"
+    geom: tuple        # seg: (a, b)   arc: (centre, r, a0, a1)   pt: (x, y)
     tag: str
     handle: str
     layer: str
+    name: str = ""     # block name, label kind, text -- whatever names the thing
 
     def chords(self, per_arc=None):
         if self.kind == "seg":
             return [self.geom]
+        if self.kind == "pt":
+            return []
         c, r, a0, a1 = self.geom
         n = per_arc or max(8, int(math.ceil(r * (a1 - a0) / (BASE_SIZE / 2.0))))
         return _chords(c, r, a0, a1, n)
@@ -273,6 +512,8 @@ class Piece:
     def endpoints(self):
         if self.kind == "seg":
             return self.geom
+        if self.kind == "pt":
+            return (self.geom, self.geom)
         c, r, a0, a1 = self.geom
         return ((c[0] + r * math.cos(a0), c[1] + r * math.sin(a0)),
                 (c[0] + r * math.cos(a1), c[1] + r * math.sin(a1)))
@@ -280,6 +521,8 @@ class Piece:
     def length(self):
         if self.kind == "seg":
             return math.dist(*self.geom)
+        if self.kind == "pt":
+            return 0.0
         c, r, a0, a1 = self.geom
         return r * (a1 - a0)
 
@@ -288,11 +531,28 @@ class Piece:
         if self.kind == "seg":
             (ax, ay), (bx, by) = self.geom
             return f"{self.tag}|seg|{ax:.3f},{ay:.3f}|{bx:.3f},{by:.3f}"
+        if self.kind == "pt":
+            return f"{self.tag}|pt|{self.geom[0]:.3f},{self.geom[1]:.3f}"
         (cx, cy), r, a0, a1 = self.geom
         return f"{self.tag}|arc|{cx:.3f},{cy:.3f}|{r:.3f}|{a0:.5f}|{a1:.5f}"
 
 
+def _xy(raw):
+    """A point from any of the shapes the snapshot uses, or None."""
+    try:
+        if isinstance(raw, dict):
+            raw = raw.get("position") or raw.get("point")
+        return (float(raw[0]), float(raw[1]))
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+
+
 def _snapshot_pieces(data: dict):
+    """Every entity of the snapshot as pieces. Lines, arcs and polylines are the
+    linework; blocks, texts, points, dimensions, labels and pipe structures are
+    point pieces; circles are full arcs; pipes and feature lines are segment
+    chains. Tags come from the layer first, then the block name, then the
+    type, exactly as layer_tags.json says."""
     for ln in data.get("lines", []) or []:
         yield Piece("seg", (_pt(ln["start_point"]), _pt(ln["end_point"])),
                     tag_for(ln.get("layer")), str(ln.get("handle")), str(ln.get("layer")))
@@ -305,8 +565,74 @@ def _snapshot_pieces(data: dict):
     for pl in data.get("polylines", []) or []:
         tag, handle, layer = tag_for(pl.get("layer")), str(pl.get("handle")), str(pl.get("layer"))
         for kind, geom in _polyline_pieces(pl):
-            yield Piece("segment" if False else ("seg" if kind == "segment" else "arc"),
-                        geom, tag, handle, layer)
+            yield Piece("seg" if kind == "segment" else "arc", geom, tag, handle, layer)
+
+    for ci in data.get("circles", []) or []:
+        c, r = _xy(ci.get("center")), ci.get("radius")
+        if c is None or not r:
+            continue
+        yield Piece("arc", (c, float(r), 0.0, 2 * math.pi),
+                    tag_for(ci.get("layer"), type="circle"), str(ci.get("handle")), str(ci.get("layer")))
+
+    for br in data.get("blocks", []) or []:
+        p = _xy(br.get("position"))
+        if p is None:
+            continue
+        yield Piece("pt", p, tag_for(br.get("layer"), name=br.get("name"), type="block"),
+                    str(br.get("handle")), str(br.get("layer")), str(br.get("name") or ""))
+
+    for tx in data.get("texts", []) or []:
+        p = _xy(tx.get("position"))
+        if p is None:
+            continue
+        yield Piece("pt", p, tag_for(tx.get("layer"), type="text"),
+                    str(tx.get("handle")), str(tx.get("layer")), str(tx.get("text") or "")[:40])
+
+    for pt in data.get("points", []) or []:
+        p = _xy(pt.get("position"))
+        if p is None:
+            continue
+        yield Piece("pt", p, tag_for(pt.get("layer"), type="point"),
+                    str(pt.get("handle")), str(pt.get("layer")))
+
+    for dim in data.get("dimensions", []) or []:
+        p = _xy(dim.get("text_position"))
+        if p is None:
+            continue
+        yield Piece("pt", p, tag_for(dim.get("layer"), type="dimension"),
+                    str(dim.get("handle")), str(dim.get("layer")))
+
+    for lbl in data.get("labels", []) or []:
+        p = _xy(lbl.get("anchor"))
+        if p is None:
+            continue
+        yield Piece("pt", p, tag_for(lbl.get("layer"), name=lbl.get("kind"), type="label"),
+                    str(lbl.get("handle")), str(lbl.get("layer")),
+                    str(lbl.get("kind") or lbl.get("type") or ""))
+
+    for net in data.get("pipe_networks", []) or []:
+        net_name = str(net.get("name") or "")
+        for pipe in net.get("pipes", []) or []:
+            a, b = _xy(pipe.get("start_point")), _xy(pipe.get("end_point"))
+            if a is None or b is None:
+                continue
+            yield Piece("seg", (a, b), tag_for(pipe.get("layer"), name=net_name, type="pipe"),
+                        str(pipe.get("handle")), str(pipe.get("layer") or net_name),
+                        str(pipe.get("name") or ""))
+        for s in net.get("structures", []) or []:
+            p = _xy(s.get("insertion_point"))
+            if p is None:
+                continue
+            yield Piece("pt", p, tag_for(s.get("layer"), name=net_name, type="structure"),
+                        str(s.get("handle")), str(s.get("layer") or net_name),
+                        str(s.get("name") or ""))
+
+    for fl in data.get("feature_lines", []) or []:
+        pts = [q for q in (_xy(p) for p in fl.get("points") or []) if q is not None]
+        tag = tag_for(fl.get("layer"), name=fl.get("name"), type="feature_line")
+        for i in range(len(pts) - 1):
+            yield Piece("seg", (pts[i], pts[i + 1]), tag, str(fl.get("handle")),
+                        str(fl.get("layer") or ""), str(fl.get("name") or ""))
 
 
 def _snapshot_polygons(data: dict):
@@ -325,24 +651,163 @@ def _snapshot_polygons(data: dict):
             yield ring, tag_for(pl.get("layer")), str(pl.get("handle"))
 
 
+def _ring_pieces(verts, closed, tag, handle, layer, bulges=None):
+    n = len(verts)
+    if n < 2:
+        return
+    count = n if (closed and n > 2) else n - 1
+    for i in range(count):
+        a, b = verts[i], verts[(i + 1) % n]
+        bulge = float(bulges[i]) if bulges and i < len(bulges) else 0.0
+        if abs(bulge) < 1e-9 or math.dist(a, b) < 1e-9:
+            yield Piece("seg", (a, b), tag, handle, layer)
+        else:
+            yield Piece("arc", _bulge_arc(a, b, bulge), tag, handle, layer)
+
+
+def _rect_verts(p):
+    c1 = _xy(p.get("corner1"))
+    if c1 is None:
+        return []
+    c2 = _xy(p.get("corner2"))
+    if c2 is None:
+        w, h = p.get("width"), p.get("height")
+        if w is None or h is None:
+            return []
+        c2 = (c1[0] + float(w), c1[1] + float(h))
+    x0, y0, x1, y1 = min(c1[0], c2[0]), min(c1[1], c2[1]), max(c1[0], c2[0]), max(c1[1], c2[1])
+    verts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    rot = math.radians(float(p.get("rotation_deg") or 0.0))
+    if abs(rot) > 1e-12:
+        cs, sn = math.cos(rot), math.sin(rot)
+        verts = [(c1[0] + (x - c1[0]) * cs - (y - c1[1]) * sn,
+                  c1[1] + (x - c1[0]) * sn + (y - c1[1]) * cs) for x, y in verts]
+    return verts
+
+
 def _payload_pieces(payloads: list):
-    """Proposed draw_* payloads reduced to pieces, for the dry-run gate."""
+    """Proposed payloads reduced to pieces, for the dry-run gate and the
+    post-write check. Covers the drawing intents whose geometry is fully given
+    in the payload; a sequence yields its steps under the sequence's index, and
+    a handler report's "proposed" block (points / segments / boxes) is read the
+    same way. Anything else -- an offset, a trim, a move by handle -- carries
+    no geometry of its own and yields nothing."""
     for index, p in enumerate(payloads):
-        intent = p.get("intent")
-        tag = tag_for(p.get("layer", ""))
-        handle = f"payload:{index}"
-        if intent == "draw_line":
-            yield index, Piece("seg", (_pt(p["start_point"]), _pt(p["end_point"])), tag, handle, str(p.get("layer")))
-        elif intent == "draw_arc":
-            a0, a1 = float(p["start_angle"]), float(p["end_angle"])
+        if not isinstance(p, dict):
+            continue
+        yield from ((index, piece) for piece in _one_payload_pieces(p, f"payload:{index}"))
+
+
+def _one_payload_pieces(p: dict, handle: str):
+    intent = str(p.get("intent") or "")
+    layer = str(p.get("layer") or "")
+    tag = tag_for(layer) if layer else "other"
+
+    if intent == "sequence":
+        for i, step in enumerate(p.get("steps") or []):
+            if isinstance(step, dict):
+                yield from _one_payload_pieces(step, f"{handle}/{i}")
+        return
+    if "proposed" in p and isinstance(p["proposed"], dict):
+        yield from proposed_pieces(p["proposed"], handle, layer)
+        return
+
+    if intent == "draw_line":
+        a, b = _xy(p.get("start_point") or p.get("start")), _xy(p.get("end_point") or p.get("end"))
+        if a and b:
+            yield Piece("seg", (a, b), tag, handle, layer)
+    elif intent == "draw_arc":
+        c = _xy(p.get("center"))
+        if c and p.get("radius"):
+            a0, a1 = float(p.get("start_angle") or 0.0), float(p.get("end_angle") or 0.0)
             if a1 < a0:
                 a1 += 2 * math.pi
-            yield index, Piece("arc", (_pt(p["center"]), float(p["radius"]), a0, a1), tag, handle, str(p.get("layer")))
-        elif intent == "draw_shape":
-            verts = [_pt(v) for v in p.get("vertices", [])]
-            count = len(verts) if p.get("closed") and len(verts) > 2 else len(verts) - 1
-            for i in range(max(0, count)):
-                yield index, Piece("seg", (verts[i], verts[(i + 1) % len(verts)]), tag, handle, str(p.get("layer")))
+            yield Piece("arc", (c, float(p["radius"]), a0, a1), tag, handle, layer)
+    elif intent == "draw_arc_by":
+        c, r = _xy(p.get("center")), p.get("radius")
+        a, b = _xy(p.get("start")), _xy(p.get("end"))
+        if c and a and b:
+            r = r or math.dist(c, a)
+            a0 = math.atan2(a[1] - c[1], a[0] - c[0])
+            a1 = math.atan2(b[1] - c[1], b[0] - c[0])
+            if a1 < a0:
+                a1 += 2 * math.pi
+            yield Piece("arc", (c, float(r), a0, a1), tag, handle, layer)
+        elif a and b:                              # chord at least
+            yield Piece("seg", (a, b), tag, handle, layer)
+    elif intent in ("draw_shape", "draw_polyline", "draw_revision_cloud", "draw_wipeout"):
+        verts = [q for q in (_xy(v) for v in p.get("vertices") or []) if q is not None]
+        closed = bool(p.get("closed")) or intent in ("draw_revision_cloud", "draw_wipeout")
+        yield from _ring_pieces(verts, closed, tag, handle, layer, p.get("bulges"))
+    elif intent == "draw_rectangle":
+        yield from _ring_pieces(_rect_verts(p), True, tag, handle, layer)
+    elif intent == "draw_polygon":
+        c, r, sides = _xy(p.get("center")), p.get("radius"), p.get("sides")
+        if c and r and sides:
+            rot = math.radians(float(p.get("rotation_deg") or 0.0))
+            n = max(3, int(sides))
+            verts = [(c[0] + float(r) * math.cos(rot + 2 * math.pi * i / n),
+                      c[1] + float(r) * math.sin(rot + 2 * math.pi * i / n)) for i in range(n)]
+            yield from _ring_pieces(verts, True, tag, handle, layer)
+    elif intent in ("draw_circle", "draw_donut"):
+        c = _xy(p.get("center"))
+        r = p.get("radius") or (float(p["diameter"]) / 2 if p.get("diameter") else None)
+        if intent == "draw_donut" and p.get("outer_diameter"):
+            r = float(p["outer_diameter"]) / 2
+        if c and r:
+            yield Piece("arc", (c, float(r), 0.0, 2 * math.pi), tag, handle, layer)
+    elif intent == "draw_ellipse":
+        c = _xy(p.get("center"))
+        r = p.get("major_radius")
+        end = _xy(p.get("major_axis_end"))
+        if c and (r or end):
+            r = float(r) if r else math.dist(c, end)
+            yield Piece("arc", (c, r, 0.0, 2 * math.pi), tag, handle, layer)   # generous: the bounding circle
+    elif intent == "draw_spline":
+        pts = [q for q in (_xy(v) for v in p.get("points") or []) if q is not None]
+        yield from _ring_pieces(pts, bool(p.get("closed")), tag, handle, layer)
+    elif intent == "draw_point":
+        for q in (_xy(v) for v in p.get("points") or []):
+            if q is not None:
+                yield Piece("pt", q, tag_for(layer, type="point"), handle, layer)
+    elif intent in ("draw_text", "draw_mtext"):
+        q = _xy(p.get("position") or p.get("insertion_point") or p.get("point"))
+        if q is not None:
+            yield Piece("pt", q, tag_for(layer, type="text"), handle, layer, str(p.get("text") or "")[:40])
+    elif intent == "insert_block":
+        q = _xy(p.get("position") or p.get("insertion_point") or p.get("point"))
+        if q is not None:
+            yield Piece("pt", q, tag_for(layer, name=p.get("name"), type="block"), handle, layer,
+                        str(p.get("name") or ""))
+    elif intent == "draw_leader":
+        pts = [q for q in (_xy(v) for v in p.get("points") or p.get("vertices") or []) if q is not None]
+        yield from _ring_pieces(pts, False, tag_for(layer, type="text"), handle, layer)
+
+
+def proposed_pieces(proposed: dict, handle: str = "proposed", layer: str = ""):
+    """A handler report's "proposed" block -- points, segments and boxes -- as
+    pieces, so a compute-stage report is checked exactly like a draw payload."""
+    tag = tag_for(layer) if layer else "label"
+    for i, q in enumerate(proposed.get("points") or []):
+        xy = _xy(q)
+        if xy is not None:
+            yield Piece("pt", xy, tag, f"{handle}/p{i}", layer)
+    for i, seg in enumerate(proposed.get("segments") or []):
+        try:
+            a, b = _xy(seg[0]), _xy(seg[1])
+        except (TypeError, IndexError):
+            continue
+        if a and b:
+            yield Piece("seg", (a, b), tag, f"{handle}/s{i}", layer)
+    for i, box in enumerate(proposed.get("boxes") or []):
+        try:
+            lo, hi = _xy(box["min"]), _xy(box["max"])
+        except (TypeError, KeyError):
+            continue
+        if lo and hi:
+            verts = [(lo[0], lo[1]), (hi[0], lo[1]), (hi[0], hi[1]), (lo[0], hi[1])]
+            for piece in _ring_pieces(verts, True, tag, f"{handle}/b{i}", layer):
+                yield piece
 
 
 # ── Cells ─────────────────────────────────────────────────────────────────────
@@ -354,10 +819,12 @@ class Cell:
     handles: dict = field(default_factory=lambda: defaultdict(set))   # tag -> {handle}
     length: dict = field(default_factory=lambda: defaultdict(float))  # tag -> clipped ft
     covered: dict = field(default_factory=lambda: defaultdict(float)) # tag -> area fraction
+    points: dict = field(default_factory=lambda: defaultdict(int))    # tag -> point pieces inside
     tensor: list = field(default_factory=lambda: [0.0, 0.0, 0.0])     # sxx, sxy, syy
     vertices: set = field(default_factory=set)                        # rounded endpoints inside
     pieces: list = field(default_factory=list)                        # level 0 only
     clipped: list = field(default_factory=list)                       # level 0: (tag, a, b) inside the cell
+    marks: list = field(default_factory=list)                         # level 0: (tag, p) point pieces inside
     frame: dict = None
     children: list = field(default_factory=list)
     hash: str = ""
@@ -368,11 +835,15 @@ class Cell:
         return len(self.handles.get(tag, ()))
 
     def tags(self) -> list:
-        return sorted(t for t in set(self.handles) | set(self.length) | set(self.covered)
-                      if self.count(t) or self.length.get(t, 0) > 0 or self.covered.get(t, 0) > 0)
+        return sorted(t for t in set(self.handles) | set(self.length) | set(self.covered) | set(self.points)
+                      if self.count(t) or self.length.get(t, 0) > 0 or self.covered.get(t, 0) > 0
+                      or self.points.get(t, 0) > 0)
 
     def total_length(self) -> float:
         return sum(self.length.values())
+
+    def total_points(self) -> int:
+        return sum(self.points.values())
 
     def orientation(self):
         """(bearing degrees 0-180, anisotropy 0-1) from the structure tensor."""
@@ -399,6 +870,11 @@ class SpatialIndex:
     def __init__(self, data: dict):
         self.cells: dict = {}
         self.entity_cells: dict = defaultdict(set)     # handle -> {level-0 key}
+        self.entity_tag: dict = {}                     # handle -> tag
+        self.rings: dict = {}                          # handle -> (ring, tag) of closed shapes
+        self.unmatched: Counter = Counter()            # layer -> ft of linework tagged "other"
+        self.unmatched_points: Counter = Counter()     # layer -> point pieces tagged by type only
+        self.tags_version = TAGS.version
         self.alignments = self._prepare_alignments(data)
         self._insert(data)
         self._frames()
@@ -427,6 +903,20 @@ class SpatialIndex:
 
     def _insert(self, data):
         for piece in _snapshot_pieces(data):
+            self.entity_tag[piece.handle] = piece.tag
+            if piece.kind == "pt":
+                key = key_at(*piece.geom)
+                c = self._cell(key)
+                c.handles[piece.tag].add(piece.handle)
+                c.points[piece.tag] += 1
+                c.pieces.append(piece)
+                c.marks.append((piece.tag, piece.geom))
+                self.entity_cells[piece.handle].add(key)
+                if piece.tag == "other" or (piece.layer and piece.tag in ("block", "text", "point", "dimension")):
+                    self.unmatched_points[piece.layer] += 1
+                continue
+            if piece.tag == "other":
+                self.unmatched[piece.layer] += piece.length()
             for a, b in piece.chords():
                 seg = _v(a, b)
                 length = math.hypot(seg[0], seg[1])
@@ -452,6 +942,7 @@ class SpatialIndex:
                 self._cell(key_at(*p)).vertices.add((round(p[0], 3), round(p[1], 3)))
 
         for ring, tag, handle in _snapshot_polygons(data):
+            self.rings[handle] = (ring, tag)
             xs, ys = [p[0] for p in ring], [p[1] for p in ring]
             _, cx0, cy0 = key_at(min(xs), min(ys))
             _, cx1, cy1 = key_at(max(xs), max(ys))
@@ -512,6 +1003,8 @@ class SpatialIndex:
                         parent.handles[tag] |= hs
                     for tag, ln in k.length.items():
                         parent.length[tag] += ln
+                    for tag, n in k.points.items():
+                        parent.points[tag] += n
                     for tag, cov in k.covered.items():
                         parent.covered[tag] += cov * child_area / parent_area
                     for i in range(3):
@@ -557,6 +1050,7 @@ class SpatialIndex:
                     text = "\n".join(sorted(
                         f"{t}|{a[0]:.3f},{a[1]:.3f}|{b[0]:.3f},{b[1]:.3f}"
                         for t, a, b in cell.clipped))
+                    text += "\n" + "\n".join(sorted(f"{t}|pt|{p[0]:.3f},{p[1]:.3f}" for t, p in cell.marks))
                     text += "\n" + "\n".join(f"{t}:{v:.3f}" for t, v in sorted(cell.covered.items()))
                 else:
                     text = "\n".join(sorted(self.cells[k].hash for k in cell.children))
@@ -730,6 +1224,15 @@ class SpatialIndex:
             for piece in cell.pieces:
                 if tag and piece.tag != tag:
                     continue
+                if piece.kind == "pt":
+                    px, py = piece.geom
+                    if radius is not None:
+                        if math.dist(point, piece.geom) > radius:
+                            continue
+                    elif not (box[0] <= px <= box[2] and box[1] <= py <= box[3]):
+                        continue
+                    out.add(piece.handle)
+                    continue
                 chords = piece.chords()
                 if radius is not None:
                     if min(_point_seg_distance(point, a, b)[0] for a, b in chords) > radius:
@@ -760,7 +1263,7 @@ class SpatialIndex:
                 if not cell:
                     continue
                 for piece in cell.pieces:
-                    if piece.tag != tag:
+                    if piece.tag != tag or piece.kind == "pt":
                         continue
                     if piece.kind == "seg":
                         hit = _ray_segments(point, d, [piece.geom])
@@ -786,6 +1289,11 @@ class SpatialIndex:
                         continue
                     for piece in cell.pieces:
                         if piece.tag != tag:
+                            continue
+                        if piece.kind == "pt":
+                            dist = math.dist(point, piece.geom)
+                            if best is None or dist < best[2]:
+                                best = (piece.handle, piece.geom, dist)
                             continue
                         for a, b in piece.chords():
                             dist, foot = _point_seg_distance(point, a, b)
@@ -813,7 +1321,7 @@ class SpatialIndex:
                 if not cell:
                     continue
                 for piece in cell.pieces:
-                    if tag and piece.tag != tag:
+                    if (tag and piece.tag != tag) or piece.kind == "pt":
                         continue
                     if piece.kind == "seg":
                         hit = _ray_segments(a, d, [piece.geom])
@@ -849,6 +1357,141 @@ class SpatialIndex:
                                     "crosses": handle, "tag": tag,
                                     "at": [round(p[0], 3), round(p[1], 3)]})
         return out
+
+    # -- the gate ---------------------------------------------------------------
+
+    def planned_cells(self, payloads: list, handles=None) -> set:
+        """Level-0 cells a set of payloads is expected to change: every cell the
+        proposed geometry passes through, every cell the named handles occupy,
+        and their immediate neighbours."""
+        keys = set()
+        for _, piece in _payload_pieces(payloads):
+            if piece.kind == "pt":
+                keys.add(key_at(*piece.geom))
+                continue
+            for a, b in piece.chords():
+                for key, _ in _traverse(a, b):
+                    keys.add(key)
+        for h in handles or ():
+            keys |= self.entity_cells.get(str(h), set())
+        out = set(keys)
+        for k in keys:
+            out.update(self._neighbours(k))
+        return out
+
+    def inside(self, point, tags=None):
+        """Closed shapes of `tags` (default: the vocabulary's 'inside' conflict
+        tags) that contain the point: [(handle, tag)]."""
+        tags = set(tags if tags is not None else (TAGS.conflicts.get("inside") or ["pad"]))
+        cell = self.cells.get(key_at(*point))
+        if cell is None:
+            return []
+        out = []
+        for tag in tags:
+            for h in cell.handles.get(tag, ()):
+                ring = self.rings.get(h)
+                if ring and _point_in_polygon(point, ring[0]):
+                    out.append((h, tag))
+        return out
+
+    def conflicts(self, payloads: list, tags=None) -> list:
+        """The dry-run gate over a list of payloads (draw_* intents, sequences,
+        or {"proposed": ...} blocks from a handler report). Three kinds:
+          crossing   a proposed line passes through existing linework of `tags`
+                     (all tags when None); touching at an end is not a crossing;
+          inside     a proposed point, or the middle of a proposed line, lands
+                     inside a closed shape of an 'inside' tag (pads by default)
+                     -- unless what is being drawn is that tag itself;
+          proximity  a proposed point sits within the vocabulary's
+                     proximity_clearance of linework (off when 0).
+        Each conflict names the payload index, what it hits and where."""
+        out = []
+        clearance = float(TAGS.conflicts.get("proximity_clearance") or 0.0)
+        inside_tags = set(TAGS.conflicts.get("inside") or ["pad"])
+        seen = set()
+        for index, piece in _payload_pieces(payloads):
+            intent = payloads[index].get("intent") if isinstance(payloads[index], dict) else None
+            if piece.kind in ("seg", "arc"):
+                for t in (tags or [None]):
+                    for handle, tag, p in self._crossings_of(piece, t):
+                        if tags is not None and tag not in tags:
+                            continue
+                        sig = ("crossing", index, handle, round(p[0], 2), round(p[1], 2))
+                        if sig in seen:
+                            continue
+                        seen.add(sig)
+                        out.append({"kind": "crossing", "payload": index, "intent": intent,
+                                    "piece": piece.handle, "hits": handle, "tag": tag,
+                                    "at": [round(p[0], 3), round(p[1], 3)]})
+                probes = [_mid(ch) for ch in piece.chords()[:: max(1, len(piece.chords()) // 4)]]
+            else:
+                probes = [piece.geom]
+            if piece.tag in inside_tags:
+                continue
+            for q in probes:
+                for handle, tag in self.inside(q, inside_tags):
+                    sig = ("inside", index, handle)
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    out.append({"kind": "inside", "payload": index, "intent": intent,
+                                "piece": piece.handle, "hits": handle, "tag": tag,
+                                "at": [round(q[0], 3), round(q[1], 3)]})
+            if piece.kind == "pt" and clearance > 0:
+                for h in self.entities(bbox=None, point=piece.geom, radius=clearance):
+                    if h == piece.handle:
+                        continue
+                    tag = self.entity_tag.get(h, "other")
+                    if tags is not None and tag not in tags:
+                        continue
+                    sig = ("proximity", index, h)
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    out.append({"kind": "proximity", "payload": index, "intent": intent,
+                                "piece": piece.handle, "hits": h, "tag": tag,
+                                "at": [round(piece.geom[0], 3), round(piece.geom[1], 3)],
+                                "within": clearance})
+        return out
+
+    def verify(self, after: "SpatialIndex", payloads: list = None, handles=None, limit: int = 12) -> dict:
+        """What a write did, in the words it was planned in. Compares this
+        (pre-write) index with `after`: the cells that changed, described; the
+        handles that appeared and vanished; and any changed cell OUTSIDE the
+        cells the payloads were expected to touch -- a side effect nobody
+        planned. `ok` is False only when such a cell exists."""
+        d = self.diff(after)
+
+        def has_content(index, k):
+            c = index.cells.get(k)
+            return bool(c and (c.tags() or c.covered))
+
+        # A cell that only ever held a vertex (a line ending exactly on a cell
+        # boundary) is not a change anyone can see.
+        changed = sorted(k for k in set(d["added"]) | set(d["removed"]) | set(d["changed"])
+                         if has_content(self, k) or has_content(after, k))
+        expected = self.planned_cells(payloads or [], handles) if (payloads or handles) else None
+        unexpected = [k for k in changed if expected is not None and k not in expected]
+        before_h, after_h = set(self.entity_cells), set(after.entity_cells)
+        new = sorted(h for h in after_h - before_h if not h.startswith("payload:"))
+        gone = sorted(before_h - after_h)
+
+        def words(keys):
+            return [{"cell": list(k), "bounds": list(bounds(k)),
+                     "before": self.describe(k), "after": after.describe(k)} for k in keys[:limit]]
+
+        return {
+            "ok": not unexpected,
+            "verified": expected is not None,
+            "changed_cells": len(changed),
+            "changed": words(changed),
+            "unexpected": words(unexpected),
+            "new_handles": new[:200],
+            "removed_handles": gone[:200],
+            "note": (None if expected is not None else
+                     "no geometry or handles in the request to check the change against; "
+                     "changed cells are listed but not judged"),
+        }
 
     def diff(self, other: "SpatialIndex"):
         """Level-0 cells added, removed or changed, found coarse-to-fine so an
@@ -932,8 +1575,7 @@ class SpatialIndex:
             cov = cell.covered.get("pad", 0.0)
             parts.append(f"{pads} pad{'s' if pads != 1 else ''}" + (f" ({cov:.0%} covered)" if cov else ""))
         angle, aniso = cell.orientation()
-        for tag in ("curb", "lot_line", "centreline", "driveway", "swale", "setback",
-                    "easement", "boundary", "right_of_way", "other"):
+        for tag in self._tag_order(cell):
             ln = cell.length.get(tag, 0.0)
             if ln <= 0:
                 continue
@@ -946,6 +1588,13 @@ class SpatialIndex:
                 if edge:
                     words += f" {edge}"
             parts.append(words)
+        # Things that sit at a point: labels, blocks, structures, text ...
+        for tag in self._tag_order(cell):
+            n = cell.points.get(tag, 0)
+            if n <= 0:
+                continue
+            word = tag.replace("_", " ")
+            parts.append(f"{n} {word}{'s' if n != 1 and not word.endswith('s') else ''}")
         body = ", ".join(parts) if parts else "nothing drawn"
         orient = self._bearing_words(angle, aniso)
         cont = ""
@@ -955,7 +1604,20 @@ class SpatialIndex:
                     and self.cells[(0, key[1] + dx, key[2] + dy)].length.get("curb", 0) > 0]
             if dirs:
                 cont = f" Curb continues {' and '.join(dirs)}."
-        return f"{head} {body[0].upper() + body[1:]}; linework {orient}.{cont}"
+        tail = f"; linework {orient}." if angle is not None else "."
+        return f"{head} {body[0].upper() + body[1:]}{tail}{cont}"
+
+    @staticmethod
+    def _tag_order(cell) -> list:
+        """Tags in the vocabulary's order, pads first, 'other' last, so a
+        sentence reads the same way for every cell."""
+        known = [t for t in TAGS.tags() if t != "pad"]
+        present = [t for t in cell.tags() if t != "pad"]
+        ordered = [t for t in known if t in present]
+        ordered += sorted(t for t in present if t not in known and t != "other")
+        if "other" in present:
+            ordered.append("other")
+        return ordered
 
     def describe_region(self, rid) -> str:
         r = self.regions.get(rid)
@@ -969,40 +1631,140 @@ class SpatialIndex:
         return (f"{rid} ({r['kind']}): {len(r['cells'])} cells, {x1 - x0:.0f} x {y1 - y0:.0f} ft. "
                 f"{counts}. {lengths}.{touch}")
 
+    # The map is bounded: a drawing nearly always has something far from the
+    # site -- an xref inserted at the origin, a north arrow, a title block --
+    # and a grid spanning the gap is millions of cells. The map shows the
+    # main cluster of occupied cells and lists the rest as outliers.
+    MAP_MAX_COLS = 120
+    MAP_MAX_ROWS = 60
+    MAP_GAP = 8          # cells of empty space that still count as "the same site"
+
+    def _main_cluster(self, keys: list) -> tuple:
+        """(cluster keys, outlier keys): the cluster grown from the fullest
+        cell by repeatedly widening its bounding box by MAP_GAP cells and
+        taking every occupied cell that falls inside."""
+        if not keys:
+            return [], []
+        weight = {k: (self.cells[k].total_length() + 10 * self.cells[k].total_points()
+                      + 100 * sum(self.cells[k].covered.values())) for k in keys}
+        seed = max(keys, key=lambda k: weight[k])
+        inside = {seed}
+        x0 = x1 = seed[1]
+        y0 = y1 = seed[2]
+        while True:
+            gx0, gx1, gy0, gy1 = x0 - self.MAP_GAP, x1 + self.MAP_GAP, y0 - self.MAP_GAP, y1 + self.MAP_GAP
+            added = [k for k in keys if k not in inside and gx0 <= k[1] <= gx1 and gy0 <= k[2] <= gy1]
+            if not added:
+                break
+            inside.update(added)
+            x0, x1 = min(x0, min(k[1] for k in added)), max(x1, max(k[1] for k in added))
+            y0, y1 = min(y0, min(k[2] for k in added)), max(y1, max(k[2] for k in added))
+        outliers = [k for k in keys if k not in inside]
+        return sorted(inside), sorted(outliers)
+
+    def _outlier_words(self, keys: list, site_box: tuple, limit: int = 8) -> list:
+        """One line per far-away cell: what it holds and where, relative to the site."""
+        sx0, sy0, sx1, sy1 = site_box
+        out = []
+        for k in keys[:limit]:
+            cell = self.cells[k]
+            x0, y0, x1, y1 = bounds(k)
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            dx = sx0 - cx if cx < sx0 else (cx - sx1 if cx > sx1 else 0.0)
+            dy = sy0 - cy if cy < sy0 else (cy - sy1 if cy > sy1 else 0.0)
+            where = []
+            if dx > 0:
+                where.append(f"{dx:,.0f} ft {'west' if cx < sx0 else 'east'}")
+            if dy > 0:
+                where.append(f"{dy:,.0f} ft {'south' if cy < sy0 else 'north'}")
+            what = []
+            for tag in self._tag_order(cell) + (["pad"] if cell.count("pad") else []):
+                n = cell.count(tag)
+                names = sorted({p.name for p in self.cells.get(k, cell).pieces if p.tag == tag and p.name})[:2]
+                what.append(f"{n} {tag.replace('_', ' ')}" + (f" ({', '.join(names)})" if names else ""))
+            out.append(f"  {', '.join(what) or 'something'} at x={cx:,.0f}, y={cy:,.0f}"
+                       f" ({' and '.join(where) + ' of' if where else 'beside'} the site)")
+        if len(keys) > limit:
+            out.append(f"  and {len(keys) - limit} more far-away cell(s)")
+        return out
+
     def site_map(self, level=None) -> str:
-        """The coarse grid as characters, north up, with a legend."""
+        """The coarse grid as characters, north up, with a legend -- the main
+        cluster of the drawing, never wider than MAP_MAX_COLS x MAP_MAX_ROWS.
+        Occupied cells far from it are listed under the map, not drawn."""
         level = self.site["level"] if level is None else level
         keys = [k for k in self.cells if k[0] == level]
         if not keys:
             return "(empty)"
-        cxs, cys = [k[1] for k in keys], [k[2] for k in keys]
-        cx0, cx1, cy0, cy1 = min(cxs), max(cxs), min(cys), max(cys)
-        rows = []
+        cluster, outliers = self._main_cluster(keys)
+
+        # Too big even for the cluster: go coarser, and if the top level is
+        # still too wide, crop around the fullest cells and say so.
+        cropped = False
+        while True:
+            cxs, cys = [k[1] for k in cluster], [k[2] for k in cluster]
+            cx0, cx1, cy0, cy1 = min(cxs), max(cxs), min(cys), max(cys)
+            cols, rows = cx1 - cx0 + 1, cy1 - cy0 + 1
+            if cols <= self.MAP_MAX_COLS and rows <= self.MAP_MAX_ROWS:
+                break
+            if level + 1 < LEVELS:
+                level += 1
+                keys = [k for k in self.cells if k[0] == level]
+                cluster, outliers = self._main_cluster(keys)
+                continue
+            # crop: keep the MAP_MAX window holding the most occupied cells
+            mid_x = sorted(cxs)[len(cxs) // 2]
+            mid_y = sorted(cys)[len(cys) // 2]
+            cx0 = max(cx0, mid_x - self.MAP_MAX_COLS // 2)
+            cy0 = max(cy0, mid_y - self.MAP_MAX_ROWS // 2)
+            cx1, cy1 = cx0 + self.MAP_MAX_COLS - 1, cy0 + self.MAP_MAX_ROWS - 1
+            outliers = outliers + [k for k in cluster if not (cx0 <= k[1] <= cx1 and cy0 <= k[2] <= cy1)]
+            cluster = [k for k in cluster if cx0 <= k[1] <= cx1 and cy0 <= k[2] <= cy1]
+            cropped = True
+            break
+
+        lines = []
         for cy in range(cy1, cy0 - 1, -1):
             row = []
             for cx in range(cx0, cx1 + 1):
                 cell = self.cells.get((level, cx, cy))
-                glyph = "."
-                if cell:
-                    for g, test in MAP_GLYPHS:
-                        if test(cell):
-                            glyph = g
-                            break
-                row.append(glyph)
-            rows.append("".join(row))
+                row.append(cell_glyph(cell) if cell else ".")
+            lines.append("".join(row))
         s = cell_size(level)
-        legend = ("legend: R curb  P pads  + curb+pads  L lot lines  d driveways/swales  "
-                  "o other linework  . empty")
-        head = (f"{len(rows)} rows x {cx1 - cx0 + 1} cols of {s:.0f} ft cells, north up; "
-                f"column 0 is x={ORIGIN[0] + cx0 * s:.0f}, top row is y={ORIGIN[1] + cy1 * s:.0f}")
-        return "\n".join([head, legend, ""] + rows)
+        site_box = (ORIGIN[0] + cx0 * s, ORIGIN[1] + cy0 * s, ORIGIN[0] + (cx1 + 1) * s, ORIGIN[1] + (cy1 + 1) * s)
+        head = (f"{len(lines)} rows x {cx1 - cx0 + 1} cols of {s:.0f} ft cells, north up; "
+                f"column 0 is x={site_box[0]:,.0f}, top row is y={ORIGIN[1] + cy1 * s:,.0f}"
+                + ("; cropped to the densest part of the site" if cropped else ""))
+        tail = []
+        if outliers:
+            tail = ["", f"Not drawn, far from the site ({len(outliers)} cell(s)):"] + \
+                   self._outlier_words(outliers, site_box)
+        return "\n".join([head, map_legend(), ""] + lines + tail)
 
     def summary(self) -> str:
         lines = [f"{len([k for k in self.cells if k[0] == 0])} occupied cells at {BASE_SIZE:.0f} ft, "
                  f"{len(self.alignments)} alignments, {len(self.regions)} regions."]
         for rid in self.regions:
             lines.append("  " + self.describe_region(rid))
+        lines.extend(self.unmatched_words())
         return "\n".join(lines)
+
+    def unmatched_words(self, limit: int = 8) -> list:
+        """The busiest layers no rule names, so 'other' is a prompt to name
+        something (define_tag) rather than a place data disappears."""
+        out = []
+        top = self.unmatched.most_common(limit)
+        if top:
+            words = ", ".join(f"{layer or '(no layer)'} {ft:,.0f} ft" for layer, ft in top)
+            more = len(self.unmatched) - len(top)
+            out.append(f"Unnamed linework ('other'): {words}"
+                       + (f", and {more} more layer{'s' if more != 1 else ''}" if more > 0 else "")
+                       + ". Name a layer family with define_tag to see it on the map.")
+        top_p = self.unmatched_points.most_common(limit)
+        if top_p:
+            words = ", ".join(f"layer '{layer}' x{n}" for layer, n in top_p)
+            out.append(f"Point entities tagged by type only (block/text/point/dimension): {words}.")
+        return out
 
 
 def build(data: dict) -> SpatialIndex:

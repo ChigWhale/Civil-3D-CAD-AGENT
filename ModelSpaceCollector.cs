@@ -14,6 +14,7 @@ using MathNet.Numerics.Statistics;
 // Disambiguate types that exist in both AutoCAD and Civil3D namespaces
 using AcadDBObject = Autodesk.AutoCAD.DatabaseServices.DBObject;
 using AcadEntity   = Autodesk.AutoCAD.DatabaseServices.Entity;
+using CivilLabel   = Autodesk.Civil.DatabaseServices.Label;
 using System.Data.Common;
 using Autodesk.Civil;
 using System;
@@ -196,6 +197,11 @@ namespace CADAgent
                 var texts         = new List<AcadEntity>();
                 var dimensions    = new List<AcadEntity>();
                 var hatches       = new List<AcadEntity>();
+                // Civil 3D labels (surface spot elevations, slopes, pipe and structure
+                // labels ...): anchor, text extents and the kind tag label_grading writes,
+                // so the spatial index can put them in cells and space_labels' output can
+                // be checked against them.
+                var labels        = new List<CivilLabel>();
                 var standardEntities = new Dictionary<string, int>();
 
                 foreach (ObjectId objId in ms)
@@ -227,6 +233,7 @@ namespace CADAgent
                         if (entity is DBText || entity is MText || entity is MLeader) { texts.Add(entity); continue; }
                         if (entity is Dimension)         { dimensions.Add(entity); continue; }
                         if (entity is Hatch)             { hatches.Add(entity);    continue; }
+                        if (entity is CivilLabel lbl)    { labels.Add(lbl);        continue; }
 
                         string typeName = entity.GetType().Name;
                         standardEntities[typeName] =
@@ -422,6 +429,56 @@ namespace CADAgent
                     catch { }
                 }
                 root["blocks"] = blockArray;
+
+                // Civil 3D labels. "anchor" is the point on the labelled feature the label
+                // belongs to (LabelLocation), not where the text sits; "bounds" is the text
+                // box as drawn, dragged state included. "kind" / "pad" come from the tag
+                // label_grading writes and are absent on any other label.
+                var labelArray = new JArray();
+                foreach (var lbl in labels)
+                {
+                    try
+                    {
+                        JObject boundsJson = null;
+                        try
+                        {
+                            var ext = lbl.GeometricExtents;
+                            boundsJson = new JObject
+                            {
+                                ["min"] = new JArray(Math.Round(ext.MinPoint.X, 4), Math.Round(ext.MinPoint.Y, 4)),
+                                ["max"] = new JArray(Math.Round(ext.MaxPoint.X, 4), Math.Round(ext.MaxPoint.Y, 4)),
+                            };
+                        }
+                        catch { }
+
+                        double ax, ay;
+                        try { var loc = lbl.LabelLocation; ax = loc.X; ay = loc.Y; }
+                        catch
+                        {
+                            if (boundsJson == null) continue;
+                            ax = ((double)boundsJson["min"][0] + (double)boundsJson["max"][0]) / 2;
+                            ay = ((double)boundsJson["min"][1] + (double)boundsJson["max"][1]) / 2;
+                        }
+                        bool dragged = false;
+                        try { dragged = lbl.Dragged; } catch { }
+
+                        var (kind, pad) = GradingLabels.ReadTag(tr, lbl);
+                        var j = new JObject
+                        {
+                            ["handle"]  = lbl.Handle.ToString(),
+                            ["type"]    = lbl.GetType().Name.Replace("Label", ""),
+                            ["layer"]   = lbl.Layer,
+                            ["anchor"]  = new JArray(Math.Round(ax, 4), Math.Round(ay, 4)),
+                            ["dragged"] = dragged,
+                        };
+                        if (boundsJson != null) j["bounds"] = boundsJson;
+                        if (kind != null) j["kind"] = kind;
+                        if (pad != null) j["pad"] = pad;
+                        labelArray.Add(j);
+                    }
+                    catch { }
+                }
+                root["labels"] = labelArray;
 
                 // Circles, ellipses, splines, points, text, dimensions, hatches: compact summaries
                 // (handle, layer, key geometry) from the same code select_entities uses.
@@ -628,6 +685,9 @@ namespace CADAgent
                 ["type"]                = type,
                 ["reconstruction_note"] = "Use LandXML for full point data",
             };
+            // Data-shortcut references are surfaces too; say so, and whether they still resolve.
+            foreach (var p in GradingLabels.SurfaceJson(surface).Properties())
+                if (obj[p.Name] == null) obj[p.Name] = p.Value;
             try
             {
                 var ext = surface.GeometricExtents;

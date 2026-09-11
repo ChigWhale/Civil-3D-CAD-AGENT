@@ -30,6 +30,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import drafting_tools
 
+GRADING_LABEL_KINDS = ("pad_fp", "lot_row", "lot_setback", "swale_meet", "swale_high",
+                       "lot_corner", "curb_transition", "drive_curb", "drive_slope",
+                       "swale_slope")
+
 # -- Field coercion -----------------------------------------------------------
 
 _TRUE = {"true", "t", "yes", "y", "1", "on"}
@@ -421,6 +425,124 @@ BLOCK_SPECS = [
         ],
     },
 ]
+
+
+
+def _build_label_grading(v):
+    payload = {"intent": "label_grading"}
+    for key in ("apply", "surface", "layer", "fp_style", "elevation_style", "tc_style",
+                "slope_style", "marker_style", "existing_tolerance", "pad_reach",
+                "drive_curb_side"):
+        if key in v and not _blank(v[key]):
+            payload[key] = v[key]
+    if v.get("kinds"):
+        payload["kinds"] = v["kinds"]
+    return payload
+
+
+BLOCK_SPECS.append({
+    "type": "label_grading",
+    "label": "Grading Labels",
+    "group": "Generated",
+    "description": ("Surface elevation and slope labels on the FG surface: pad FP, "
+                    "lot corners, right-of-way and setback crossings, swale high "
+                    "points and meeting points, curb arc/straight transitions, "
+                    "driveway-at-curb, and driveway / swale slope labels. Reads pads, "
+                    "lot lines, curb, driveways and swales from model space and xrefs."),
+    "build": _build_label_grading,
+    "fields": [
+        {"name": "apply", "label": "Place labels", "type": "bool", "default": True,
+         "help": "Off = report what would be labelled without writing anything."},
+        {"name": "surface", "label": "Surface", "type": "text", "optional": True,
+         "help": "FG surface name. Blank = the one surface whose name contains 'FG'."},
+        {"name": "kinds", "label": "Label kinds", "type": "strings", "optional": True,
+         "help": "Comma separated subset of: " + ", ".join(GRADING_LABEL_KINDS) +
+                 ". Blank = all of them."},
+        {"name": "layer", "label": "Layer", "type": "text", "default": "0"},
+        {"name": "fp_style", "label": "FP style", "type": "text", "optional": True,
+         "help": "Spot elevation style for pad labels. Blank = the drawing's default "
+                 "surface spot elevation style. A name that does not exist falls back "
+                 "to the default with a warning."},
+        {"name": "elevation_style", "label": "Elevation style", "type": "text", "optional": True,
+         "help": "Spot elevation style for lot, swale and driveway labels. Blank = default."},
+        {"name": "tc_style", "label": "Top of curb style", "type": "text", "optional": True,
+         "help": "Spot elevation style for curb transitions. Blank = default."},
+        {"name": "slope_style", "label": "Slope style", "type": "text", "optional": True,
+         "help": "Slope label style for driveway and swale slopes. Blank = default."},
+        {"name": "marker_style", "label": "Marker style", "type": "text", "optional": True,
+         "help": "Blank = the drawing's default marker."},
+        {"name": "existing_tolerance", "label": "Skip existing within", "type": "number",
+         "default": 1.0,
+         "help": "Feet. A surface label of the same type this close to a target "
+                 "means it is already labelled."},
+        {"name": "pad_reach", "label": "Pad reach", "type": "number", "default": 60,
+         "help": "Feet. Swale and lot-corner linework further than this from every "
+                 "pad belongs to no lot and is ignored."},
+        {"name": "drive_curb_side", "label": "Driveway curb label side", "type": "choice",
+         "options": ["right", "left", "both"], "default": "right",
+         "help": "Which flare of the driveway gets the TC label where its arc lands on the "
+                 "back of curb, looking from the pad toward the road."},
+    ],
+})
+
+
+def _build_space_labels(v):
+    payload = {"intent": "space_labels"}
+    for key in ("apply", "layer", "types", "mode", "include_other", "curb_layer",
+                "include_dragged", "include_pinned", "clearance", "cell_size", "max_passes"):
+        if key in v and not _blank(v[key]):
+            payload[key] = v[key]
+    for key in ("obstacle_layers", "ignore_layers"):
+        if v.get(key):
+            payload[key] = v[key]
+    if v.get("leader_lengths"):
+        payload["leader_lengths"] = [float(x) for x in v["leader_lengths"]]
+    return payload
+
+
+BLOCK_SPECS.append({
+    "type": "space_labels",
+    "label": "Space Labels",
+    "group": "Generated",
+    "description": ("Finished-grade elevation labels are dragged clear of linework and "
+                    "each other (candidates in 8 directions scored on an occupancy grid of "
+                    "the drawing's linework, most crowded placed first, then repaired); "
+                    "top-of-curb labels are rotated to follow the back of curb instead. "
+                    "Pad and slope labels are left alone unless asked."),
+    "build": _build_space_labels,
+    "fields": [
+        {"name": "apply", "label": "Move labels", "type": "bool", "default": True,
+         "help": "Off = report where every label would go without writing anything."},
+        {"name": "layer", "label": "Label layer", "type": "text", "optional": True,
+         "help": "Only labels on a layer ending in this. Blank = any layer."},
+        {"name": "types", "label": "Label types", "type": "choice",
+         "options": ["surface", "elevation", "slope", "all"], "default": "surface"},
+        {"name": "mode", "label": "Treatment", "type": "choice",
+         "options": ["auto", "position", "align"], "default": "auto",
+         "help": "auto = by label kind (curb labels align, finished-grade labels position); "
+                 "position or align forces one treatment on every selected label."},
+        {"name": "include_other", "label": "Also position pad and slope labels", "type": "bool",
+         "default": False},
+        {"name": "curb_layer", "label": "Back of curb layer", "type": "text", "default": "c-road-back",
+         "help": "Suffix. Curb labels are rotated to this linework."},
+        {"name": "include_dragged", "label": "Move already-dragged labels", "type": "bool",
+         "default": False,
+         "help": "Off = labels somebody already dragged stay put and count as obstacles."},
+        {"name": "include_pinned", "label": "Move pinned labels", "type": "bool", "default": False},
+        {"name": "obstacle_layers", "label": "Obstacle layers", "type": "strings", "optional": True,
+         "help": "Layer suffixes that count as linework. Blank = every visible layer."},
+        {"name": "ignore_layers", "label": "Ignore layers", "type": "strings", "optional": True,
+         "help": "Layer suffixes that never count as obstacles."},
+        {"name": "clearance", "label": "Clearance", "type": "number", "default": 0.5,
+         "help": "Feet of padding kept around linework."},
+        {"name": "cell_size", "label": "Grid cell", "type": "number", "optional": True,
+         "help": "Feet. Blank = half the text height."},
+        {"name": "leader_lengths", "label": "Leader lengths", "type": "strings", "optional": True,
+         "help": "Feet, comma separated. Blank = 1, 2 and 3 text heights."},
+        {"name": "max_passes", "label": "Repair passes", "type": "int", "default": 10},
+    ],
+})
+
 
 # -- Generated blocks: one per general drafting tool ---------------------------
 #

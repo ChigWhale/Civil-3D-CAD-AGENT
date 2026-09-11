@@ -12,10 +12,14 @@ using AcadApp = Autodesk.AutoCAD.ApplicationServices.Application;
 namespace CADAgent
 {
     /// <summary>
-    /// Listens on http://localhost:5199/ and exposes two endpoints:
+    /// Listens on http://localhost:5199/ and exposes these endpoints:
     ///   GET  /modelspace  — collects the drawing and returns LastJson
+    ///   GET  /nested      — geometry inside xrefs / blocks on the given layer suffixes
+    ///   GET  /revision    — the drawing's change counter (see DrawingRevision)
     ///   POST /execute     — dispatches a single agent step to ModelSpaceBuilder / CadCommands
+    ///   POST /handler     — one stage of an ICadObjectHandler (context | compute | draw)
     ///   GET  /intents     — lists every intent CadCommands accepts
+    /// Every response that names a drawing carries its revision in X-Drawing-Revision.
     ///
     /// Requests are accepted asynchronously (BeginGetContext) and queued.
     /// They are processed during AutoCAD's Idle event, which fires on the
@@ -50,6 +54,7 @@ namespace CADAgent
                          (prefixes == null || prefixes.Length == 0) ? _defaultPrefixes : prefixes)
                     _listener.Prefixes.Add(prefix);
                 _listener.Start();
+                DrawingRevision.Wire();
                 AcadApp.Idle += OnIdle;
                 BeginAccept();
             }
@@ -125,12 +130,37 @@ namespace CADAgent
                 return;
             }
 
-            if (path == "/nested" && method == "GET")
+            // The drawing's change counter alone: cheap enough to ask before every query,
+            // so a client holding an index built from revision N can skip the download
+            // when the drawing still reports N.
+            if (path == "/revision" && method == "GET")
             {
-                string body; int status;
+                string body; int status; Document target = null;
                 try
                 {
-                    Document target = ResolveDocument(ctx.Request.QueryString["file"]);
+                    target = ResolveDocument(ctx.Request.QueryString["file"]);
+                    if (target == null) { body = Error("No active document"); status = 500; }
+                    else
+                    {
+                        body = new JObject
+                        {
+                            ["file"]     = target.Name,
+                            ["revision"] = DrawingRevision.Get(target),
+                        }.ToString();
+                        status = 200;
+                    }
+                }
+                catch (Exception ex) { body = Error(ex.Message); status = 500; }
+                Respond(ctx, body, status, target);
+                return;
+            }
+
+            if (path == "/nested" && method == "GET")
+            {
+                string body; int status; Document target = null;
+                try
+                {
+                    target = ResolveDocument(ctx.Request.QueryString["file"]);
                     if (target == null) { body = Error("No active document"); status = 500; }
                     else
                     {
@@ -141,16 +171,32 @@ namespace CADAgent
                     }
                 }
                 catch (Exception ex) { body = Error(ex.Message); status = 500; }
-                Respond(ctx, body, status);
+                Respond(ctx, body, status, target);
                 return;
             }
 
             if (path == "/modelspace" && method == "GET")
             {
-                string body; int status;
-                try   { body = HandleModelSpace(ctx.Request.QueryString["file"]); status = 200; }
+                string body; int status; Document target = null;
+                try
+                {
+                    target = ResolveDocument(ctx.Request.QueryString["file"]);
+                    if (target == null) { body = Error("No active document"); status = 500; }
+                    else
+                    {
+                        // The revision is read BEFORE collecting, so a client that pairs
+                        // this body with this header never records a newer revision
+                        // than the data it holds.
+                        using (target.LockDocument())
+                        {
+                            ModelSpaceCollector.Collect(target);
+                            body = ModelSpaceCollector.GetLastJson(target.Name);
+                        }
+                        status = 200;
+                    }
+                }
                 catch (Exception ex) { body = Error(ex.Message); status = 500; }
-                Respond(ctx, body, status);
+                Respond(ctx, body, status, target);
                 return;
             }
 
@@ -183,6 +229,8 @@ namespace CADAgent
                     return;
                 }
 
+                bool isWrite = !DrawingRevision.ReadOnlyIntents.Contains(intent);
+
                 // Intents that need Editor / LayoutManager / xref loading run right here on the
                 // application thread; the rest go to a worker holding the document lock.
                 if (ModelSpaceBuilder.RequiresAppThread(intent, requestBody))
@@ -197,7 +245,8 @@ namespace CADAgent
                         }
                     }
                     catch (Exception ex) { body = Error(ex.Message); status = 500; }
-                    Respond(ctx, body, status);
+                    if (isWrite) DrawingRevision.Bump(doc);
+                    Respond(ctx, body, status, doc);
                     return;
                 }
 
@@ -215,14 +264,29 @@ namespace CADAgent
                         }
                     }
                     catch (Exception ex) { body = Error(ex.Message); status = 500; }
-                    try { Respond(ctx, body, status); } catch { }
+                    if (isWrite) DrawingRevision.Bump(doc);
+                    try { Respond(ctx, body, status, doc); } catch { }
                 });
                 return;
             }
 
             if (path == "/intents" && method == "GET")
             {
-                Respond(ctx, new JObject { ["intents"] = new JArray(CadCommands.Intents) }.ToString(), 200);
+                // "built" is the loaded DLL's write time: the one way to tell whether Civil 3D is
+                // running the build you think it is (NETLOAD cannot replace an already loaded assembly).
+                string built = "", location = "";
+                try
+                {
+                    location = typeof(CadCommands).Assembly.Location;
+                    built = File.GetLastWriteTime(location).ToString("yyyy-MM-dd HH:mm:ss");
+                }
+                catch { }
+                Respond(ctx, new JObject
+                {
+                    ["intents"] = new JArray(CadCommands.Intents),
+                    ["built"] = built,
+                    ["dll"] = location,
+                }.ToString(), 200);
                 return;
             }
 
@@ -244,7 +308,7 @@ namespace CADAgent
                     return;
                 }
 
-                string body; int status;
+                string body; int status; Document doc = null;
                 try
                 {
                     string raw;
@@ -256,16 +320,18 @@ namespace CADAgent
                     string stage   = env["stage"]?.ToString() ?? "compute";
                     string request = env["request"]?.ToString(Newtonsoft.Json.Formatting.None) ?? "{}";
 
-                    Document doc = ResolveDocument(env["file"]?.ToString());
+                    doc = ResolveDocument(env["file"]?.ToString());
                     if (doc == null) { body = Error("No active document"); status = 500; }
                     else
                     {
                         body   = PipeInvertSetter.HandlerRegistry.Run(handler, stage, doc, request);
                         status = 200;
+                        string s = stage.ToLowerInvariant();
+                        if (s == "draw" || s == "apply") DrawingRevision.Bump(doc);
                     }
                 }
                 catch (Exception ex) { body = Error(ex.Message); status = 500; }
-                Respond(ctx, body, status);
+                Respond(ctx, body, status, doc);
                 return;
             }
 
@@ -295,17 +361,6 @@ namespace CADAgent
             }
 
             return new JObject { ["drawings"] = drawings }.ToString();
-        }
-
-        private static string HandleModelSpace(string filePath)
-        {
-            Document doc = ResolveDocument(filePath);
-            if (doc == null) return Error("No active document");
-            using (doc.LockDocument())
-            {
-                ModelSpaceCollector.Collect(doc);
-                return ModelSpaceCollector.GetLastJson(doc.Name);
-            }
         }
 
         /// <summary>Returns the "file" field from an /execute payload, or null if absent.</summary>
@@ -353,6 +408,19 @@ namespace CADAgent
 
         private static string Error(string msg) =>
             new JObject { ["error"] = msg }.ToString();
+
+        /// <summary>Answers with the drawing's current revision in the X-Drawing-Revision
+        /// header, so a client can pair what it just read (or just wrote) with the counter
+        /// value it should expect to see until the drawing changes again.</summary>
+        private static void Respond(HttpListenerContext ctx, string body, int status, Document doc)
+        {
+            if (doc != null)
+            {
+                try { ctx.Response.Headers["X-Drawing-Revision"] = DrawingRevision.Get(doc).ToString(); }
+                catch { }
+            }
+            Respond(ctx, body, status);
+        }
 
         private static void Respond(HttpListenerContext ctx, string body, int status)
         {

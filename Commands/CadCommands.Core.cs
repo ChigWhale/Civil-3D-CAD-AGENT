@@ -55,6 +55,8 @@ namespace CADAgent
             RegisterAnnotate();
             RegisterOrganize();
             RegisterQuery();
+            RegisterGrading();
+            RegisterSpacing();
         }
 
         private static void Add(string intent, Handler handler, bool appThread = false)

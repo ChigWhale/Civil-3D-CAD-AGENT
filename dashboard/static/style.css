@@ -406,7 +406,7 @@ main {
   margin-top: 7px;
 }
 
-.run-btn, .stop-btn, .clear-btn {
+.run-btn, .resume-btn, .stop-btn, .clear-btn {
   font-size: 11px;
   border: none;
   padding: 6px 14px;
@@ -414,9 +414,11 @@ main {
   cursor: pointer;
 }
 .run-btn { background: var(--ok); color: #0b1f16; font-weight: 600; }
+.resume-btn { background: var(--err); color: #fff; font-weight: 600; }
 .stop-btn, .clear-btn { background: none; border: 1px solid var(--border); color: var(--muted); }
-.run-btn:disabled, .stop-btn:disabled, .clear-btn:disabled { opacity: .4; cursor: default; }
+.run-btn:disabled, .resume-btn:disabled, .stop-btn:disabled, .clear-btn:disabled { opacity: .4; cursor: default; }
 .run-btn:not(:disabled):hover,
+.resume-btn:not(:disabled):hover,
 .stop-btn:not(:disabled):hover,
 .clear-btn:not(:disabled):hover { filter: brightness(1.15); }
 

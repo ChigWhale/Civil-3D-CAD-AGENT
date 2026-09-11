@@ -65,6 +65,7 @@ function createLane(board) {
     sequenceEl: el.querySelector(".sequence"),
     sequenceEmpty: el.querySelector(".sequence-empty"),
     runBtn: el.querySelector(".run-btn"),
+    resumeBtn: el.querySelector(".resume-btn"),
     stopBtn: el.querySelector(".stop-btn"),
     clearBtn: el.querySelector(".clear-btn"),
     runStatus: el.querySelector(".run-status"),
@@ -84,6 +85,7 @@ function createLane(board) {
   );
   el.querySelector(".delete-btn").addEventListener("click", () => deleteLane(lane));
   lane.runBtn.addEventListener("click", () => runSequence(lane));
+  lane.resumeBtn.addEventListener("click", () => resumeSequence(lane));
   lane.stopBtn.addEventListener("click", () => stopSequence(lane));
   lane.clearBtn.addEventListener("click", () => {
     lane.blocks = [];
@@ -608,6 +610,23 @@ async function stopSequence(lane) {
   await fetch(`/dashboards/${encodeURIComponent(lane.id)}/stop`, { method: "POST" });
 }
 
+/** A run paused on conflicts (policy "pause") waits for this, or for a resume
+ *  from the chat. The reason is recorded with the decision. */
+async function resumeSequence(lane) {
+  const reason = window.prompt("Resume the paused run? Say why (recorded with the decision):", "reviewed in the browser");
+  if (reason === null) return;
+  await fetch(`/dashboards/${encodeURIComponent(lane.id)}/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason, by: "browser" }),
+  });
+}
+
+function setPaused(lane, paused) {
+  lane.resumeBtn.hidden = !paused;
+  lane.resumeBtn.disabled = !paused;
+}
+
 /** Server-side validation errors are prefixed "block N (type): ..." — mark that
  *  card so the user doesn't have to count down the list. */
 function flagBlockFromError(lane, message) {
@@ -636,6 +655,7 @@ function setRunning(lane, running) {
   lane.stopBtn.disabled = !running;
   lane.runBtn.disabled = running || lane.blocks.length === 0;
   lane.clearBtn.disabled = running;
+  if (!running) setPaused(lane, false);
 }
 
 async function uploadAvatar(lane, file) {
@@ -737,9 +757,23 @@ function handleEvent(event) {
 
   if (event.type === "run_started") {
     setRunning(lane, true);
+    setPaused(lane, false);
     setRunStatus(lane, `running 0/${event.total}`, "");
     lane.runTotal = event.total;
     lane.runDone = 0;
+    return;
+  }
+  if (event.type === "run_paused") {
+    // The pre-run check found conflicts and the run's policy says wait. The
+    // Stop button already works; Resume lets it go ahead with a reason.
+    setRunning(lane, true);
+    setPaused(lane, true);
+    setRunStatus(lane, `paused — ${event.message}`, "err");
+    addLogEntry(lane, { tool: "gate", _ts: event._ts, warning: event.message }, "warning");
+    return;
+  }
+  if (event.type === "attention") {
+    addLogEntry(lane, { tool: event.kind, _ts: event._ts, warning: `needs a decision: ${event.message}` }, "warning");
     return;
   }
   if (event.type === "run_finished") {
@@ -762,6 +796,15 @@ function handleEvent(event) {
     // drawing before posting. A crossing is worth a look, not a refusal, so it
     // lands in the log and the run carries on.
     addLogEntry(lane, { tool: event.tool, _ts: event._ts, warning: event.message }, "warning");
+    return;
+  }
+  if (event.type === "run_verified") {
+    // The post-run check: the spatial index rebuilt and compared with the one
+    // from before the run. A change outside the planned area is worth a look.
+    const detail = (event.unexpected || []).slice(0, 3).map(u => u.after).join(" | ");
+    addLogEntry(lane, { tool: "verify", _ts: event._ts,
+                        warning: event.message + (detail ? ` — ${detail}` : "") },
+                event.ok ? "ok" : "warning");
     return;
   }
 
