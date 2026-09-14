@@ -1083,6 +1083,25 @@ namespace CADAgent
             return curves;
         }
 
+        /// <summary>World-space closed polylines on the pad layer suffixes, with the source entity's
+        /// handle (the one the CADAGENT_GRADING tag carries) and area centroid. Model space and
+        /// xrefs alike. The caller owns (and disposes) the polylines.</summary>
+        public static List<(Polyline poly, string handle, Point3d centroid)> CollectPads(Transaction tr, Database db, IEnumerable<string> padSuffixes)
+        {
+            const string never = "never";
+            var o = new Options
+            {
+                Pad = padSuffixes.Where(s => !string.IsNullOrWhiteSpace(s)).ToList(),
+                Curb = never, LotLine = never, Setback = never, Row = never, Centreline = never, Swale = never, Driveway = never,
+            };
+            if (o.Pad.Count == 0) return new List<(Polyline, string, Point3d)>();
+            var lw = CollectLinework(tr, db, o);
+            var pads = lw.Pads.Select(p => (p.Poly, p.Handle, p.Centroid)).ToList();
+            lw.Pads.Clear();            // ownership moves to the caller
+            lw.Dispose();
+            return pads;
+        }
+
         // ── Entry points ──────────────────────────────────────────────────────────
 
         /// <summary>Read-only: surfaces, label/marker styles and how much linework each layer contributes.</summary>

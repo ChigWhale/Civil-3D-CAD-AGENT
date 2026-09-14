@@ -53,8 +53,9 @@ import math
 import os
 import re
 from collections import defaultdict, Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
+import layer_words
 from driveways import (
     PAD_LAYER_SUFFIXES,
     ROAD_LAYER,
@@ -74,6 +75,25 @@ from driveways import (
     _v,
     is_pad_layer,
 )
+
+
+def point_at_station(pts, station: float):
+    """The point `station` ft along a flattened alignment, clamped to its ends."""
+    if not pts:
+        return None
+    if station <= 0:
+        return pts[0]
+    run = 0.0
+    for i in range(len(pts) - 1):
+        seg = math.dist(pts[i], pts[i + 1])
+        if seg <= 0:
+            continue
+        if run + seg >= station:
+            t = (station - run) / seg
+            return (pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t,
+                    pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t)
+        run += seg
+    return pts[-1]
 
 
 def _centreline_length(pts) -> float:
@@ -150,18 +170,46 @@ _MATCHERS = {
 }
 
 
-class Vocabulary:
-    """The tag rules, glyphs and merge list, with a version that changes on
-    every edit so cached indexes built with the old words are rebuilt."""
+@dataclass(frozen=True)
+class Classification:
+    """What the vocabulary says about one entity: its tag, the family the tag
+    belongs to (water_hydrant -> water), its state (proposed / existing / future
+    ...), where the answer came from and, for derived names, how sure it is."""
+    tag: str
+    family: str
+    state: str = "proposed"
+    source: str = "other"      # pad | rule | learned | derived | type | other
+    confidence: str = ""       # full | partial | none (derived only)
 
-    def __init__(self, path=TAGS_FILE):
+
+class Vocabulary:
+    """The tag rules, glyphs and merge list, plus the word dictionary and the
+    learned families, with a version that changes on every edit so cached
+    indexes built with the old words are rebuilt.
+
+    classify() precedence: pad layers -> hand rules on layer / block name ->
+    learned entries a person edited -> derivation from the layer's words ->
+    hand rules on entity type -> the type itself -> "other"."""
+
+    PRECEDENCE = ("pad -> layer/name rules -> learned (edited) -> derived from words "
+                  "-> type rules -> type -> other")
+
+    def __init__(self, path=TAGS_FILE, words_path=None, learned_path=None):
         self.path = path
         self.version = 0
         self.rules: list = []
+        self._layer_rules: list = []
+        self._type_rules: list = []
         self.combos: list = []
         self.glyph_priority: list = []
         self.merge: list = []
         self.conflicts: dict = {}
+        self._families: dict = {}
+        self._cache: dict = {}
+        self._known = None
+        self.words = layer_words.Words(words_path or layer_words.WORDS_FILE)
+        self.learned = layer_words.Learned(learned_path or layer_words.LEARNED_FILE)
+        self._mtimes: dict = {}
         self.load()
 
     # -- loading / saving ---------------------------------------------------
@@ -181,8 +229,47 @@ class Vocabulary:
         self.glyph_priority = [str(t) for t in (raw.get("glyph_priority") or [])]
         self.merge = [str(s).lower() for s in (raw.get("merge") or []) if str(s).strip()]
         self.conflicts = raw.get("conflicts") if isinstance(raw.get("conflicts"), dict) else {}
+        self._families = {}
+        for r in self.rules:
+            if r.get("family"):
+                self._families[r["tag"]] = r["family"]
+        for key, e in self.learned.entries.items():
+            if e.get("edited") and e.get("tag") and e.get("family"):
+                self._families[e["tag"]] = e["family"]
         self._sort()
+        self._remember_mtimes()
+        self._bump()
+
+    def _bump(self):
         self.version += 1
+        self._cache.clear()
+        self._known = None
+
+    def _remember_mtimes(self):
+        for p in (self.path, self.words.path):
+            try:
+                self._mtimes[p] = os.path.getmtime(p)
+            except OSError:
+                self._mtimes[p] = None
+
+    def refresh_if_changed(self) -> bool:
+        """Reloads when the rules or the dictionary changed on disk: the MCP
+        server and the dashboard server each hold a Vocabulary, and an edit
+        made through one must reach the other without a restart. The learned
+        file is not part of the check because this process may be writing it."""
+        changed = False
+        for p in (self.path, self.words.path):
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                m = None
+            if m != self._mtimes.get(p):
+                changed = True
+        if changed:
+            self.words.load()
+            self.learned.load()
+            self.load()
+        return changed
 
     def save(self):
         data = {
@@ -203,6 +290,7 @@ class Vocabulary:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, self.path)
+        self._remember_mtimes()
 
     @staticmethod
     def _normalise(rule: dict):
@@ -216,6 +304,9 @@ class Vocabulary:
         glyph = str(rule.get("glyph") or "").strip()
         if glyph:
             out["glyph"] = glyph[0]
+        family = str(rule.get("family") or "").strip().lower().replace(" ", "_")
+        if family:
+            out["family"] = family
         try:
             out["priority"] = int(rule.get("priority", 100))
         except (TypeError, ValueError):
@@ -224,33 +315,112 @@ class Vocabulary:
 
     def _sort(self):
         self.rules.sort(key=lambda r: r.get("priority", 100))   # stable: file order within a priority
+        self._layer_rules = [r for r in self.rules if r["on"] in ("layer", "name")]
+        self._type_rules = [r for r in self.rules if r["on"] == "type"]
 
     # -- the one question ---------------------------------------------------
 
-    def tag_for(self, layer=None, name=None, type=None) -> str:
-        """The tag for an entity. Layer wins when a layer rule matches; then a
-        block-name rule, then a type rule; then the type itself; then 'other'."""
+    def classify(self, layer=None, name=None, type=None, record=True) -> Classification:
         layer_l = str(layer or "").lower()
         name_l = str(name or "").lower()
         type_l = str(type or "").lower()
+        key = (layer_l, name_l, type_l)
+        hit = self._cache.get(key)
+        if hit is not None:
+            if record and hit.source == "derived":
+                self._note(layer_l)
+            return hit
+        c = self._classify(layer_l, name_l, type_l, record)
+        if len(self._cache) > 200_000:
+            self._cache.clear()
+        self._cache[key] = c
+        return c
+
+    def _note(self, layer_l: str):
+        d = self.words.derive(layer_l)
+        if d.derivable and d.family_key and self.learned.get(d.family_key) is None:
+            self.learned.note(d.family_key, d)
+
+    def _classify(self, layer_l, name_l, type_l, record) -> Classification:
+        d = self.words.derive(layer_l) if layer_l else None
+        state = d.state if d else "proposed"
         if layer_l and is_pad_layer(layer_l):
-            return "pad"
-        for r in self.rules:
-            value = {"layer": layer_l, "name": name_l, "type": type_l}[r["on"]]
+            return Classification("pad", "pad", state, "pad")
+        for r in self._layer_rules:
+            value = layer_l if r["on"] == "layer" else name_l
             if not value:
                 continue
             try:
                 if _MATCHERS[r["match"]](value, r["needle"]):
-                    return r["tag"]
+                    fam = r.get("family") or self._families.get(r["tag"], r["tag"])
+                    return Classification(r["tag"], fam, state, "rule")
             except re.error:
                 continue
-        return type_l or "other"
+        if d is not None:
+            learned = self.learned.get(d.family_key) if d.family_key else None
+            if learned and learned.get("edited"):
+                tag = learned.get("tag") or d.tag
+                fam = learned.get("family") or (d.family if d.derivable else tag)
+                st = learned.get("state") or state
+                if tag:
+                    self._families[tag] = fam
+                    return Classification(tag, fam, st, "learned", d.confidence)
+            if d.derivable:
+                self._families[d.tag] = d.family
+                if record:
+                    self._note(layer_l)
+                return Classification(d.tag, d.family, state, "derived", d.confidence)
+        for r in self._type_rules:
+            if type_l and _MATCHERS[r["match"]](type_l, r["needle"]):
+                fam = r.get("family") or self._families.get(r["tag"], r["tag"])
+                return Classification(r["tag"], fam, state, "type")
+        if type_l:
+            return Classification(type_l, type_l, state, "type")
+        return Classification("other", "other", state, "other")
+
+    def tag_for(self, layer=None, name=None, type=None) -> str:
+        return self.classify(layer, name, type).tag
+
+    def explain(self, layer) -> dict:
+        """The whole story for one layer name: classification, derivation, the
+        learned entry, and the hand rule that won (if one did)."""
+        c = self.classify(layer, record=False)
+        d = self.words.derive(layer)
+        rule = None
+        layer_l = str(layer or "").lower()
+        for r in self._layer_rules:
+            if r["on"] == "layer":
+                try:
+                    if _MATCHERS[r["match"]](layer_l, r["needle"]):
+                        rule = dict(r)
+                        break
+                except re.error:
+                    continue
+        return {"layer": layer, "classification": asdict(c), "derivation": d.as_dict(),
+                "learned": self.learned.get(d.family_key), "rule": rule,
+                "pad_shortcut": bool(layer_l and is_pad_layer(layer_l))}
+
+    # -- families --------------------------------------------------------------
+
+    def family_of(self, tag) -> str:
+        tag = str(tag or "").lower()
+        return self._families.get(tag, tag)
+
+    def matches(self, tag, words) -> bool:
+        """Whether a tag is named by any of `words`: itself or its family."""
+        tag = str(tag or "").lower()
+        wanted = {str(w).lower() for w in (words or ())}
+        return tag in wanted or self.family_of(tag) in wanted
+
+    def state_word(self, state) -> str:
+        return self.words.state_word(state)
 
     # -- editing ------------------------------------------------------------
 
-    def define(self, tag, needle, match="contains", on="layer", glyph="", priority=None, persist=True):
+    def define(self, tag, needle, match="contains", on="layer", glyph="", priority=None, persist=True, family=""):
         rule = self._normalise({"tag": tag, "needle": needle, "match": match, "on": on,
-                                "glyph": glyph, "priority": 80 if priority is None else priority})
+                                "glyph": glyph, "priority": 80 if priority is None else priority,
+                                "family": family})
         if rule is None:
             raise ValueError(f"bad rule: tag={tag!r} needle={needle!r} match={match!r} on={on!r}; "
                              f"match must be one of {sorted(_MATCHERS)} and on one of layer, name, type")
@@ -258,10 +428,12 @@ class Vocabulary:
         self.rules = [r for r in self.rules
                       if not (r["on"] == rule["on"] and r["match"] == rule["match"] and r["needle"] == rule["needle"])]
         self.rules.append(rule)
+        if rule.get("family"):
+            self._families[rule["tag"]] = rule["family"]
         if rule["on"] == "layer" and rule["match"] in ("endswith", "equals") and rule["needle"] not in self.merge:
             self.merge.append(rule["needle"])
         self._sort()
-        self.version += 1
+        self._bump()
         if persist:
             self.save()
         return rule
@@ -269,10 +441,27 @@ class Vocabulary:
     def forget(self, tag, persist=True) -> int:
         before = len(self.rules)
         self.rules = [r for r in self.rules if r["tag"] != tag]
-        self.version += 1
+        self._sort()
+        self._bump()
         if persist:
             self.save()
         return before - len(self.rules)
+
+    def rename_word(self, abbr, word, kind="major", tag_key="", glyph="") -> dict:
+        out = self.words.set_word(abbr, word, kind=kind, tag_key=tag_key, glyph=glyph)
+        self._remember_mtimes()
+        self._bump()
+        return out
+
+    def edit_learned(self, family_key, tag=None, family=None, state=None, note=None) -> dict:
+        entry = self.learned.edit(family_key, tag=tag, family=family, state=state, note=note)
+        if entry.get("tag") and entry.get("family"):
+            self._families[entry["tag"]] = entry["family"]
+        self._bump()
+        return entry
+
+    def flush_learned(self) -> int:
+        return self.learned.flush()
 
     # -- what the agent may ask ----------------------------------------------
 
@@ -286,23 +475,38 @@ class Vocabulary:
             out.insert(0, "pad")
         return out
 
+    def known_words(self) -> frozenset:
+        """Every word a check or query may name: hand tags, families, every
+        family_minor the dictionary can produce, learned tags, type tags."""
+        if self._known is None:
+            words = set(self.tags()) | set(self.words.all_tag_words()) | self.learned.tags()
+            words |= set(self._families.values())
+            words |= {"other", "block", "text", "label", "point", "dimension", "pad"}
+            self._known = frozenset(w for w in words if w)
+        return self._known
+
     def glyph_for(self, tag) -> str:
         for r in self.rules:
             if r["tag"] == tag and r.get("glyph"):
                 return r["glyph"]
-        return ""
+        return self.words.family_glyph(self.family_of(tag))
 
     def describe(self) -> dict:
         return {
             "version": self.version,
             "file": self.path,
+            "precedence": self.PRECEDENCE,
             "tags": self.tags(),
+            "families": sorted(set(self._families.values()) | set(self.words.families())),
             "rules": [dict(r) for r in self.rules],
             "combos": self.combos,
             "glyph_priority": self.glyph_priority,
             "merge_layers": list(self.merge),
             "conflicts": dict(self.conflicts),
-            "fallback": "an entity no rule matches is tagged by its type (block, text, pipe ...) "
+            "words": self.words.describe(),
+            "learned": self.learned.describe(),
+            "fallback": "a layer no rule names is read from its words (C-WATR-HYDR -> water_hydrant); "
+                        "an entity with no readable layer is tagged by its type (block, text, pipe ...) "
                         "or 'other' for plain linework",
         }
 
@@ -314,22 +518,28 @@ def tag_for(layer=None, name=None, type=None) -> str:
     return TAGS.tag_for(layer, name, type)
 
 
+def classify(layer=None, name=None, type=None, record=True) -> Classification:
+    return TAGS.classify(layer, name, type, record)
+
+
 def merge_layers() -> list:
     """Layer suffixes to pull out of xrefs into a snapshot before indexing."""
     return [*TAGS.merge, *[s for s in PAD_LAYER_SUFFIXES if s not in TAGS.merge]]
 
 
 def cell_glyph(cell) -> str:
-    """The site-map character for a cell: combos first, then tags in the
-    configured priority, then any tag with a glyph, then 'o' for linework."""
+    """The site-map character for a cell: combos first, then tags (or their
+    families) in the configured priority, then any tag with a glyph, then 'o'."""
     present = set(cell.tags())
+    families = {TAGS.family_of(t) for t in present}
     for combo in TAGS.combos:
         wanted = [str(t) for t in (combo.get("all") or [])]
-        if wanted and all(t in present for t in wanted):
+        if wanted and all(t in present or t in families for t in wanted):
             return str(combo["glyph"])[0]
-    for tag in TAGS.glyph_priority:
-        if tag in present and TAGS.glyph_for(tag):
-            return TAGS.glyph_for(tag)
+    for word in TAGS.glyph_priority:
+        for t in present:
+            if (t == word or TAGS.family_of(t) == word) and TAGS.glyph_for(t):
+                return TAGS.glyph_for(t)
     for tag in sorted(present):
         g = TAGS.glyph_for(tag)
         if g:
@@ -342,7 +552,9 @@ def map_legend() -> str:
     for combo in TAGS.combos:
         parts.append(f"{combo['glyph']} {'+'.join(combo.get('all') or [])}")
     by_glyph, order = {}, []
-    for tag in [*TAGS.glyph_priority, *TAGS.tags()]:
+    names = [*TAGS.glyph_priority, *TAGS.tags()]
+    names += [f for f in TAGS.words.families() if TAGS.words.family_glyph(f)]
+    for tag in names:
         g = TAGS.glyph_for(tag)
         if not g:
             continue
@@ -634,6 +846,136 @@ def _snapshot_pieces(data: dict):
             yield Piece("seg", (pts[i], pts[i + 1]), tag, str(fl.get("handle")),
                         str(fl.get("layer") or ""), str(fl.get("name") or ""))
 
+    # Alignments as linework in their own right (they already serve as the
+    # station/offset frames): every tangent and arc.
+    for al in data.get("alignments", []) or []:
+        tag = tag_for(al.get("layer"), name=al.get("name"), type="alignment")
+        handle, name = str(al.get("handle") or al.get("name")), str(al.get("name") or "")
+        for ent in al.get("entities") or []:
+            kind = ent.get("type")
+            if kind == "Tangent":
+                a, b = _xy(ent.get("start")), _xy(ent.get("end"))
+                if a and b:
+                    yield Piece("seg", (a, b), tag, handle, str(al.get("layer") or ""), name)
+            elif kind == "Arc":
+                c, r = _xy(ent.get("center")), ent.get("radius")
+                a, b = _xy(ent.get("start")), _xy(ent.get("end"))
+                if c and r and a and b:
+                    a0 = math.atan2(a[1] - c[1], a[0] - c[0])
+                    a1 = math.atan2(b[1] - c[1], b[0] - c[0])
+                    if ent.get("clockwise"):
+                        a0, a1 = a1, a0          # store counter-clockwise from the end
+                    while a1 < a0:
+                        a1 += 2 * math.pi
+                    yield Piece("arc", (c, float(r), a0, a1), tag, handle, str(al.get("layer") or ""), name)
+
+    # Pressure networks: pipes as segments, fittings and appurtenances as points.
+    for net in data.get("pressure_networks", []) or []:
+        net_name = str(net.get("name") or "")
+        for pipe in net.get("pipes", []) or []:
+            a, b = _xy(pipe.get("start_point")), _xy(pipe.get("end_point"))
+            if a is None or b is None:
+                continue
+            yield Piece("seg", (a, b), tag_for(pipe.get("layer"), name=net_name, type="pressure_pipe"),
+                        str(pipe.get("handle")), str(pipe.get("layer") or net_name),
+                        str(pipe.get("part_size") or pipe.get("name") or ""))
+        for kind_key, kind in (("fittings", "fitting"), ("appurtenances", "appurtenance")):
+            for part in net.get(kind_key, []) or []:
+                p = _xy(part.get("position"))
+                if p is None:
+                    continue
+                yield Piece("pt", p, tag_for(part.get("layer"), name=part.get("part_type") or part.get("name"), type=kind),
+                            str(part.get("handle")), str(part.get("layer") or net_name),
+                            str(part.get("part_type") or part.get("description") or part.get("name") or ""))
+
+    # Parcels: every loop segment, tagged by the parcel's layer or "parcel".
+    for pc in data.get("parcels", []) or []:
+        tag = tag_for(pc.get("layer"), name=pc.get("name"), type="parcel")
+        handle, layer, name = str(pc.get("handle")), str(pc.get("layer") or ""), str(pc.get("name") or "")
+        for loop in pc.get("loops") or []:
+            for seg in loop or []:
+                a, b = _xy(seg.get("start")), _xy(seg.get("end"))
+                if a is None or b is None:
+                    continue
+                if seg.get("type") == "arc" and seg.get("center") and seg.get("radius"):
+                    c = _xy(seg["center"])
+                    a0 = math.atan2(a[1] - c[1], a[0] - c[0])
+                    a1 = math.atan2(b[1] - c[1], b[0] - c[0])
+                    if seg.get("clockwise"):
+                        a0, a1 = a1, a0
+                    while a1 < a0:
+                        a1 += 2 * math.pi
+                    yield Piece("arc", (c, float(seg["radius"]), a0, a1), tag, handle, layer, name)
+                else:
+                    yield Piece("seg", (a, b), tag, handle, layer, name)
+
+    # Surface borders, corridor feature lines, sample lines, survey figures,
+    # catchment / grading / view-frame boundaries: point chains.
+    def chains(items, type_name, key, closed):
+        for it in items or []:
+            pts = [q for q in (_xy(p) for p in it.get(key) or []) if q is not None]
+            if len(pts) < 2:
+                continue
+            tag = tag_for(it.get("layer"), name=it.get("name") or it.get("code"), type=type_name)
+            handle = str(it.get("handle"))
+            layer = str(it.get("layer") or "")
+            name = str(it.get("name") or it.get("code") or "")
+            n = len(pts)
+            for i in range(n if (closed and n > 2) else n - 1):
+                yield Piece("seg", (pts[i], pts[(i + 1) % n]), tag, handle, layer, name)
+
+    for sf in data.get("surfaces", []) or []:
+        for i, loop in enumerate(sf.get("boundary") or []):
+            yield from chains([{"points": loop.get("points"), "layer": sf.get("layer"), "name": sf.get("name"),
+                                "handle": f"{sf.get('handle')}/b{i}"}], "surface", "points", True)
+    yield from chains(data.get("corridor_lines"), "corridor_line", "points", False)
+    yield from chains(data.get("sample_lines"), "sample_line", "points", False)
+    yield from chains(data.get("survey_figures"), "survey_figure", "points", False)
+    yield from chains(data.get("catchments"), "catchment", "boundary", True)
+    yield from chains(data.get("gradings"), "grading", "boundary", True)
+    yield from chains(data.get("view_frames"), "view_frame", "boundary", True)
+
+    for cp in data.get("cogo_points", []) or []:
+        p = _xy(cp.get("position"))
+        if p is None:
+            continue
+        yield Piece("pt", p, tag_for(cp.get("layer"), name=cp.get("description"), type="cogo_point"),
+                    str(cp.get("handle")), str(cp.get("layer") or ""), str(cp.get("description") or cp.get("number") or ""))
+
+    for ix in data.get("intersections", []) or []:
+        p = _xy(ix.get("position"))
+        if p is None:
+            continue
+        yield Piece("pt", p, tag_for(ix.get("layer"), name=ix.get("name"), type="intersection"),
+                    str(ix.get("handle")), str(ix.get("layer") or ""), str(ix.get("name") or ""))
+
+    # Paper-space viewports as the model-space windows they show: closed rings
+    # tagged "viewport", named by layout, so a cell can say which sheet sees it.
+    for lay in data.get("layouts", []) or []:
+        for vp in lay.get("viewports") or []:
+            verts = _viewport_verts(vp)
+            if not verts or not vp.get("on", True):
+                continue
+            yield from _ring_pieces(verts, True, tag_for(vp.get("layer"), type="viewport"),
+                                    str(vp.get("handle")), str(vp.get("layer") or ""), None)
+
+
+def _viewport_verts(vp: dict) -> list:
+    """A viewport's model window as four corners: the plugin's twisted
+    model_ring when it reports one, else the axis-aligned model_window."""
+    ring = vp.get("model_ring")
+    if ring:
+        verts = [q for q in (_xy(v) for v in ring) if q is not None]
+        if len(verts) >= 3:
+            return verts
+    win = vp.get("model_window")
+    if not win:
+        return []
+    lo, hi = _xy(win[0]), _xy(win[1])
+    if lo is None or hi is None:
+        return []
+    return [(lo[0], lo[1]), (hi[0], lo[1]), (hi[0], hi[1]), (lo[0], hi[1])]
+
 
 def _snapshot_polygons(data: dict):
     """Closed polylines as chorded vertex rings, for covered-fraction."""
@@ -663,6 +1005,26 @@ def _ring_pieces(verts, closed, tag, handle, layer, bulges=None):
             yield Piece("seg", (a, b), tag, handle, layer)
         else:
             yield Piece("arc", _bulge_arc(a, b, bulge), tag, handle, layer)
+
+
+def viewport_ring(view_center, paper_scale, width, height, twist_deg=0.0):
+    """The model-space corners a paper viewport shows: paper size over the
+    scale (paper units per model unit), twisted about the view centre. The
+    same arithmetic as CadCommands.ViewportWindow, so a planned window and
+    the one the plugin reports back agree."""
+    c = _xy(view_center)
+    try:
+        ps = float(paper_scale)
+        w, h = float(width), float(height)
+    except (TypeError, ValueError):
+        return []
+    if c is None or ps <= 0 or w <= 0 or h <= 0:
+        return []
+    half_w, half_h = w / ps / 2.0, h / ps / 2.0
+    a = -math.radians(float(twist_deg or 0.0))
+    cs, sn = math.cos(a), math.sin(a)
+    return [(c[0] + ox * cs - oy * sn, c[1] + ox * sn + oy * cs)
+            for ox, oy in ((-half_w, -half_h), (half_w, -half_h), (half_w, half_h), (-half_w, half_h))]
 
 
 def _rect_verts(p):
@@ -741,6 +1103,13 @@ def _one_payload_pieces(p: dict, handle: str):
         yield from _ring_pieces(verts, closed, tag, handle, layer, p.get("bulges"))
     elif intent == "draw_rectangle":
         yield from _ring_pieces(_rect_verts(p), True, tag, handle, layer)
+    elif intent == "create_viewport":
+        # The window a new sheet will show, as the ring the index will hold once
+        # the plugin reports it back: planned cells, never a conflict (see
+        # conflicts()) -- a viewport frame crosses everything it frames.
+        verts = viewport_ring(p.get("view_center"), p.get("scale"), p.get("width"), p.get("height"),
+                              p.get("twist_deg"))
+        yield from _ring_pieces(verts, True, "viewport", handle, layer)
     elif intent == "draw_polygon":
         c, r, sides = _xy(p.get("center")), p.get("radius"), p.get("sides")
         if c and r and sides:
@@ -825,6 +1194,7 @@ class Cell:
     pieces: list = field(default_factory=list)                        # level 0 only
     clipped: list = field(default_factory=list)                       # level 0: (tag, a, b) inside the cell
     marks: list = field(default_factory=list)                         # level 0: (tag, p) point pieces inside
+    states: dict = field(default_factory=lambda: defaultdict(Counter)) # tag -> Counter(state -> piece touches)
     frame: dict = None
     children: list = field(default_factory=list)
     hash: str = ""
@@ -871,8 +1241,13 @@ class SpatialIndex:
         self.cells: dict = {}
         self.entity_cells: dict = defaultdict(set)     # handle -> {level-0 key}
         self.entity_tag: dict = {}                     # handle -> tag
+        self.tag_handles: dict = defaultdict(set)      # tag -> {handle}
         self.rings: dict = {}                          # handle -> (ring, tag) of closed shapes
-        self.unmatched: Counter = Counter()            # layer -> ft of linework tagged "other"
+        self.entity_state: dict = {}                   # handle -> proposed | existing | future ...
+        self.family_tags: dict = defaultdict(set)      # family -> {tags present}
+        self.layer_info: dict = {}                     # layer -> how it was named, feet, points
+        self.windows: dict = {}                        # viewport handle -> {ring, layout, on}
+        self.unmatched: Counter = Counter()            # layer -> ft of linework nothing could name
         self.unmatched_points: Counter = Counter()     # layer -> point pieces tagged by type only
         self.tags_version = TAGS.version
         self.alignments = self._prepare_alignments(data)
@@ -901,21 +1276,58 @@ class SpatialIndex:
             c = self.cells[key] = Cell(key)
         return c
 
+    def _verdict(self, piece) -> tuple:
+        """(state, source, confidence) for a piece, from its layer's words: what
+        the classifier would say, without carrying it on every Piece."""
+        d = TAGS.words.derive(piece.layer) if piece.layer else None
+        state = d.state if d else "proposed"
+        if piece.tag == "other":
+            return state, "other", ""
+        if d is not None and d.derivable and d.tag == piece.tag:
+            return state, "derived", d.confidence
+        if piece.tag in ("block", "text", "point", "dimension", "circle"):
+            return state, "type", ""
+        return state, "rule", ""
+
+    def _record(self, piece, state, source, confidence, feet=0.0, points=0):
+        self.entity_tag[piece.handle] = piece.tag
+        self.tag_handles[piece.tag].add(piece.handle)
+        self.entity_state[piece.handle] = state
+        self.family_tags[TAGS.family_of(piece.tag)].add(piece.tag)
+        info = self.layer_info.get(piece.layer)
+        if info is None:
+            info = self.layer_info[piece.layer] = {"tag": piece.tag, "family": TAGS.family_of(piece.tag),
+                                                   "state": state, "source": source, "confidence": confidence,
+                                                   "feet": 0.0, "points": 0, "handles": 0}
+        info["feet"] += feet
+        info["points"] += points
+        info["handles"] += 1
+
     def _insert(self, data):
+        for lay in data.get("layouts", []) or []:
+            for vp in lay.get("viewports") or []:
+                verts = _viewport_verts(vp)
+                if verts:
+                    self.windows[str(vp.get("handle"))] = {"ring": verts, "layout": str(lay.get("name") or ""),
+                                                           "on": bool(vp.get("on", True))}
         for piece in _snapshot_pieces(data):
-            self.entity_tag[piece.handle] = piece.tag
+            state, source, confidence = self._verdict(piece)
+            unverified = source == "other" or (source == "derived" and confidence == "none")
             if piece.kind == "pt":
+                self._record(piece, state, source, confidence, points=1)
                 key = key_at(*piece.geom)
                 c = self._cell(key)
                 c.handles[piece.tag].add(piece.handle)
                 c.points[piece.tag] += 1
+                c.states[piece.tag][state] += 1
                 c.pieces.append(piece)
                 c.marks.append((piece.tag, piece.geom))
                 self.entity_cells[piece.handle].add(key)
-                if piece.tag == "other" or (piece.layer and piece.tag in ("block", "text", "point", "dimension")):
+                if unverified or (piece.layer and source == "type"):
                     self.unmatched_points[piece.layer] += 1
                 continue
-            if piece.tag == "other":
+            self._record(piece, state, source, confidence, feet=piece.length())
+            if unverified:
                 self.unmatched[piece.layer] += piece.length()
             for a, b in piece.chords():
                 seg = _v(a, b)
@@ -934,6 +1346,7 @@ class SpatialIndex:
                     c.tensor[2] += clipped * uy * uy
                     if not c.pieces or c.pieces[-1] is not piece:
                         c.pieces.append(piece)
+                        c.states[piece.tag][state] += 1
                     span = _clip(a, b, bounds(key))
                     if span:
                         c.clipped.append((piece.tag, span[0], span[1]))
@@ -943,6 +1356,10 @@ class SpatialIndex:
 
         for ring, tag, handle in _snapshot_polygons(data):
             self.rings[handle] = (ring, tag)
+            self.tag_handles[tag].add(handle)
+            self.entity_tag.setdefault(handle, tag)
+            self.entity_state.setdefault(handle, "proposed")
+            self.family_tags[TAGS.family_of(tag)].add(tag)
             xs, ys = [p[0] for p in ring], [p[1] for p in ring]
             _, cx0, cy0 = key_at(min(xs), min(ys))
             _, cx1, cy1 = key_at(max(xs), max(ys))
@@ -962,6 +1379,13 @@ class SpatialIndex:
                         c.covered[tag] = min(1.0, c.covered[tag] + inside / (SUBSAMPLE ** 2))
                         c.handles[tag].add(handle)
                         self.entity_cells[handle].add(key)
+
+        # First sight of a layer family -> layer_tags.learned.json. Never fatal:
+        # a read-only disk or a race with another process must not cost a build.
+        try:
+            TAGS.flush_learned()
+        except OSError:
+            pass
 
     def _frames(self):
         if not self.alignments:
@@ -1005,6 +1429,8 @@ class SpatialIndex:
                         parent.length[tag] += ln
                     for tag, n in k.points.items():
                         parent.points[tag] += n
+                    for tag, st in k.states.items():
+                        parent.states[tag].update(st)
                     for tag, cov in k.covered.items():
                         parent.covered[tag] += cov * child_area / parent_area
                     for i in range(3):
@@ -1160,6 +1586,44 @@ class SpatialIndex:
     def cell(self, key):
         return self.cells.get(key)
 
+    def tags_of(self, word) -> set:
+        """Every tag a word names: itself, or every member of the family it
+        names (water -> water_main, water_hydrant ...)."""
+        word = str(word or "").lower()
+        out = set(self.family_tags.get(word, ()))
+        if word in self.tag_handles:
+            out.add(word)
+        return out
+
+    def handles_for(self, word, state=None) -> set:
+        """Handles of a tag or a family, optionally only those in one state."""
+        out = set()
+        for t in self.tags_of(word):
+            out |= self.tag_handles.get(t, set())
+        if state:
+            out = {h for h in out if self.entity_state.get(h, "proposed") == state}
+        return out
+
+    def _wanted(self, tag):
+        """None (anything) or the set of tags a query word stands for; a word
+        the index has never seen yields an empty set, so it matches nothing."""
+        if tag is None or tag == "":
+            return None
+        return self.tags_of(tag)
+
+    def pieces_for(self, handle) -> list:
+        """Every piece of one entity, once each (a piece sits in every cell it crosses)."""
+        seen, out = set(), []
+        for key in self.entity_cells.get(str(handle), ()):
+            cell = self.cells.get(key)
+            if not cell:
+                continue
+            for piece in cell.pieces:
+                if piece.handle == str(handle) and id(piece) not in seen:
+                    seen.add(id(piece))
+                    out.append(piece)
+        return out
+
     def _region_of_key(self, key):
         """A cell's region; for a parent, the region most of its base cells are in."""
         if key[0] == 0:
@@ -1211,8 +1675,10 @@ class SpatialIndex:
                 if (level, cx, cy) in self.cells:
                     yield (level, cx, cy)
 
-    def entities(self, tag=None, bbox=None, point=None, radius=None):
-        """Handles of entities of `tag` touching a bbox, or within `radius` of a point."""
+    def entities(self, tag=None, bbox=None, point=None, radius=None, state=None):
+        """Handles of entities of `tag` (a tag or a family) touching a bbox, or
+        within `radius` of a point; `state` keeps only existing / proposed / ..."""
+        wanted = self._wanted(tag)
         if point is not None and radius is not None:
             bbox = (point[0] - radius, point[1] - radius, point[0] + radius, point[1] + radius)
         if bbox is None:
@@ -1222,7 +1688,9 @@ class SpatialIndex:
         for key in self._keys_in(box):
             cell = self.cells[key]
             for piece in cell.pieces:
-                if tag and piece.tag != tag:
+                if wanted is not None and piece.tag not in wanted:
+                    continue
+                if state and self.entity_state.get(piece.handle, "proposed") != state:
                     continue
                 if piece.kind == "pt":
                     px, py = piece.geom
@@ -1247,13 +1715,15 @@ class SpatialIndex:
                 cx, cy = centre(key)
                 if box[0] <= cx <= box[2] and box[1] <= cy <= box[3]:
                     for t, hs in cell.handles.items():
-                        if not tag or t == tag:
-                            out |= hs
+                        if wanted is None or t in wanted:
+                            out |= {h for h in hs if not state or self.entity_state.get(h, "proposed") == state}
         return sorted(out)
 
-    def nearest(self, tag, point, direction=None, max_distance=2000.0):
-        """The nearest piece of `tag`, optionally only looking along `direction`.
-        Returns (handle, hit point, distance) or None."""
+    def nearest(self, tag, point, direction=None, max_distance=2000.0, state=None):
+        """The nearest piece of `tag` (a tag or a family), optionally only looking
+        along `direction` and only in one `state`. Returns (handle, hit point,
+        distance) or None."""
+        wanted = self._wanted(tag)
         if direction is not None:
             d = _norm(direction)
             far = _add(point, _scale(d, max_distance))
@@ -1263,7 +1733,9 @@ class SpatialIndex:
                 if not cell:
                     continue
                 for piece in cell.pieces:
-                    if piece.tag != tag or piece.kind == "pt":
+                    if (wanted is not None and piece.tag not in wanted) or piece.kind == "pt":
+                        continue
+                    if state and self.entity_state.get(piece.handle, "proposed") != state:
                         continue
                     if piece.kind == "seg":
                         hit = _ray_segments(point, d, [piece.geom])
@@ -1288,7 +1760,9 @@ class SpatialIndex:
                     if not cell:
                         continue
                     for piece in cell.pieces:
-                        if piece.tag != tag:
+                        if wanted is not None and piece.tag not in wanted:
+                            continue
+                        if state and self.entity_state.get(piece.handle, "proposed") != state:
                             continue
                         if piece.kind == "pt":
                             dist = math.dist(point, piece.geom)
@@ -1304,11 +1778,12 @@ class SpatialIndex:
             ring += 1
         return best
 
-    def between(self, a, b, tag=None):
+    def between(self, a, b, tag=None, state=None):
         """Pieces the segment ab crosses in its interior: [(handle, tag, point)]."""
-        return self._crossings_of(Piece("seg", (a, b), "query", "query", ""), tag)
+        return self._crossings_of(Piece("seg", (a, b), "query", "query", ""), tag, state=state)
 
-    def _crossings_of(self, probe: Piece, tag=None, eps=1e-3):
+    def _crossings_of(self, probe: Piece, tag=None, eps=1e-3, state=None):
+        wanted = self._wanted(tag)
         out, seen = [], set()
         for a, b in probe.chords():
             seg = _v(a, b)
@@ -1321,7 +1796,9 @@ class SpatialIndex:
                 if not cell:
                     continue
                 for piece in cell.pieces:
-                    if (tag and piece.tag != tag) or piece.kind == "pt":
+                    if (wanted is not None and piece.tag not in wanted) or piece.kind == "pt":
+                        continue
+                    if state and self.entity_state.get(piece.handle, "proposed") != state:
                         continue
                     if piece.kind == "seg":
                         hit = _ray_segments(a, d, [piece.geom])
@@ -1379,16 +1856,21 @@ class SpatialIndex:
             out.update(self._neighbours(k))
         return out
 
-    def inside(self, point, tags=None):
-        """Closed shapes of `tags` (default: the vocabulary's 'inside' conflict
-        tags) that contain the point: [(handle, tag)]."""
-        tags = set(tags if tags is not None else (TAGS.conflicts.get("inside") or ["pad"]))
+    def inside(self, point, tags=None, state=None):
+        """Closed shapes of `tags` (tags or families; default the vocabulary's
+        'inside' conflict tags) that contain the point: [(handle, tag)]."""
+        words = tags if tags is not None else (TAGS.conflicts.get("inside") or ["pad"])
+        expanded = set()
+        for w in words:
+            expanded |= self.tags_of(w)
         cell = self.cells.get(key_at(*point))
         if cell is None:
             return []
         out = []
-        for tag in tags:
+        for tag in expanded:
             for h in cell.handles.get(tag, ()):
+                if state and self.entity_state.get(h, "proposed") != state:
+                    continue
                 ring = self.rings.get(h)
                 if ring and _point_in_polygon(point, ring[0]):
                     out.append((h, tag))
@@ -1407,51 +1889,56 @@ class SpatialIndex:
         Each conflict names the payload index, what it hits and where."""
         out = []
         clearance = float(TAGS.conflicts.get("proximity_clearance") or 0.0)
-        inside_tags = set(TAGS.conflicts.get("inside") or ["pad"])
+        inside_words = list(TAGS.conflicts.get("inside") or ["pad"])
+        wanted_words = None if tags is None else set(t for t in tags)
         seen = set()
         for index, piece in _payload_pieces(payloads):
+            if piece.tag == "viewport":
+                continue                         # a sheet's window, not linework in the model
             intent = payloads[index].get("intent") if isinstance(payloads[index], dict) else None
+            proposed_state = TAGS.words.derive(piece.layer).state if piece.layer else "proposed"
+
+            def record(kind, handle, tag, at, **extra):
+                out.append({"kind": kind, "payload": index, "intent": intent, "piece": piece.handle,
+                            "hits": handle, "tag": tag, "family": TAGS.family_of(tag),
+                            "state": self.entity_state.get(handle, "proposed"),
+                            "proposed_state": proposed_state, "at": at, **extra})
+
             if piece.kind in ("seg", "arc"):
                 for t in (tags or [None]):
                     for handle, tag, p in self._crossings_of(piece, t):
-                        if tags is not None and tag not in tags:
+                        if wanted_words is not None and not TAGS.matches(tag, wanted_words):
                             continue
                         sig = ("crossing", index, handle, round(p[0], 2), round(p[1], 2))
                         if sig in seen:
                             continue
                         seen.add(sig)
-                        out.append({"kind": "crossing", "payload": index, "intent": intent,
-                                    "piece": piece.handle, "hits": handle, "tag": tag,
-                                    "at": [round(p[0], 3), round(p[1], 3)]})
+                        record("crossing", handle, tag, [round(p[0], 3), round(p[1], 3)])
                 probes = [_mid(ch) for ch in piece.chords()[:: max(1, len(piece.chords()) // 4)]]
             else:
                 probes = [piece.geom]
-            if piece.tag in inside_tags:
+            if TAGS.matches(piece.tag, inside_words):
                 continue
             for q in probes:
-                for handle, tag in self.inside(q, inside_tags):
+                for handle, tag in self.inside(q, inside_words):
                     sig = ("inside", index, handle)
                     if sig in seen:
                         continue
                     seen.add(sig)
-                    out.append({"kind": "inside", "payload": index, "intent": intent,
-                                "piece": piece.handle, "hits": handle, "tag": tag,
-                                "at": [round(q[0], 3), round(q[1], 3)]})
+                    record("inside", handle, tag, [round(q[0], 3), round(q[1], 3)])
             if piece.kind == "pt" and clearance > 0:
                 for h in self.entities(bbox=None, point=piece.geom, radius=clearance):
                     if h == piece.handle:
                         continue
                     tag = self.entity_tag.get(h, "other")
-                    if tags is not None and tag not in tags:
+                    if wanted_words is not None and not TAGS.matches(tag, wanted_words):
                         continue
                     sig = ("proximity", index, h)
                     if sig in seen:
                         continue
                     seen.add(sig)
-                    out.append({"kind": "proximity", "payload": index, "intent": intent,
-                                "piece": piece.handle, "hits": h, "tag": tag,
-                                "at": [round(piece.geom[0], 3), round(piece.geom[1], 3)],
-                                "within": clearance})
+                    record("proximity", h, tag, [round(piece.geom[0], 3), round(piece.geom[1], 3)],
+                           within=clearance)
         return out
 
     def verify(self, after: "SpatialIndex", payloads: list = None, handles=None, limit: int = 12) -> dict:
@@ -1580,7 +2067,7 @@ class SpatialIndex:
             if ln <= 0:
                 continue
             n = cell.count(tag)
-            words = f"{tag.replace('_', ' ')} {ln:.0f} ft"
+            words = f"{self._state_prefix(cell, tag)}{tag.replace('_', ' ')} {ln:.0f} ft"
             if n > 1:
                 words += f" ({n} pieces)"
             if key[0] == 0 and tag in ("curb", "lot_line", "driveway", "swale"):
@@ -1594,7 +2081,7 @@ class SpatialIndex:
             if n <= 0:
                 continue
             word = tag.replace("_", " ")
-            parts.append(f"{n} {word}{'s' if n != 1 and not word.endswith('s') else ''}")
+            parts.append(f"{n} {self._state_prefix(cell, tag)}{word}{'s' if n != 1 and not word.endswith('s') else ''}")
         body = ", ".join(parts) if parts else "nothing drawn"
         orient = self._bearing_words(angle, aniso)
         cont = ""
@@ -1608,13 +2095,29 @@ class SpatialIndex:
         return f"{head} {body[0].upper() + body[1:]}{tail}{cont}"
 
     @staticmethod
+    def _state_prefix(cell, tag) -> str:
+        """'existing ' / 'future ' when every piece of the tag in this cell
+        shares one non-proposed state; '(existing/proposed) ' when mixed."""
+        st = cell.states.get(tag)
+        if not st:
+            return ""
+        kinds = sorted(k for k, n in st.items() if n)
+        if len(kinds) == 1:
+            return "" if kinds[0] == "proposed" else f"{TAGS.state_word(kinds[0])} "
+        return "(" + "/".join(TAGS.state_word(k) for k in kinds) + ") "
+
+    @staticmethod
     def _tag_order(cell) -> list:
-        """Tags in the vocabulary's order, pads first, 'other' last, so a
+        """Tags in the vocabulary's order, pads first, then families in the
+        glyph priority, then the rest alphabetically, 'other' last, so a
         sentence reads the same way for every cell."""
         known = [t for t in TAGS.tags() if t != "pad"]
         present = [t for t in cell.tags() if t != "pad"]
         ordered = [t for t in known if t in present]
-        ordered += sorted(t for t in present if t not in known and t != "other")
+        rest = [t for t in present if t not in known and t != "other"]
+        prio = {f: i for i, f in enumerate(TAGS.glyph_priority)}
+        rest.sort(key=lambda t: (prio.get(TAGS.family_of(t), 99), TAGS.family_of(t), t))
+        ordered += rest
         if "other" in present:
             ordered.append("other")
         return ordered
@@ -1764,7 +2267,33 @@ class SpatialIndex:
         if top_p:
             words = ", ".join(f"layer '{layer}' x{n}" for layer, n in top_p)
             out.append(f"Point entities tagged by type only (block/text/point/dimension): {words}.")
+        low = [(layer, info) for layer, info in self.layer_info.items()
+               if info["source"] == "derived" and info["confidence"] == "none"]
+        low.sort(key=lambda kv: -(kv[1]["feet"] + 10 * kv[1]["points"]))
+        if low:
+            words = ", ".join(f"{layer} -> {info['tag']}" + (f" {info['feet']:,.0f} ft" if info["feet"] else f" x{info['points']}")
+                              for layer, info in low[:limit])
+            out.append(f"Named from their words (unverified): {words}. Correct one with edit_learned, "
+                       f"or teach an abbreviation with rename_word.")
         return out
+
+    def derivation_stats(self, limit: int = 25) -> dict:
+        """How the drawing's layers were named: counts by source and confidence,
+        the unverified ones with their auto names, and the states seen."""
+        by_source, by_conf, states = Counter(), Counter(), Counter()
+        low = []
+        for layer, info in self.layer_info.items():
+            by_source[info["source"]] += 1
+            if info["source"] == "derived":
+                by_conf[info["confidence"]] += 1
+            states[info["state"]] += 1
+            if info["source"] == "derived" and info["confidence"] != "full":
+                low.append({"layer": layer, "tag": info["tag"], "family": info["family"],
+                            "confidence": info["confidence"], "feet": round(info["feet"], 1),
+                            "points": info["points"]})
+        low.sort(key=lambda r: -(r["feet"] + 10 * r["points"]))
+        return {"layers": len(self.layer_info), "by_source": dict(by_source), "auto_by_confidence": dict(by_conf),
+                "states": dict(states), "unverified": low[:limit]}
 
 
 def build(data: dict) -> SpatialIndex:

@@ -424,6 +424,29 @@ BLOCK_SPECS = [
                      "different street and are left alone."},
         ],
     },
+    {
+        "type": "cut_sheets",
+        "label": "Cut Sheets",
+        "group": "Generated",
+        "description": ("Paper-space sheets over the designer's work: tiles the work's "
+                        "extent with viewports at the plan type's scale, clones the "
+                        "template layout for each, fills the title block, places the "
+                        "furniture (north arrow, scale bar, notes, warnings) and writes "
+                        "the tables. One all-or-nothing sequence per sheet. Reads the "
+                        "drawing and playbooks/<type>/sheets.json when it runs."),
+        "expand": "sheets",   # reads the live drawing; see _expand in server.py
+        "fields": [
+            {"name": "plan_type", "label": "Plan type", "type": "text",
+             "help": "A type under playbooks/ with a sheets.json (see list_playbooks)."},
+            {"name": "scale", "label": "Scale (ft per inch)", "type": "number", "optional": True,
+             "help": "40 for 1\" = 40'. Blank: the first scale in the spec that fits max_sheets."},
+            {"name": "max_sheets", "label": "Max sheets", "type": "number", "optional": True},
+            {"name": "twist_deg", "label": "Twist (deg)", "type": "number", "default": 0,
+             "help": "Rotates every viewport; 0 = north up."},
+            {"name": "title", "label": "Sheet title", "type": "text", "default": "",
+             "help": "Fills {title} in the title block and furniture."},
+        ],
+    },
 ]
 
 
@@ -488,11 +511,12 @@ BLOCK_SPECS.append({
 
 def _build_space_labels(v):
     payload = {"intent": "space_labels"}
-    for key in ("apply", "layer", "types", "mode", "include_other", "curb_layer",
-                "include_dragged", "include_pinned", "clearance", "cell_size", "max_passes"):
+    for key in ("apply", "layer", "types", "mode", "include_other", "curb_layer", "curb_side",
+                "centreline_layer", "include_dragged", "include_pinned", "clearance", "label_gap",
+                "cell_size", "max_passes"):
         if key in v and not _blank(v[key]):
             payload[key] = v[key]
-    for key in ("obstacle_layers", "ignore_layers"):
+    for key in ("obstacle_layers", "ignore_layers", "pad_layers"):
         if v.get(key):
             payload[key] = v[key]
     if v.get("leader_lengths"):
@@ -504,11 +528,12 @@ BLOCK_SPECS.append({
     "type": "space_labels",
     "label": "Space Labels",
     "group": "Generated",
-    "description": ("Finished-grade elevation labels are dragged clear of linework and "
-                    "each other (candidates in 8 directions scored on an occupancy grid of "
-                    "the drawing's linework, most crowded placed first, then repaired); "
-                    "top-of-curb labels are rotated to follow the back of curb instead. "
-                    "Pad and slope labels are left alone unless asked."),
+    "description": ("Finished-grade elevation labels are dragged clear of linework, each "
+                    "other and each other's leaders (candidates in 8 directions scored on an "
+                    "occupancy grid of the drawing's linework, most crowded placed first, then "
+                    "repaired); top-of-curb labels are rotated to follow the back of curb and "
+                    "flipped in place so the text sits on the outside of the curb, never "
+                    "dragged. Pad and slope labels are left alone unless asked."),
     "build": _build_space_labels,
     "fields": [
         {"name": "apply", "label": "Move labels", "type": "bool", "default": True,
@@ -525,6 +550,17 @@ BLOCK_SPECS.append({
          "default": False},
         {"name": "curb_layer", "label": "Back of curb layer", "type": "text", "default": "c-road-back",
          "help": "Suffix. Curb labels are rotated to this linework."},
+        {"name": "curb_side", "label": "Curb text side", "type": "choice",
+         "options": ["outside", "keep"], "default": "outside",
+         "help": "outside = flip a curb label in place when its text lands on the road side "
+                 "(away from the centreline, else toward the pad, else toward the right of way). "
+                 "keep = rotate only."},
+        {"name": "centreline_layer", "label": "Road centreline layer", "type": "text",
+         "default": "c-rway-center",
+         "help": "Suffix. The side of the curb away from this is the outside."},
+        {"name": "pad_layers", "label": "Pad layers", "type": "strings", "optional": True,
+         "help": "Suffixes. Blank = c-lots-pad, -30, -40, -50. Used to tell the outside of the "
+                 "curb when no centreline is in reach."},
         {"name": "include_dragged", "label": "Move already-dragged labels", "type": "bool",
          "default": False,
          "help": "Off = labels somebody already dragged stay put and count as obstacles."},
@@ -535,10 +571,12 @@ BLOCK_SPECS.append({
          "help": "Layer suffixes that never count as obstacles."},
         {"name": "clearance", "label": "Clearance", "type": "number", "default": 0.5,
          "help": "Feet of padding kept around linework."},
+        {"name": "label_gap", "label": "Label gap", "type": "number", "optional": True,
+         "help": "Feet a placed label keeps from other text and leaders. Blank = 0."},
         {"name": "cell_size", "label": "Grid cell", "type": "number", "optional": True,
-         "help": "Feet. Blank = half the text height."},
+         "help": "Feet. Blank = a quarter of the text height."},
         {"name": "leader_lengths", "label": "Leader lengths", "type": "strings", "optional": True,
-         "help": "Feet, comma separated. Blank = 1, 2 and 3 text heights."},
+         "help": "Feet, comma separated. Blank = 1, 2, 3 and 4.5 text heights."},
         {"name": "max_passes", "label": "Repair passes", "type": "int", "default": 10},
     ],
 })

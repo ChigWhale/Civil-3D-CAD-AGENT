@@ -1,52 +1,317 @@
 {
   "_about": [
-    "The vocabulary the spatial index speaks. Every entity in a drawing gets ONE tag,",
-    "decided by the first rule here that matches it (rules are tried in ascending",
-    "priority, then file order). A rule matches on the entity's layer name, its block",
-    "name, or its type (line, arc, polyline, block, text, point, circle, dimension,",
-    "pipe, structure, feature_line, label). Layer matching is case-insensitive;",
-    "'endswith' and 'contains' are what make an xref-prefixed layer such as",
-    "'x-plat (ph1a)|c-lots-line' resolve to the same tag as the native one.",
-    "Nothing matched: the entity's type becomes its tag when it has one (a block is",
-    "'block'), and plain linework becomes 'other'. spatial_map lists the busiest",
-    "'other' layers so they can be named here or with the define_tag tool.",
-    "glyph: the character the site map paints a cell with; combos win over single",
-    "glyphs and are tried in order. merge: layer suffixes worth pulling out of xrefs",
-    "into the index (the plugin's /nested route matches on layer-name suffix)."
+    "The hand-written half of the vocabulary. Every entity gets ONE tag. Precedence:",
+    "pad layers (driveways.is_pad_layer) -> these rules on layer name / block name ->",
+    "learned entries a person edited (layer_tags.learned.json) -> a name derived from",
+    "the layer's words (layer_words.json: C-WATR-HYDR -> water_hydrant, family water)",
+    "-> these rules on entity type -> the type itself -> 'other'.",
+    "A rule: tag, on (layer | name | type), match (equals | endswith | startswith |",
+    "contains | regex), needle, optional glyph (site-map character), family (the",
+    "word a family query such as find_entities('water') groups it under) and",
+    "priority (lower wins). Layer matching is case-insensitive; endswith/contains",
+    "make an xref-prefixed layer such as 'x-plat (ph1a)|c-lots-line' resolve too.",
+    "Utility layers (c-watr, c-sswr, c-strm ...) have no rules here on purpose: the",
+    "word dictionary names them, with the part (main, hydrant, inlet) in the tag.",
+    "glyph_priority / combos: which tag or family paints a site-map cell. merge: xref",
+    "layer suffixes pulled into the index. conflicts: the gate's 'inside' tags and",
+    "proximity clearance."
   ],
   "rules": [
-    {"tag": "pad",          "on": "layer", "match": "endswith", "needle": "c-lots-pad",    "glyph": "P", "priority": 10},
-    {"tag": "pad",          "on": "layer", "match": "endswith", "needle": "c-lots-pad-30", "glyph": "P", "priority": 10},
-    {"tag": "pad",          "on": "layer", "match": "endswith", "needle": "c-lots-pad-40", "glyph": "P", "priority": 10},
-    {"tag": "pad",          "on": "layer", "match": "endswith", "needle": "c-lots-pad-50", "glyph": "P", "priority": 10},
-    {"tag": "curb",         "on": "layer", "match": "equals",   "needle": "c-road-back",   "glyph": "R", "priority": 20},
-    {"tag": "lot_line",     "on": "layer", "match": "endswith", "needle": "c-lots-line",   "glyph": "L", "priority": 30},
-    {"tag": "setback",      "on": "layer", "match": "endswith", "needle": "c-lots-stbk",   "priority": 30},
-    {"tag": "centreline",   "on": "layer", "match": "endswith", "needle": "c-rway-center", "priority": 30},
-    {"tag": "right_of_way", "on": "layer", "match": "endswith", "needle": "c-rway-line",   "priority": 30},
-    {"tag": "boundary",     "on": "layer", "match": "contains", "needle": "c-bndy",        "priority": 40},
-    {"tag": "easement",     "on": "layer", "match": "contains", "needle": "c-esmt",        "priority": 40},
-    {"tag": "driveway",     "on": "layer", "match": "contains", "needle": "drive",         "glyph": "d", "priority": 50},
-    {"tag": "swale",        "on": "layer", "match": "contains", "needle": "swale",         "glyph": "d", "priority": 50},
-    {"tag": "storm",        "on": "layer", "match": "contains", "needle": "c-strm",        "glyph": "s", "priority": 60},
-    {"tag": "sanitary",     "on": "layer", "match": "contains", "needle": "c-sswr",        "glyph": "s", "priority": 60},
-    {"tag": "water",        "on": "layer", "match": "contains", "needle": "c-watr",        "glyph": "w", "priority": 60},
-    {"tag": "contour",      "on": "layer", "match": "contains", "needle": "c-topo",        "priority": 70},
-    {"tag": "pipe",         "on": "type",  "match": "equals",   "needle": "pipe",          "glyph": "s", "priority": 90},
-    {"tag": "structure",    "on": "type",  "match": "equals",   "needle": "structure",     "glyph": "s", "priority": 90},
-    {"tag": "feature_line", "on": "type",  "match": "equals",   "needle": "feature_line",  "priority": 90},
-    {"tag": "label",        "on": "type",  "match": "equals",   "needle": "label",         "priority": 90},
-    {"tag": "text",         "on": "type",  "match": "equals",   "needle": "text",          "priority": 90},
-    {"tag": "block",        "on": "type",  "match": "equals",   "needle": "block",         "priority": 90}
+    {
+      "tag": "pad",
+      "on": "layer",
+      "match": "endswith",
+      "needle": "c-lots-pad",
+      "glyph": "P",
+      "priority": 10
+    },
+    {
+      "tag": "pad",
+      "on": "layer",
+      "match": "endswith",
+      "needle": "c-lots-pad-30",
+      "glyph": "P",
+      "priority": 10
+    },
+    {
+      "tag": "pad",
+      "on": "layer",
+      "match": "endswith",
+      "needle": "c-lots-pad-40",
+      "glyph": "P",
+      "priority": 10
+    },
+    {
+      "tag": "pad",
+      "on": "layer",
+      "match": "endswith",
+      "needle": "c-lots-pad-50",
+      "glyph": "P",
+      "priority": 10
+    },
+    {
+      "tag": "curb",
+      "on": "layer",
+      "match": "endswith",
+      "needle": "c-road-back",
+      "glyph": "R",
+      "priority": 20
+    },
+    {
+      "tag": "lot_line",
+      "on": "layer",
+      "match": "endswith",
+      "needle": "c-lots-line",
+      "glyph": "L",
+      "priority": 30
+    },
+    {
+      "tag": "setback",
+      "on": "layer",
+      "match": "endswith",
+      "needle": "c-lots-stbk",
+      "priority": 30
+    },
+    {
+      "tag": "centreline",
+      "on": "layer",
+      "match": "endswith",
+      "needle": "c-rway-center",
+      "priority": 30
+    },
+    {
+      "tag": "right_of_way",
+      "on": "layer",
+      "match": "endswith",
+      "needle": "c-rway-line",
+      "priority": 30
+    },
+    {
+      "tag": "boundary",
+      "on": "layer",
+      "match": "contains",
+      "needle": "c-bndy",
+      "priority": 40
+    },
+    {
+      "tag": "easement",
+      "on": "layer",
+      "match": "contains",
+      "needle": "c-esmt",
+      "priority": 40
+    },
+    {
+      "tag": "driveway",
+      "on": "layer",
+      "match": "contains",
+      "needle": "drive",
+      "glyph": "d",
+      "priority": 50
+    },
+    {
+      "tag": "swale",
+      "on": "layer",
+      "match": "contains",
+      "needle": "swale",
+      "glyph": "d",
+      "priority": 50
+    },
+    {
+      "tag": "contour",
+      "on": "layer",
+      "match": "contains",
+      "needle": "c-topo",
+      "priority": 70
+    },
+    {
+      "tag": "pipe",
+      "on": "type",
+      "match": "equals",
+      "needle": "pipe",
+      "glyph": "s",
+      "priority": 90
+    },
+    {
+      "tag": "structure",
+      "on": "type",
+      "match": "equals",
+      "needle": "structure",
+      "glyph": "s",
+      "priority": 90
+    },
+    {
+      "tag": "water",
+      "on": "type",
+      "match": "equals",
+      "needle": "pressure_pipe",
+      "glyph": "w",
+      "priority": 90
+    },
+    {
+      "tag": "fitting",
+      "on": "type",
+      "match": "equals",
+      "needle": "fitting",
+      "priority": 90
+    },
+    {
+      "tag": "appurtenance",
+      "on": "type",
+      "match": "equals",
+      "needle": "appurtenance",
+      "glyph": "w",
+      "priority": 90
+    },
+    {
+      "tag": "feature_line",
+      "on": "type",
+      "match": "equals",
+      "needle": "feature_line",
+      "priority": 90
+    },
+    {
+      "tag": "alignment",
+      "on": "type",
+      "match": "equals",
+      "needle": "alignment",
+      "glyph": "=",
+      "priority": 90
+    },
+    {
+      "tag": "parcel",
+      "on": "type",
+      "match": "equals",
+      "needle": "parcel",
+      "priority": 90
+    },
+    {
+      "tag": "surface",
+      "on": "type",
+      "match": "equals",
+      "needle": "surface",
+      "priority": 90
+    },
+    {
+      "tag": "corridor",
+      "on": "type",
+      "match": "equals",
+      "needle": "corridor_line",
+      "priority": 90
+    },
+    {
+      "tag": "cogo_point",
+      "on": "type",
+      "match": "equals",
+      "needle": "cogo_point",
+      "priority": 90
+    },
+    {
+      "tag": "sample_line",
+      "on": "type",
+      "match": "equals",
+      "needle": "sample_line",
+      "priority": 90
+    },
+    {
+      "tag": "catchment",
+      "on": "type",
+      "match": "equals",
+      "needle": "catchment",
+      "priority": 90
+    },
+    {
+      "tag": "grading",
+      "on": "type",
+      "match": "equals",
+      "needle": "grading",
+      "priority": 90
+    },
+    {
+      "tag": "intersection",
+      "on": "type",
+      "match": "equals",
+      "needle": "intersection",
+      "priority": 90
+    },
+    {
+      "tag": "survey_figure",
+      "on": "type",
+      "match": "equals",
+      "needle": "survey_figure",
+      "priority": 90
+    },
+    {
+      "tag": "view_frame",
+      "on": "type",
+      "match": "equals",
+      "needle": "view_frame",
+      "priority": 90
+    },
+    {
+      "tag": "viewport",
+      "on": "type",
+      "match": "equals",
+      "needle": "viewport",
+      "priority": 90
+    },
+    {
+      "tag": "label",
+      "on": "type",
+      "match": "equals",
+      "needle": "label",
+      "priority": 90
+    },
+    {
+      "tag": "text",
+      "on": "type",
+      "match": "equals",
+      "needle": "text",
+      "priority": 90
+    },
+    {
+      "tag": "block",
+      "on": "type",
+      "match": "equals",
+      "needle": "block",
+      "priority": 90
+    }
   ],
   "combos": [
-    {"glyph": "+", "all": ["curb", "pad"]}
+    {
+      "glyph": "+",
+      "all": [
+        "curb",
+        "pad"
+      ]
+    }
   ],
-  "glyph_priority": ["curb", "pad", "lot_line", "driveway", "swale", "storm", "sanitary", "water"],
-  "merge": ["c-lots-pad", "c-lots-pad-30", "c-lots-pad-40", "c-lots-pad-50", "c-road-back",
-            "c-lots-line", "c-lots-stbk", "c-rway-center", "c-rway-line", "c-bndy", "c-esmt"],
+  "glyph_priority": [
+    "curb",
+    "pad",
+    "lot_line",
+    "driveway",
+    "swale",
+    "storm",
+    "sanitary",
+    "water"
+  ],
+  "merge": [
+    "c-lots-pad",
+    "c-lots-pad-30",
+    "c-lots-pad-40",
+    "c-lots-pad-50",
+    "c-road-back",
+    "c-lots-line",
+    "c-lots-stbk",
+    "c-rway-center",
+    "c-rway-line",
+    "c-bndy",
+    "c-esmt"
+  ],
   "conflicts": {
-    "inside": ["pad"],
+    "inside": [
+      "pad"
+    ],
     "proximity_clearance": 0.0
   }
 }

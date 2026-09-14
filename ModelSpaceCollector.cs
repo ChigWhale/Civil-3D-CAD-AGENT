@@ -202,6 +202,13 @@ namespace CADAgent
                 // so the spatial index can put them in cells and space_labels' output can
                 // be checked against them.
                 var labels        = new List<CivilLabel>();
+                // The rest of the Civil 3D object set, read by CivilCoverage.
+                var sampleLines   = new List<AcadEntity>();
+                var catchments    = new List<AcadEntity>();
+                var gradings      = new List<AcadEntity>();
+                var intersections = new List<AcadEntity>();
+                var surveyFigures = new List<AcadEntity>();
+                var viewFrames    = new List<AcadEntity>();
                 var standardEntities = new Dictionary<string, int>();
 
                 foreach (ObjectId objId in ms)
@@ -212,9 +219,15 @@ namespace CADAgent
                         if (!(obj is AcadEntity entity)) continue;
 
                         // These are collected via the civilDoc API instead
-                        if (entity is Alignment || entity is SampleLine ||
-                            entity is Pipe      || entity is Structure) continue;
+                        if (entity is Alignment || entity is Pipe || entity is Structure ||
+                            entity is PressurePart) continue;
 
+                        if (entity is SampleLine)     { sampleLines.Add(entity);   continue; }
+                        if (entity is Catchment)      { catchments.Add(entity);    continue; }
+                        if (entity is Grading)        { gradings.Add(entity);      continue; }
+                        if (entity is Intersection)   { intersections.Add(entity); continue; }
+                        if (entity is SurveyFigure)   { surveyFigures.Add(entity); continue; }
+                        if (entity is ViewFrame)      { viewFrames.Add(entity);    continue; }
                         if (entity is TinSurface  ts) { tinSurfaces.Add(ts);  continue; }
                         if (entity is GridSurface gs) { gridSurfaces.Add(gs); continue; }
                         if (entity is Corridor    c)  { corridors.Add(c);     continue; }
@@ -479,6 +492,16 @@ namespace CADAgent
                     catch { }
                 }
                 root["labels"] = labelArray;
+
+                // Pressure networks, parcel loops, surface borders, corridor feature
+                // lines, COGO points, sample lines, catchments, gradings, intersections,
+                // survey figures, view frames, profile views and paper-space layouts.
+                var allSurfaces = new List<Autodesk.Civil.DatabaseServices.Surface>();
+                allSurfaces.AddRange(tinSurfaces);
+                allSurfaces.AddRange(gridSurfaces);
+                CivilCoverage.Append(root, tr, db, civilDoc,
+                                     sampleLines, catchments, gradings, intersections, surveyFigures, viewFrames,
+                                     profileViews.Cast<AcadEntity>().ToList(), parcels, allSurfaces, corridors);
 
                 // Circles, ellipses, splines, points, text, dimensions, hatches: compact summaries
                 // (handle, layer, key geometry) from the same code select_entities uses.

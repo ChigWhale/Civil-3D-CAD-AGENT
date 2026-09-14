@@ -92,7 +92,7 @@ namespace CADAgent
             var just = Attachment(S(req["justification"]), AttachmentPoint.BaseLeft);
             if (just == AttachmentPoint.BaseLeft) txt.Position = pos;
             else { txt.Justify = just; txt.AlignmentPoint = pos; }
-            ObjectId id = Append(tr, ModelSpace(tr, db), txt, S(req["layer"], "0"));
+            ObjectId id = Append(tr, TargetSpace(tr, db, req), txt, S(req["layer"], "0"));
             if (req["color"] != null) txt.Color = ColorFrom(req["color"]);
             txt.AdjustAlignment(db);
             return Created("Text created.", new[] { id }, new JObject { ["bounds"] = BoundsJson(txt) });
@@ -112,7 +112,7 @@ namespace CADAgent
             mt.Attachment = Attachment(S(req["attachment"]), AttachmentPoint.TopLeft);
             if (req["line_spacing_factor"] != null) mt.LineSpacingFactor = D(req["line_spacing_factor"]);
             if (req["background_mask"] != null) mt.BackgroundFill = B(req["background_mask"]);
-            ObjectId id = Append(tr, ModelSpace(tr, db), mt, S(req["layer"], "0"));
+            ObjectId id = Append(tr, TargetSpace(tr, db, req), mt, S(req["layer"], "0"));
             if (req["color"] != null) mt.Color = ColorFrom(req["color"]);
             return Created("MText created.", new[] { id }, new JObject { ["bounds"] = BoundsJson(mt) });
         });
@@ -493,7 +493,7 @@ namespace CADAgent
             }
             else ml.ContentType = ContentType.NoneContent;
 
-            ObjectId id = Append(tr, ModelSpace(tr, db), ml, S(req["layer"], "0"));
+            ObjectId id = Append(tr, TargetSpace(tr, db, req), ml, S(req["layer"], "0"));
             return Created("Leader created.", new[] { id });
         });
 
@@ -550,7 +550,7 @@ namespace CADAgent
                 tb.Cells[0, 0].TextString = S(req["title"]);
             }
             tb.GenerateLayout();
-            ObjectId id = Append(tr, ModelSpace(tr, db), tb, S(req["layer"], "0"));
+            ObjectId id = Append(tr, TargetSpace(tr, db, req), tb, S(req["layer"], "0"));
             return Created("Table created.", new[] { id }, new JObject { ["rows"] = rows, ["columns"] = cols, ["bounds"] = BoundsJson(tb) });
         });
 

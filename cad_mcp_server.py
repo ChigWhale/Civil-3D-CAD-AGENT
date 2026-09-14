@@ -5,8 +5,12 @@ import socket, subprocess, sys, threading, webbrowser
 from urllib.parse import quote
 from collections import defaultdict
 from mcp.server.fastmcp import FastMCP
+import checks as checks_mod
 import dashboard_events
 import driveways
+import exemplars
+import playbooks
+import sheets
 import spatial
 import spatial_cache
 import swales
@@ -24,7 +28,10 @@ _SIZE_LIMIT = 950_000  # bytes — 50 KB buffer below the 1 MB MCP threshold
 
 _ALL_CATEGORIES = [
     "lines", "arcs", "polylines", "alignments",
-    "pipe_networks", "surfaces", "corridors", "feature_lines",
+    "pipe_networks", "pressure_networks", "surfaces", "corridors", "corridor_lines",
+    "feature_lines", "parcels", "cogo_points", "point_groups", "sample_lines",
+    "catchments", "gradings", "intersections", "survey_figures", "view_frames",
+    "profile_views", "section_views", "layouts",
     "blocks", "labels", "layers", "adjacency",
     # Entity types the general drafting tools (drafting_tools.py) create and edit.
     "circles", "ellipses", "splines", "points", "texts", "dimensions", "hatches",
@@ -1110,18 +1117,29 @@ def label_grading(dashboard: str, apply: bool = False, surface: str = "",
 def space_labels(dashboard: str, apply: bool = False, handles: list[str] | None = None,
                  layer: str = "", types: str = "surface", window: list[list[float]] | None = None,
                  mode: str = "auto", kinds: list[str] | None = None, include_other: bool = False,
-                 curb_layer: str = "c-road-back", curb_tolerance: float = 1.0,
+                 curb_layer: str | list[str] = "c-road-back", curb_tolerance: float = 1.0,
+                 curb_side: str = "outside", centreline_layer: str = "c-rway-center",
+                 pad_layers: list[str] | None = None, row_layer: str = "c-rway-line",
+                 side_reach: float = 80.0, centreline_reach: float = 40.0,
                  include_dragged: bool = False, include_pinned: bool = False,
                  obstacle_layers: list[str] | None = None, ignore_layers: list[str] | None = None,
-                 clearance: float = 0.5, cell_size: float = 0.0,
+                 clearance: float = 0.5, cell_size: float = 0.0, label_gap: float = 0.0,
                  leader_lengths: list[float] | None = None, directions: list[float] | None = None,
                  allow_undragged: bool = True, weights: dict | None = None,
                  max_passes: int = 10, background: bool = True) -> str:
     """Puts grading labels where they belong, two treatments chosen per label:
       position  the finished-grade elevation labels (lot_row, lot_setback, swale_meet,
-                swale_high, lot_corner) are dragged clear of linework and each other;
+                swale_high, lot_corner) are dragged clear of linework, of each other
+                and of each other's leaders;
       align     the top-of-curb labels (curb_transition, drive_curb) are rotated to
-                follow the back of curb (curb_layer) at their anchor, nothing else.
+                follow the back of curb (curb_layer, a suffix or a list of suffixes)
+                at their anchor and, when the style puts the text on the road side,
+                flipped in place so the text sits on the outside of the curb. They are
+                never dragged. Outside = toward the label's pad (its tagged pad, else the
+                nearest on pad_layers within side_reach ft), else away from a
+                centreline_layer line within centreline_reach ft (a road's own centreline
+                is close; a rear easement's is not this curb's), else toward row_layer
+                within side_reach. curb_side="keep" rotates only.
     Which is which comes from the kind tag label_grading writes on its labels; an
     untagged spot elevation is aligned when its anchor sits within curb_tolerance of
     the back of curb and positioned otherwise. Pad (pad_fp) and slope labels are
@@ -1130,29 +1148,42 @@ def space_labels(dashboard: str, apply: bool = False, handles: list[str] | None 
 
     Positioning is greedy candidate placement with local-search repair, scored on a
     raster occupancy grid of the linework (model space AND xrefs, every visible layer
-    unless obstacle_layers / ignore_layers say otherwise). The plugin does all of it
-    and reports per label; nothing here reasons about geometry.
+    unless obstacle_layers / ignore_layers say otherwise). Labels that are not being
+    moved are stamped from their real exploded geometry: text, borders and markers
+    block as text, their leaders and slope arrow lines block as leaders. The plugin
+    does all of it and reports per label; nothing here reasons about geometry.
 
     Each label is tried undragged (at its anchor) and dragged in each of 8 directions
-    at 1, 2 and 3 text heights of leader. Every candidate is measured for real -- the
-    offset is applied and the extents read back -- so the text box is exactly what
+    at 1, 2, 3 and 4.5 text heights of leader. Every candidate is measured for real --
+    the offset is applied and the extents read back -- so the text box is exactly what
     Civil 3D draws. Cost = linework under the text (x10) + other labels under the
-    text (x25) + linework under the leader (x1) + leader length in text heights (x1)
-    + direction preference (x0.5), minus 2 for staying where it is. Labels are placed
-    most-constrained first, then repair passes revisit any that still overlap.
+    text (x25) + leaders through the text or this leader through other text (x25)
+    + this leader across other leaders (x10) + linework under the leader (x1)
+    + leader length in text heights (x1) + direction preference (x0.5), minus 2 for
+    staying where it is. Labels are placed most-constrained first, each stamping its
+    text box and leader as it goes, then repair passes revisit any that still overlap.
+    label_gap: feet a placed text box must keep from other text and leaders (default 0).
 
     Call with apply=False first and read the report:
-      * aligned / clean / overlapping / moved / skipped counts, and labels=[...] with,
-        per label, its mode and kind, then for aligned ones rotation_deg and
-        curb_distance, for positioned ones the
-        chosen offset (or undragged), its text box, line_hits, label_hits and cost --
-        a label with line_hits or label_hits > 0 could not be made clear with these
-        candidates (longer leader_lengths, more directions or a smaller clearance
-        usually fix it);
-      * warnings: no linework in reach, grid coarsened for a huge region (pass a
-        window and work one sheet at a time), labels that could not be measured.
-    Then apply=True writes every offset in one transaction. Compute leaves the drawing
-    untouched: every temporary measurement is rolled back.
+      * aligned / side_unresolved / clean / overlapping / leader_conflicts / moved /
+        skipped counts, and labels=[...] with, per label, its mode and kind, then for
+        aligned ones rotation_deg, curb_distance, side (outside / inside / centred /
+        unknown), side_method (already / flipped / rotated_180 / none), outward_ref
+        (pad / centreline / row) and outward_detail (what each reference measured:
+        pad handle and side, centreline distance and side, row distance and side,
+        the text's side, the curb tangent); for positioned ones the chosen offset
+        (or undragged), its text box, line_hits, label_hits, leader_label_hits,
+        leader_cross_hits and cost -- any hit count > 0 means it could not be made
+        clear with these candidates (longer leader_lengths, more directions or a
+        smaller clearance usually fix it);
+      * skipped_dragged_by_kind / skipped_pinned_by_kind: labels left alone because
+        they were already dragged or pinned, so "not rotated" is not "failed";
+      * warnings: no linework in reach, no centreline / pad / right of way to tell
+        the outside of the curb, fixed labels that would not explode, grid coarsened
+        for a huge region (pass a window and work one sheet at a time), labels that
+        could not be measured.
+    Then apply=True writes every offset, rotation and flip in one transaction.
+    Compute leaves the drawing untouched: every temporary measurement is rolled back.
 
     handles: explicit label handles (e.g. `created` from label_grading); otherwise
     every label matching types ("elevation", "slope", "surface" = both, "all" = any
@@ -1160,9 +1191,9 @@ def space_labels(dashboard: str, apply: bool = False, handles: list[str] | None 
     include_dragged: also move labels somebody already dragged (default: leave them
     and treat them as obstacles). include_pinned: same for pinned labels.
     clearance: feet of padding around linework. cell_size: grid cell in feet
-    (default half the text height). leader_lengths / directions (degrees, in
+    (default a quarter of the text height). leader_lengths / directions (degrees, in
     preference order) override the candidate set. weights: {line, label, leader,
-    length, direction, stay}.
+    length, direction, stay, leader_label, leader_leader}.
 
     background (default True): measuring every candidate for every label takes
     minutes, longer than a chat tool call may stay open, so the command is
@@ -1175,10 +1206,15 @@ def space_labels(dashboard: str, apply: bool = False, handles: list[str] | None 
     if background and not (handles or window or kinds or directions or weights):
         params: dict = {"apply": bool(apply), "types": types, "mode": mode,
                         "include_other": include_other, "curb_layer": curb_layer,
+                        "curb_side": curb_side, "centreline_layer": centreline_layer,
+                        "row_layer": row_layer, "side_reach": side_reach,
+                        "centreline_reach": centreline_reach,
                         "include_dragged": include_dragged, "include_pinned": include_pinned,
-                        "clearance": clearance, "max_passes": max_passes}
+                        "clearance": clearance, "label_gap": label_gap, "max_passes": max_passes}
         if layer:
             params["layer"] = layer
+        if pad_layers:
+            params["pad_layers"] = list(pad_layers)
         if obstacle_layers:
             params["obstacle_layers"] = list(obstacle_layers)
         if ignore_layers:
@@ -1197,9 +1233,15 @@ def space_labels(dashboard: str, apply: bool = False, handles: list[str] | None 
         "include_other": include_other,
         "curb_layer": curb_layer,
         "curb_tolerance": curb_tolerance,
+        "curb_side": curb_side,
+        "centreline_layer": centreline_layer,
+        "row_layer": row_layer,
+        "side_reach": side_reach,
+        "centreline_reach": centreline_reach,
         "include_dragged": include_dragged,
         "include_pinned": include_pinned,
         "clearance": clearance,
+        "label_gap": label_gap,
         "allow_undragged": allow_undragged,
         "max_passes": max_passes,
     }
@@ -1211,6 +1253,8 @@ def space_labels(dashboard: str, apply: bool = False, handles: list[str] | None 
         request["layer"] = layer
     if window:
         request["window"] = window
+    if pad_layers:
+        request["pad_layers"] = list(pad_layers)
     if obstacle_layers:
         request["obstacle_layers"] = list(obstacle_layers)
     if ignore_layers:
@@ -1352,14 +1396,21 @@ _MAP_MAX_CHARS = 60_000
 @mcp.tool()
 @observed
 def list_tags(dashboard: str) -> str:
-    """The vocabulary the spatial tools speak: every tag, the rule that assigns
-    it (layer suffix / block name / entity type), its map glyph, which xref
-    layers are merged into the index, and -- for this dashboard's drawing --
-    the busiest layers no rule names, so you can decide what to call them.
-    Tags are the words describe_location and find_entities use."""
+    """The vocabulary the spatial tools speak. Most layers name themselves from
+    the words in their names (layer_words.json): C-WATR-HYDR -> water_hydrant in
+    family water, V- layers are existing, -FUTR future. Hand rules
+    (layer_tags.json) win over that, and a person can override one family in
+    layer_tags.learned.json (edit_learned). This returns the precedence, the
+    hand tags, the families, the dictionary and learned-file summaries, and --
+    for this dashboard's drawing -- how its layers were named: counts by
+    source, the unverified auto-names (no known word in them; correct with
+    edit_learned or teach the abbreviation with rename_word), and the layers
+    nothing could name. Tags or families are the words describe_location,
+    find_entities and checks use."""
     out = spatial.TAGS.describe()
     try:
         index = _index_for(dashboard)
+        out["auto_named"] = index.derivation_stats()
         out["unmatched_linework"] = [{"layer": layer, "feet": round(ft, 1)}
                                      for layer, ft in index.unmatched.most_common(25)]
         out["type_tagged_points"] = [{"layer": layer, "count": n}
@@ -1371,9 +1422,73 @@ def list_tags(dashboard: str) -> str:
 
 @mcp.tool()
 @observed
+def explain_layer(layer: str, dashboard: str = "") -> str:
+    """Why a layer name gets the tag it gets: the classification (tag, family,
+    state, source, confidence), the word-by-word derivation, the learned entry
+    for its family if any, and the hand rule that won if one did. With a
+    dashboard, adds what the drawing holds on that layer."""
+    out = spatial.TAGS.explain(layer)
+    if dashboard:
+        try:
+            index = _index_for(dashboard)
+            out["in_drawing"] = index.layer_info.get(layer) or index.layer_info.get(str(layer).lower())
+        except Exception as e:
+            out["drawing_note"] = str(e)
+    return json.dumps(out)
+
+
+@mcp.tool()
+@observed
+def rename_word(abbr: str, word: str, kind: str = "major", tag_key: str = "", glyph: str = "") -> str:
+    """Teaches the dictionary an abbreviation, for every layer that uses it,
+    now and in future drawings. kind: major (a category such as WATR -> water;
+    tag_key is the family word, default the word itself; glyph paints the
+    family on the map), minor (a part such as HYDR -> hydrant), state (a token
+    that sets existing / future / demolition / abandoned / temporary),
+    discipline (a leading letter), or annotation (a minor that marks text).
+    Saved to layer_words.json; every cached index is rebuilt on its next use.
+    Returns the learned families whose names change as a result."""
+    try:
+        before = {k: spatial.TAGS.classify(e.get("example") or k, record=False).tag
+                  for k, e in spatial.TAGS.learned.entries.items() if not e.get("edited")}
+        out = spatial.TAGS.rename_word(abbr, word, kind=kind, tag_key=tag_key, glyph=glyph)
+    except (ValueError, OSError) as e:
+        return _err(e)
+    spatial_cache.invalidate_all()
+    changed = []
+    for k, e in spatial.TAGS.learned.entries.items():
+        if e.get("edited"):
+            continue
+        now = spatial.TAGS.classify(e.get("example") or k, record=False).tag
+        if now != before.get(k):
+            changed.append({"family": k, "was": before.get(k), "now": now})
+    out.update({"vocabulary_version": spatial.TAGS.version, "renamed_families": changed[:40]})
+    return json.dumps(out)
+
+
+@mcp.tool()
+@observed
+def edit_learned(family: str, tag: str = "", family_of: str = "", state: str = "", note: str = "") -> str:
+    """Overrides the auto name of ONE layer family. family is the layer name
+    without its xref prefix, numbers or FUTR, as listed by list_tags
+    (e.g. "c-misc-stuff"). Give a new tag, the family word it belongs to, a
+    state, or just a note; blank fields keep the derived value. The entry is
+    marked edited in layer_tags.learned.json and wins over derivation from now
+    on. Use rename_word instead when an abbreviation is wrong everywhere."""
+    try:
+        entry = spatial.TAGS.edit_learned(family, tag=tag or None, family=family_of or None,
+                                          state=state or None, note=note if note else None)
+    except (ValueError, OSError) as e:
+        return _err(e)
+    spatial_cache.invalidate_all()
+    return json.dumps({"ok": True, "family": family, "entry": entry, "vocabulary_version": spatial.TAGS.version})
+
+
+@mcp.tool()
+@observed
 def define_tag(dashboard: str, tag: str, needle: str, match: str = "contains",
                on: str = "layer", glyph: str = "", priority: int = 80,
-               persist: bool = True) -> str:
+               persist: bool = True, family: str = "") -> str:
     """Teaches the spatial index a word. From now on an entity whose layer name
     (on="layer"), block name (on="name") or type (on="type": line, arc,
     polyline, block, text, point, circle, dimension, pipe, structure,
@@ -1387,7 +1502,7 @@ def define_tag(dashboard: str, tag: str, needle: str, match: str = "contains",
     effect. Use list_tags first to see the busiest unnamed layers."""
     try:
         rule = spatial.TAGS.define(tag, needle, match=match, on=on, glyph=glyph,
-                                   priority=priority, persist=persist)
+                                   priority=priority, persist=persist, family=family)
     except (ValueError, OSError) as e:
         return json.dumps({"error": str(e)})
     spatial_cache.invalidate_all()
@@ -1510,7 +1625,7 @@ def list_blocks(dashboard: str, group: str = "", block_type: str = "", with_help
 @mcp.tool()
 @observed
 def run_on_dashboard(dashboard: str, blocks: list[dict], on_conflict: str = "pause",
-                     label: str = "") -> str:
+                     label: str = "", checks: str = "") -> str:
     """Commits a sequence of blocks to a dashboard and sets it running on that
     dashboard's drawing, in the background, with no model in the loop. Returns
     at once with the run id; the run continues after this chat turn ends and
@@ -1531,6 +1646,12 @@ def run_on_dashboard(dashboard: str, blocks: list[dict], on_conflict: str = "pau
     After the run the index is rebuilt and the change verified; a change
     outside the planned area also lands on the attention queue.
 
+    checks: a plan type from list_playbooks (e.g. "water"). After the run draws,
+    that playbook's acceptance checks are evaluated over what the run created;
+    results land under the run's `checks` in dashboard_status, and a failed
+    error-severity check queues an attention item of kind "checks". Nothing is
+    undone. Leave blank for no checks.
+
     label: a few words naming the run, shown in status. dashboard: REQUIRED id
     of the dashboard; its drawing is set by the user."""
     if not isinstance(blocks, list) or not blocks:
@@ -1538,9 +1659,10 @@ def run_on_dashboard(dashboard: str, blocks: list[dict], on_conflict: str = "pau
     on_conflict = str(on_conflict or "pause").strip().lower()
     if on_conflict not in ("pause", "warn", "stop"):
         return json.dumps({"error": "on_conflict must be pause, warn or stop"})
-    body = _dash_post(f"/dashboards/{dashboard}/run",
-                      {"blocks": blocks, "policy": {"on_conflict": on_conflict},
-                       "label": label, "source": "desktop"})
+    request = {"blocks": blocks, "policy": {"on_conflict": on_conflict}, "label": label, "source": "desktop"}
+    if str(checks or "").strip():
+        request["checks"] = str(checks).strip()
+    body = _dash_post(f"/dashboards/{dashboard}/run", request)
     if "error" not in body:
         body["note"] = ("Running in the background. Check dashboard_status later, or call "
                         "wait_for_dashboards to hold until it needs a decision or finishes.")
@@ -1689,6 +1811,333 @@ def resolve_attention(item: str, note: str) -> str:
     return json.dumps(_dash_post(f"/attention/{item}/resolve", {"note": note}))
 
 
+# ── Exemplars and playbooks: representation -> generalization ────────────────
+#
+# A finished plan of one type is exported as an exemplar bundle (exemplars.py):
+# the snapshot split into the base a designer starts from (playbooks/<type>/
+# base.json, decided by people) and the delta they drew, both as index cells in
+# words, plus a cell-by-cell diff and relations (how far each delta tag sits
+# from what was there, where along the alignments, how often). Bundles hold
+# client geometry and live under CAD_EXEMPLAR_DIR, outside the repo. From the
+# bundles of one type, playbook_brief builds a bounded, coordinate-free digest;
+# the chat writes the playbook (markdown + checks) and saves it with
+# save_playbook; dashboard runs then evaluate those checks after they draw.
+
+
+def _err(e) -> str:
+    return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+@observed
+def export_exemplar(dashboard: str, plan_type: str, name: str = "", notes: str = "",
+                    overwrite: bool = False) -> str:
+    """Exports the dashboard's drawing as an exemplar bundle of `plan_type`
+    (a folder under playbooks/ with a base.json; see list_playbooks). Reads the
+    drawing, splits it into base and delta by that type's base spec, and writes
+    snapshot, base, delta, index cells in words for both, the diff, relations
+    and the unmatched-layer list to CAD_EXEMPLAR_DIR/<type>/<name>/. Read-only
+    on the drawing. Returns the manifest summary plus the busiest delta layers
+    the vocabulary has no word for: name those with define_tag and re-export,
+    so the bundle is written in the right words. name defaults to the drawing
+    stem plus a timestamp; overwrite=True replaces an existing bundle."""
+    try:
+        file = _file_for(dashboard)
+        m = exemplars.export_drawing(file, plan_type, name=name, notes=notes, overwrite=overwrite, base_url=BASE)
+    except (exemplars.ExemplarError, playbooks.PlaybookError) as e:
+        return _err(e)
+    out = {k: m.get(k) for k in ("plan_type", "name", "path", "revision", "vocabulary_version", "alignments",
+                                 "counts", "reasons", "cells", "delta_tags", "delta_handles",
+                                 "unmatched_delta_layers")}
+    if out.get("unmatched_delta_layers"):
+        out["hint"] = ("Layers under unmatched_delta_layers landed in the delta with an unverified name: "
+                       "either nothing in the layer name was recognisable, or the auto name (shown as tag) "
+                       "was built from unknown words. Correct one with edit_learned, teach an abbreviation "
+                       "with rename_word, or pin a hand rule with define_tag, then export again with "
+                       "overwrite=True. Everything else was named from its words automatically.")
+    return json.dumps(out)
+
+
+@mcp.tool()
+@observed
+def list_exemplars(plan_type: str = "") -> str:
+    """The exemplar bundles on disk (all types, or one): name, drawing, export
+    time, revision, vocabulary version, alignments, cell counts, delta tags."""
+    try:
+        return json.dumps({"root": exemplars.exemplar_root(), "bundles": exemplars.list_bundles(plan_type)})
+    except exemplars.ExemplarError as e:
+        return _err(e)
+
+
+@mcp.tool()
+@observed
+def read_exemplar(plan_type: str, name: str, part: str = "summary", max_chars: int = 30000) -> str:
+    """One part of a bundle, for drilling in while writing a playbook. part:
+    manifest, summary, site_map, base_summary, base_site_map, relations,
+    unmatched, diff, cells, base_cells. Text is cut at max_chars on a line."""
+    try:
+        return exemplars.read_part(plan_type, name, part, max_chars)
+    except exemplars.ExemplarError as e:
+        return _err(e)
+
+
+@mcp.tool()
+@observed
+def playbook_brief(plan_type: str, max_chars: int = 60000) -> str:
+    """The digest of every exemplar of a plan type, bounded and free of
+    absolute coordinates: the base spec in words, each exemplar's delta by tag
+    (feet, points, region share, station and offset, side, nearest base and
+    delta tags, spacing), a few before-and-after cells, the layers still
+    unnamed, what holds across exemplars, the blocks that produce those tags,
+    and the output contract. Read it, then write the playbook and call
+    save_playbook. Use read_exemplar for detail on one bundle."""
+    palette = None
+    pal = _dash_get("/blocks")
+    if "error" not in pal:
+        palette = pal.get("blocks") or []
+    try:
+        return exemplars.build_brief(plan_type, max_chars=max_chars, palette=palette)
+    except (exemplars.ExemplarError, playbooks.PlaybookError) as e:
+        return _err(e)
+
+
+@mcp.tool()
+@observed
+def save_playbook(plan_type: str, markdown: str, checks_json: str) -> str:
+    """Saves a plan type's playbook: markdown with the required '## ' sections
+    (Scope, Base, Steps, Rules of thumb, Checks, Vocabulary, Open questions)
+    and checks_json, a JSON list of acceptance checks (see the output contract
+    in playbook_brief). Both are validated first; errors name what is wrong.
+    Writes playbooks/<type>/playbook.md and checks.json in the repo. Test the
+    checks right away with check_drawing and calibrate_checks."""
+    try:
+        return json.dumps(playbooks.save_playbook(plan_type, markdown, checks_json))
+    except playbooks.PlaybookError as e:
+        return _err(e)
+
+
+@mcp.tool()
+@observed
+def get_playbook(plan_type: str) -> str:
+    """A plan type's playbook markdown, checks and base spec, as saved."""
+    try:
+        return json.dumps(playbooks.load_playbook(plan_type))
+    except playbooks.PlaybookError as e:
+        return _err(e)
+
+
+@mcp.tool()
+@observed
+def list_playbooks() -> str:
+    """Every plan type under playbooks/: whether it has a base spec, a playbook,
+    how many checks, version and save time. A type with a base spec but no
+    playbook is ready for export_exemplar and playbook_brief."""
+    return json.dumps({"playbooks": playbooks.list_playbooks(),
+                       "check_kinds": list(checks_mod.KINDS)})
+
+
+# ── Sheets: layouts cut from model space, with furniture ──────────────────────
+#
+# A plan type's sheets.json (playbooks/<type>/) says what a sheet of that type
+# looks like; sheets.py tiles the designer's work with viewport windows and
+# turns each into one all-or-nothing plugin sequence. The cut runs on the
+# dashboard like any other block, so it is verified and checked afterwards.
+
+
+def _sheet_plan_summary(plan: dict) -> dict:
+    return {k: plan[k] for k in ("plan_type", "scale", "scale_text", "twist_deg", "count", "grid", "extent",
+                                 "extent_source", "subject", "tried", "warnings")}
+
+
+@mcp.tool()
+@observed
+def get_sheet_spec(plan_type: str) -> str:
+    """A plan type's sheet spec (playbooks/<type>/sheets.json) as saved, or -- when
+    none is saved yet -- a template pre-filled from the exemplars' sheets
+    (viewport rectangle, scales, overlap, furniture seen on every sheet), with
+    the fields explained. Edit and save with save_sheet_spec."""
+    try:
+        spec = sheets.load_spec(plan_type)
+        return json.dumps({"plan_type": plan_type, "saved": True, "path": sheets.spec_path(plan_type),
+                           "spec": spec, "warnings": sheets.spec_warnings(spec)})
+    except playbooks.PlaybookError as e:
+        return _err(e)
+    except sheets.SheetError as e:
+        note = str(e)
+    stats = []
+    try:
+        for b in exemplars.list_bundles(plan_type):
+            try:
+                stats.append(json.loads(exemplars.read_part(plan_type, b["name"], "sheets", 200_000)))
+            except (exemplars.ExemplarError, ValueError):
+                pass
+    except exemplars.ExemplarError:
+        pass
+    spec = sheets.suggest_spec(plan_type, stats) if stats else sheets.default_spec(plan_type)
+    return json.dumps({"plan_type": plan_type, "saved": False, "note": note,
+                       "from_exemplars": len(stats), "spec": spec})
+
+
+@mcp.tool()
+@observed
+def save_sheet_spec(plan_type: str, spec_json: str) -> str:
+    """Saves a plan type's sheet spec (validated; errors name the field). Paper
+    units are inches, model feet; scales are feet per inch (40 = 1" = 40').
+    template.file/layout name the title-block layout to clone; viewport
+    is where the window sits on that sheet; visible says what shows in it;
+    furniture and tables carry a place and a condition each. Then plan_sheets."""
+    try:
+        return json.dumps(sheets.save_spec(plan_type, spec_json))
+    except (sheets.SheetError, playbooks.PlaybookError) as e:
+        return _err(e)
+
+
+@mcp.tool()
+@observed
+def plan_sheets(dashboard: str, plan_type: str, scale: float = 0, max_sheets: int = 0,
+                twist_deg: float | None = None, title: str = "") -> str:
+    """Dry run of cut_sheets: reads the dashboard's drawing and says how many
+    sheets it takes at which scale, what each window holds (in the index's
+    words), which furniture and tables each sheet would get, which layers are
+    frozen in the viewports, and what is missing (template file, block library).
+    Nothing is written. scale in feet per inch (0 = pick from the spec),
+    max_sheets 0 = the spec's, twist_deg None = the spec's."""
+    try:
+        spec = sheets.load_spec(plan_type)
+        entry = spatial_cache.get(_file_for(dashboard))
+        plan, payloads = sheets.plan_and_payloads(
+            entry.index, entry.data, spec, plan_type, scale=scale or None, max_sheets=max_sheets or None,
+            twist_deg=twist_deg, drawing=_file_for(dashboard), title=title)
+    except (sheets.SheetError, playbooks.PlaybookError, spatial_cache.PluginError, DashboardError) as e:
+        return _err(e)
+    per_sheet = []
+    for p, sh in zip(payloads, plan["sheets"]):
+        steps = p["steps"]
+        per_sheet.append({"layout": sh["layout"], "row": sh["row"] + 1, "col": sh["col"] + 1,
+                          "holds": sh["tags"], "entities": len(sh["handles"]),
+                          "furniture": [st.get("name") or "mtext" for st in steps if st["intent"] in ("insert_block", "draw_mtext")],
+                          "tables": [st.get("title") or "table" for st in steps if st["intent"] == "create_table"],
+                          "steps": len(steps)})
+    vp = next((st for st in payloads[0]["steps"] if st["intent"] == "create_viewport"), {}) if payloads else {}
+    return json.dumps({**_sheet_plan_summary(plan), "template": (spec.get("template") or {}).get("file") or "(plain layouts)",
+                       "frozen_in_viewports": len(vp.get("freeze_layers") or []),
+                       "words": sheets.describe_plan(entry.index, plan), "sheets": per_sheet,
+                       "spec_warnings": sheets.spec_warnings(spec),
+                       "next": "cut_sheets(dashboard, plan_type, ...) runs this on the dashboard"})
+
+
+@mcp.tool()
+@observed
+def cut_sheets(dashboard: str, plan_type: str, scale: float = 0, max_sheets: int = 0,
+               twist_deg: float | None = None, title: str = "", on_conflict: str = "pause") -> str:
+    """Cuts the sheets on the dashboard, in the background: one all-or-nothing
+    sequence per sheet (template layout cloned, viewport cut with the plan
+    type's visible layers, title block filled, furniture placed, tables
+    written). Runs like any block: gated, verified afterwards (the new viewport
+    windows are planned cells), and the plan type's checks are evaluated when it
+    has a playbook -- a `covered` check says nothing fell off the sheets. Call
+    plan_sheets first to see the plan. Layouts that already exist with the
+    same names make the sheet fail rather than overwrite it."""
+    params = {"plan_type": plan_type, "twist_deg": twist_deg if twist_deg is not None else 0, "title": title}
+    if scale:
+        params["scale"] = scale
+    if max_sheets:
+        params["max_sheets"] = max_sheets
+    checks = ""
+    try:
+        if any(p["plan_type"] == plan_type and p["checks"] for p in playbooks.list_playbooks()):
+            checks = plan_type
+    except Exception:
+        pass
+    return run_on_dashboard(dashboard, [{"type": "cut_sheets", "params": params}], on_conflict=on_conflict,
+                            label=f"cut {plan_type} sheets", checks=checks)
+
+
+@mcp.tool()
+@observed
+def list_sheets(dashboard: str) -> str:
+    """The sheets the dashboard's drawing already has: every layout with its
+    viewports (scale, twist, model window, what the window holds in the index's
+    words, frozen layer count), the blocks on the paper with their attributes,
+    and the tables. Read-only."""
+    try:
+        entry = spatial_cache.get(_file_for(dashboard))
+    except (spatial_cache.PluginError, DashboardError) as e:
+        return _err(e)
+    return json.dumps({"layouts": sheets.list_layouts(entry.data, entry.index)})
+
+
+@mcp.tool()
+@observed
+def check_drawing(dashboard: str, plan_type: str = "", checks_json: str = "", scope: str = "all") -> str:
+    """Evaluates acceptance checks against the dashboard's drawing as it is now:
+    a saved playbook's checks (plan_type) or an inline list (checks_json). scope
+    "all" judges the whole drawing; "new" judges only what the dashboard's latest
+    run created. Returns pass/fail per check with offenders by handle. This is
+    how a playbook's checks are tried right after writing them."""
+    try:
+        check_list = playbooks.load_checks(plan_type) if plan_type else playbooks._coerce_checks(checks_json)
+    except playbooks.PlaybookError as e:
+        return _err(e)
+    errors = checks_mod.validate(check_list)
+    if errors:
+        return json.dumps({"error": "checks did not validate", "details": errors})
+    try:
+        index = _index_for(dashboard)
+    except Exception as e:
+        return _err(e)
+    handles = None
+    if scope == "new":
+        st = _dash_get(f"/dashboards/{dashboard}/status")
+        run = (st.get("run") or {}) if isinstance(st, dict) else {}
+        handles = set((run.get("verification") or {}).get("new_handles") or [])
+        if not handles:
+            return json.dumps({"error": "the latest run has no new handles to scope to; use scope='all'"})
+    results = checks_mod.evaluate(index, check_list, handles)
+    return json.dumps({"scope": scope, **checks_mod.summarize(results), "results": results})
+
+
+@mcp.tool()
+@observed
+def calibrate_checks(plan_type: str, checks_json: str = "") -> str:
+    """Runs a plan type's checks (saved, or checks_json) over every exemplar
+    bundle of that type, scoped to each bundle's delta. A check the exemplars
+    themselves fail is a bad check, or an exemplar with a real problem; either
+    way it should not go into a playbook unchanged. Returns per-bundle results."""
+    try:
+        check_list = playbooks._coerce_checks(checks_json) if str(checks_json or "").strip() \
+            else playbooks.load_checks(plan_type)
+        bundles = exemplars.list_bundles(plan_type)
+    except (playbooks.PlaybookError, exemplars.ExemplarError) as e:
+        return _err(e)
+    errors = checks_mod.validate(check_list)
+    if errors:
+        return json.dumps({"error": "checks did not validate", "details": errors})
+    if not bundles:
+        return json.dumps({"error": f"no exemplar bundles for {plan_type!r}"})
+    out, failing = [], {}
+    for b in bundles:
+        bdir = exemplars.bundle_dir(plan_type, b["name"])
+        try:
+            with open(os.path.join(bdir, "snapshot.json"), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            with open(os.path.join(bdir, "delta.json"), "r", encoding="utf-8") as f:
+                delta = json.load(f)
+        except (OSError, ValueError) as e:
+            out.append({"bundle": b["name"], "error": str(e)})
+            continue
+        index = spatial.build(data)
+        results = checks_mod.evaluate(index, check_list, exemplars.leaf_handles(delta))
+        summary = checks_mod.summarize(results)
+        for r in results:
+            if not r["ok"]:
+                failing.setdefault(r["id"], []).append(b["name"])
+        out.append({"bundle": b["name"], **summary,
+                    "failed": [{k: r[k] for k in ("id", "expected", "actual", "offenders")} for r in results if not r["ok"]]})
+    return json.dumps({"plan_type": plan_type, "bundles": len(bundles), "ok": not failing,
+                       "checks_failing_somewhere": failing, "per_bundle": out})
+
+
 @mcp.tool()
 @observed
 def describe_location(dashboard: str, x: float, y: float) -> str:
@@ -1712,20 +2161,22 @@ def describe_location(dashboard: str, x: float, y: float) -> str:
 @mcp.tool()
 @observed
 def find_entities(dashboard: str, tag: str, x: float, y: float,
-                  radius: float = 100.0) -> str:
-    """Handles of entities of one tag within `radius` ft of a point.
+                  radius: float = 100.0, state: str = "") -> str:
+    """Handles of entities of one tag or family within `radius` ft of a point.
 
-    tag is any word from list_tags: pad, curb, lot_line, setback, centreline,
-    right_of_way, boundary, easement, driveway, swale, storm, sanitary, water,
-    contour, pipe, structure, feature_line, label, text, block ... or other.
-    Point entities (labels, blocks, structures, text) match on their anchor.
-    Handles are what move_to_layer, edit_layer and the modify tools take, so
-    this is how a reasoned-about area becomes something to act on."""
+    tag is a word from list_tags: a hand tag (pad, curb, lot_line, setback,
+    centreline, right_of_way, boundary, easement, driveway, swale ...), a full
+    auto tag (water_main, water_hydrant, sanitary_pipe, storm_inlet ...), or a
+    family word that means all of its parts (water, sanitary, storm ...).
+    state narrows to proposed / existing / future / demolition / abandoned /
+    temporary. Point entities (labels, blocks, structures, text) match on
+    their anchor. Handles are what move_to_layer, edit_layer and the modify
+    tools take, so this is how a reasoned-about area becomes something to act on."""
     try:
         index = _index_for(dashboard)
     except Exception as e:
         return json.dumps({"error": str(e)})
-    handles = index.entities(tag, point=(x, y), radius=radius)
+    handles = index.entities(tag, point=(x, y), radius=radius, state=state or None)
     return json.dumps({"tag": tag, "count": len(handles), "handles": handles,
                        "region": index.region_of(point=(x, y))})
 
@@ -1890,7 +2341,7 @@ _DASHBOARD_URL  = f"http://localhost:{_DASHBOARD_PORT}"
 # Point _HEALTH_PATH at a route the CURRENT server has and older ones don't, and
 # require the version stamp to match so a server running older code is replaced.
 _HEALTH_PATH = "/version"
-_DASHBOARD_VERSION = "2026-09-10.3"   # must equal dashboard/server.py DASHBOARD_VERSION
+_DASHBOARD_VERSION = "2026-09-14.2"   # must equal dashboard/server.py DASHBOARD_VERSION
 
 # How long a server gets to answer before it counts as failed or stale. Covers
 # uvicorn's own startup plus the sibling-process case described in _launch.

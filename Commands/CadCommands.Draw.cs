@@ -79,7 +79,7 @@ namespace CADAgent
             }
             pl.Closed = B(req["closed"], false);
             if (req["elevation"] != null) pl.Elevation = D(req["elevation"]);
-            ObjectId id = Append(tr, ModelSpace(tr, db), pl, S(req["layer"], "0"));
+            ObjectId id = Append(tr, TargetSpace(tr, db, req), pl, S(req["layer"], "0"));
             return Created("Polyline created.", new[] { id }, new JObject { ["length"] = R(pl.Length), ["area"] = pl.Closed ? R(pl.Area) : 0 });
         });
 
@@ -115,7 +115,7 @@ namespace CADAgent
             double chamfer = D(req["chamfer_distance"], 0);
             if (chamfer > Tol) ChamferAllPolylineVertices(pl, chamfer);
 
-            ObjectId id = Append(tr, ModelSpace(tr, db), pl, S(req["layer"], "0"));
+            ObjectId id = Append(tr, TargetSpace(tr, db, req), pl, S(req["layer"], "0"));
             return Created("Rectangle created.", new[] { id }, new JObject { ["area"] = R(pl.Area) });
         });
 

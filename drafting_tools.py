@@ -130,25 +130,27 @@ def register(mcp, observed, post, file_for):
     @observed
     def draw_polyline(dashboard: str, vertices: list[list[float]], layer: str = "0",
                       closed: bool = False, bulges: list[float] | None = None,
-                      width: float = 0.0, elevation: float | None = None) -> str:
+                      width: float = 0.0, elevation: float | None = None,
+                 layout: str | None = None) -> str:
         """PLINE with arcs and width. bulges[i] = tan(included_angle/4) for the segment
         leaving vertex i (0 = straight, 1 = semicircle, negative = clockwise). Prefer
-        this over draw_shape when a segment must be curved or the line needs width."""
+        this over draw_shape when a segment must be curved or the line needs width. layout: a paper-space layout name puts it on that sheet instead of model space."""
         return call("draw_polyline", dashboard, vertices=vertices, layer=layer, closed=closed,
-                    bulges=bulges, width=width, elevation=elevation)
+                    bulges=bulges, width=width, elevation=elevation, layout=layout)
 
     @mcp.tool()
     @observed
     def draw_rectangle(dashboard: str, corner1: list[float], corner2: list[float] | None = None,
                        width: float | None = None, height: float | None = None,
                        rotation_deg: float = 0.0, layer: str = "0",
-                       fillet_radius: float = 0.0, chamfer_distance: float = 0.0) -> str:
+                       fillet_radius: float = 0.0, chamfer_distance: float = 0.0,
+                 layout: str | None = None) -> str:
         """RECTANG: closed polyline from two opposite corners, or corner1 + width/height,
         optionally rotated about corner1 and with rounded (fillet_radius) or
-        bevelled (chamfer_distance) corners."""
+        bevelled (chamfer_distance) corners. layout: a paper-space layout name puts it on that sheet instead of model space."""
         return call("draw_rectangle", dashboard, corner1=corner1, corner2=corner2, width=width,
                     height=height, rotation_deg=rotation_deg, layer=layer,
-                    fillet_radius=fillet_radius, chamfer_distance=chamfer_distance)
+                    fillet_radius=fillet_radius, chamfer_distance=chamfer_distance, layout=layout)
 
     @mcp.tool()
     @observed
@@ -533,23 +535,25 @@ def register(mcp, observed, post, file_for):
     @observed
     def draw_text(dashboard: str, text: str, position: list[float], height: float | None = None,
                   rotation_deg: float = 0.0, justification: str = "left", style: str | None = None,
-                  layer: str = "0", width_factor: float | None = None, color: str | int | None = None) -> str:
+                  layer: str = "0", width_factor: float | None = None, color: str | int | None = None,
+                 layout: str | None = None) -> str:
         """TEXT: single-line text. justification: left, center, right, middle, top_left,
-        top_center, top_right, middle_left, middle_right, bottom_left/center/right."""
+        top_center, top_right, middle_left, middle_right, bottom_left/center/right. layout: a paper-space layout name puts it on that sheet instead of model space."""
         return call("draw_text", dashboard, text=text, position=position, height=height, rotation_deg=rotation_deg,
-                    justification=justification, style=style, layer=layer, width_factor=width_factor, color=color)
+                    justification=justification, style=style, layer=layer, width_factor=width_factor, color=color, layout=layout)
 
     @mcp.tool()
     @observed
     def draw_mtext(dashboard: str, text: str, position: list[float], width: float = 0.0,
                    height: float | None = None, rotation_deg: float = 0.0, attachment: str = "top_left",
                    style: str | None = None, layer: str = "0", line_spacing_factor: float | None = None,
-                   background_mask: bool | None = None, color: str | int | None = None) -> str:
+                   background_mask: bool | None = None, color: str | int | None = None,
+                 layout: str | None = None) -> str:
         """MTEXT: paragraph text wrapped at `width` (0 = no wrap); "\\\\P" starts a new line.
-        attachment is the corner/side of the box that sits at position."""
+        attachment is the corner/side of the box that sits at position. layout: a paper-space layout name puts it on that sheet instead of model space."""
         return call("draw_mtext", dashboard, text=text, position=position, width=width, height=height,
                     rotation_deg=rotation_deg, attachment=attachment, style=style, layer=layer,
-                    line_spacing_factor=line_spacing_factor, background_mask=background_mask, color=color)
+                    line_spacing_factor=line_spacing_factor, background_mask=background_mask, color=color, layout=layout)
 
     @mcp.tool()
     @observed
@@ -674,12 +678,13 @@ def register(mcp, observed, post, file_for):
                     text_position: list[float] | None = None, height: float | None = None,
                     landing: bool = True, landing_length: float | None = None,
                     arrow_size: float | None = None, style: str | None = None,
-                    text_style: str | None = None, layer: str = "0") -> str:
+                    text_style: str | None = None, layer: str = "0",
+                 layout: str | None = None) -> str:
         """MLEADER: arrow at points[0], vertices through the rest, then a landing and the
-        text (empty text = leader line only)."""
+        text (empty text = leader line only). layout: a paper-space layout name puts it on that sheet instead of model space."""
         return call("draw_leader", dashboard, points=points, text=text, text_position=text_position,
                     height=height, landing=landing, landing_length=landing_length, arrow_size=arrow_size,
-                    style=style, text_style=text_style, layer=layer)
+                    style=style, text_style=text_style, layer=layer, layout=layout)
 
     @mcp.tool()
     @observed
@@ -695,12 +700,13 @@ def register(mcp, observed, post, file_for):
     def create_table(dashboard: str, position: list[float], cells: list[list[str]] | None = None,
                      rows: int | None = None, columns: int | None = None, row_height: float | None = None,
                      column_width: float | None = None, text_height: float | None = None,
-                     title: str | None = None, style: str | None = None, layer: str = "0") -> str:
+                     title: str | None = None, style: str | None = None, layer: str = "0",
+                 layout: str | None = None) -> str:
         """TABLE at position (top-left). cells = matrix of strings (row 0 is the title row
-        when `title` is given, row 1 the header in the default style)."""
+        when `title` is given, row 1 the header in the default style). layout: a paper-space layout name puts it on that sheet instead of model space."""
         return call("create_table", dashboard, position=position, cells=cells, rows=rows, columns=columns,
                     row_height=row_height, column_width=column_width, text_height=text_height, title=title,
-                    style=style, layer=layer)
+                    style=style, layer=layer, layout=layout)
 
     @mcp.tool()
     @observed
@@ -847,13 +853,14 @@ def register(mcp, observed, post, file_for):
     @observed
     def insert_block(dashboard: str, name: str, position: list[float], scale: float | list[float] = 1.0,
                      rotation_deg: float = 0.0, layer: str = "0", attributes: dict | None = None,
-                     source_file: str | None = None, source_block: str | None = None) -> str:
+                     source_file: str | None = None, source_block: str | None = None,
+                 layout: str | None = None) -> str:
         """INSERT a block reference; attributes {TAG: value} fills its attributes. If the
         block is not defined here, source_file (.dwg) imports it: the whole file as the
-        block, or just source_block from inside it."""
+        block, or just source_block from inside it. layout: a paper-space layout name puts it on that sheet instead of model space."""
         return call("insert_block", dashboard, name=name, position=position, scale=scale,
                     rotation_deg=rotation_deg, layer=layer, attributes=attributes,
-                    source_file=source_file, source_block=source_block)
+                    source_file=source_file, source_block=source_block, layout=layout)
 
     @mcp.tool()
     @observed
@@ -938,19 +945,49 @@ def register(mcp, observed, post, file_for):
     @mcp.tool()
     @observed
     def manage_layouts(dashboard: str, action: str = "list", name: str | None = None,
-                       new_name: str | None = None, set_current: bool = False) -> str:
-        """LAYOUT: list, create (name), set_current (name) or rename (name -> new_name)."""
-        return call("manage_layouts", dashboard, action=action, name=name, new_name=new_name, set_current=set_current)
+                       new_name: str | None = None, set_current: bool = False,
+                       source_file: str | None = None, source_layout: str | None = None) -> str:
+        """LAYOUT: list, create (name), set_current (name), rename (name -> new_name),
+        clone_from_template (name + source_file, a .dwg/.dwt, + source_layout: the page
+        setup and everything on that template layout -- title block, border, notes --
+        come across, its viewports do not; the reply's title_block is the handle of the
+        block to fill with set_block_attributes, and the first handle in created), or
+        delete (name; never Model or the current layout -- a person's tool, runs never
+        delete layouts)."""
+        return call("manage_layouts", dashboard, action=action, name=name, new_name=new_name, set_current=set_current,
+                    source_file=source_file, source_layout=source_layout)
 
     @mcp.tool()
     @observed
     def create_viewport(dashboard: str, layout: str, center: list[float], width: float, height: float,
                         view_center: list[float] | None = None, scale: float | None = None,
-                        view_height: float | None = None, locked: bool = True, layer: str = "0") -> str:
+                        view_height: float | None = None, locked: bool = True, layer: str = "0",
+                        twist_deg: float = 0.0, freeze_layers: list[str] | None = None,
+                        annotation_scale: str = "auto") -> str:
         """MVIEW: paper-space viewport in `layout` (center/width/height in paper units)
-        looking at model view_center at `scale` (paper/model, e.g. 0.02 for 1:50)."""
+        looking at model view_center (a model-space point, twist or not) at `scale`
+        (paper/model: 0.025 for 1" = 40'). twist_deg rotates the view (north up = 0).
+        freeze_layers are frozen in this viewport only (xref|layer names allowed; names
+        not in the drawing are reported, not errors). annotation_scale: "auto" gives the
+        viewport the annotation scale matching `scale` (created if missing) so annotative
+        labels show; a scale name to pick one; "none" to leave it. The reply carries the
+        model window and ring the viewport shows."""
         return call("create_viewport", dashboard, layout=layout, center=center, width=width, height=height,
-                    view_center=view_center, scale=scale, view_height=view_height, locked=locked, layer=layer)
+                    view_center=view_center, scale=scale, view_height=view_height, locked=locked, layer=layer,
+                    twist_deg=twist_deg, freeze_layers=freeze_layers, annotation_scale=annotation_scale)
+
+    @mcp.tool()
+    @observed
+    def set_viewport(dashboard: str, handle: str, on: bool | None = None, locked: bool | None = None,
+                     scale: float | None = None, view_center: list[float] | None = None,
+                     twist_deg: float | None = None, freeze_layers: list[str] | None = None,
+                     thaw_layers: list[str] | None = None, annotation_scale: str | None = None) -> str:
+        """Changes an existing paper-space viewport: on/off, lock, scale, model view
+        centre, twist, layers frozen or thawed in it, annotation scale. Blank fields are
+        left alone. Returns the model window it shows afterwards."""
+        return call("set_viewport", dashboard, handle=handle, on=on, locked=locked, scale=scale,
+                    view_center=view_center, twist_deg=twist_deg, freeze_layers=freeze_layers,
+                    thaw_layers=thaw_layers, annotation_scale=annotation_scale)
 
     @mcp.tool()
     @observed

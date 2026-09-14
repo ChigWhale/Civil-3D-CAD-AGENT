@@ -798,6 +798,12 @@ function handleEvent(event) {
     addLogEntry(lane, { tool: event.tool, _ts: event._ts, warning: event.message }, "warning");
     return;
   }
+  if (event.type === "run_checked") {
+    // The playbook's acceptance checks over what the run drew.
+    addLogEntry(lane, { tool: "checks", _ts: event._ts, warning: event.message },
+                event.ok ? "ok" : "warning");
+    return;
+  }
   if (event.type === "run_verified") {
     // The post-run check: the spatial index rebuilt and compared with the one
     // from before the run. A change outside the planned area is worth a look.

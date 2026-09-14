@@ -9,6 +9,7 @@ using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Geometry;
 
 using AcadEntity = Autodesk.AutoCAD.DatabaseServices.Entity;
+using SysException = System.Exception;
 
 namespace CADAgent
 {
@@ -37,6 +38,7 @@ namespace CADAgent
             Add("group_entities",         GroupEntities);
             Add("manage_layouts",         ManageLayouts, appThread: true);
             Add("create_viewport",        CreateViewport);
+            Add("set_viewport",           SetViewport);
             Add("zoom_view",              ZoomView, appThread: true);
             Add("save_drawing",           SaveDrawing, appThread: true);
         }
@@ -414,7 +416,7 @@ namespace CADAgent
                             if (!srcBt.Has(sourceBlock)) throw new ArgumentException($"'{source}' has no block named '{sourceBlock}'");
                             var ids = new ObjectIdCollection { srcBt[sourceBlock] };
                             var map = new IdMapping();
-                            db.WblockCloneObjects(ids, db.BlockTableId, map, DuplicateRecordCloning.Ignore, false);
+                            src.WblockCloneObjects(ids, db.BlockTableId, map, DuplicateRecordCloning.Ignore, false);
                             str.Commit();
                         }
                         bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
@@ -431,7 +433,7 @@ namespace CADAgent
             if (req["scale"] is JArray sc && sc.Count >= 2) br.ScaleFactors = new Scale3d(D(sc[0]), D(sc[1]), sc.Count > 2 ? D(sc[2]) : 1);
             else br.ScaleFactors = new Scale3d(D(req["scale"], 1));
             br.Rotation = Rad(req["rotation_deg"]);
-            ObjectId id = Append(tr, ModelSpace(tr, db), br, S(req["layer"], "0"));
+            ObjectId id = Append(tr, TargetSpace(tr, db, req), br, S(req["layer"], "0"));
             int attrs = AddAttributeReferences(tr, br, btr, req["attributes"] as JObject);
             return Created($"Block '{name}' inserted.", new[] { id }, new JObject { ["attributes_set"] = attrs, ["bounds"] = BoundsJson(br) });
         });
@@ -755,8 +757,82 @@ namespace CADAgent
                     lm.RenameLayout(old, nw);
                     return Ok($"Layout '{old}' renamed to '{nw}'.");
                 }
+                case "clone_from_template":
+                {
+                    // A sheet from the template: the page setup and everything drawn on
+                    // the template layout (title block, borders, notes) come across; the
+                    // template's viewports do not, the caller cuts its own.
+                    string name = S(req["name"]) ?? throw new ArgumentException("name is required");
+                    string source = S(req["source_file"]) ?? throw new ArgumentException("source_file (the .dwg/.dwt holding the template layout) is required");
+                    string sourceLayout = S(req["source_layout"]) ?? throw new ArgumentException("source_layout (the layout's name inside source_file) is required");
+                    if (lm.LayoutExists(name)) throw new ArgumentException($"layout '{name}' already exists");
+                    if (!File.Exists(source)) throw new FileNotFoundException($"source_file not found: {source}");
+
+                    ObjectId newId = lm.CreateLayout(name);
+                    var layout = (Layout)tr.GetObject(newId, OpenMode.ForWrite);
+                    var created = new List<ObjectId>();
+                    var blocks = new JArray();
+                    string titleBlock = null;
+                    bool titleHasAttrs = false;
+                    using (var src = new Database(false, true))
+                    {
+                        src.ReadDwgFile(source, FileOpenMode.OpenForReadAndAllShare, true, null);
+                        src.CloseInput(true);
+                        using (var str = src.TransactionManager.StartTransaction())
+                        {
+                            var srcDict = (DBDictionary)str.GetObject(src.LayoutDictionaryId, OpenMode.ForRead);
+                            if (!srcDict.Contains(sourceLayout)) throw new ArgumentException($"'{source}' has no layout named '{sourceLayout}'");
+                            var srcLayout = (Layout)str.GetObject(srcDict.GetAt(sourceLayout), OpenMode.ForRead);
+                            layout.CopyFrom(srcLayout);          // page setup: paper, device, style sheet, origin, rotation
+                            if (!layout.LayoutName.Equals(name, StringComparison.OrdinalIgnoreCase)) layout.LayoutName = name;
+
+                            var srcBtr = (BlockTableRecord)str.GetObject(srcLayout.BlockTableRecordId, OpenMode.ForRead);
+                            var ids = new ObjectIdCollection();
+                            foreach (ObjectId oid in srcBtr)
+                                if (!(str.GetObject(oid, OpenMode.ForRead) is Viewport)) ids.Add(oid);
+                            if (ids.Count > 0)
+                            {
+                                var map = new IdMapping();
+                                src.WblockCloneObjects(ids, layout.BlockTableRecordId, map, DuplicateRecordCloning.Ignore, false);
+                                foreach (IdPair pair in map)
+                                {
+                                    if (!pair.IsPrimary || !pair.IsCloned || pair.Value.IsNull) continue;
+                                    created.Add(pair.Value);
+                                    if (tr.GetObject(pair.Value, OpenMode.ForRead) is BlockReference br)
+                                    {
+                                        int attrs = 0;
+                                        try { attrs = br.AttributeCollection.Count; } catch { }
+                                        blocks.Add(new JObject { ["handle"] = br.Handle.ToString(), ["name"] = br.Name, ["attributes"] = attrs });
+                                        // the title block: the first block with attributes, else the first block
+                                        if (titleBlock == null || (attrs > 0 && !titleHasAttrs)) { titleBlock = br.Handle.ToString(); titleHasAttrs = attrs > 0; }
+                                    }
+                                }
+                            }
+                            str.Commit();
+                        }
+                    }
+                    if (titleBlock != null)
+                    {
+                        // "@0" in a sequence is the first handle this step created: make it the title block
+                        int at = created.FindIndex(i => i.Handle.ToString() == titleBlock);
+                        if (at > 0) { var tb = created[at]; created.RemoveAt(at); created.Insert(0, tb); }
+                    }
+                    if (B(req["set_current"])) lm.CurrentLayout = name;
+                    return Created($"Layout '{name}' cloned from '{sourceLayout}' in {Path.GetFileName(source)} ({created.Count} entities).",
+                                   created, new JObject { ["name"] = name, ["title_block"] = titleBlock, ["blocks"] = blocks,
+                                                          ["paper_size"] = new JArray(R(layout.PlotPaperSize.X), R(layout.PlotPaperSize.Y)) });
+                }
+                case "delete":
+                {
+                    string name = S(req["name"]) ?? throw new ArgumentException("name is required");
+                    if (!lm.LayoutExists(name)) throw new ArgumentException($"layout '{name}' does not exist");
+                    if (name.Equals("Model", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("Model cannot be deleted");
+                    if (name.Equals(lm.CurrentLayout, StringComparison.OrdinalIgnoreCase)) throw new ArgumentException($"'{name}' is the current layout; set another current first");
+                    lm.DeleteLayout(name);
+                    return Ok($"Layout '{name}' deleted.", new JObject { ["deleted"] = name });
+                }
                 default:
-                    throw new ArgumentException("action must be list, create, set_current or rename");
+                    throw new ArgumentException("action must be list, create, set_current, rename, clone_from_template or delete");
             }
         });
 
@@ -775,12 +851,146 @@ namespace CADAgent
             var vp = new Viewport { CenterPoint = center, Width = width, Height = height };
             ObjectId id = Append(tr, space, vp, S(req["layer"], "0"));
             vp.On = true;
-            if (req["view_center"] != null) { var vc = P3(req["view_center"]); vp.ViewCenter = new Point2d(vc.X, vc.Y); }
-            if (req["scale"] != null) vp.CustomScale = D(req["scale"]);           // paper : model, e.g. 0.02 = 1:50
+            if (req["scale"] != null) vp.CustomScale = D(req["scale"]);           // paper : model, e.g. 0.025 = 1" = 40'
             else if (req["view_height"] != null) vp.ViewHeight = D(req["view_height"]);
+            if (req["twist_deg"] != null) vp.TwistAngle = Rad(req["twist_deg"]);
+            if (req["view_center"] != null) SetViewCenter(vp, Flat(P3(req["view_center"])));
+            var frozen = LayersInViewport(tr, db, vp, req["freeze_layers"] as JArray, true);
+            string anno = null;
+            string want = S(req["annotation_scale"], "auto");
+            if (req["scale"] != null && want != "none" && want != "false")
+                anno = ApplyAnnotationScale(db, vp, want);
             vp.Locked = B(req["locked"], true);
-            return Created($"Viewport created in '{layoutName}'.", new[] { id }, new JObject { ["number"] = vp.Number });
+            var extra = ViewportWindow(vp);
+            extra["number"] = vp.Number;
+            extra["frozen"] = frozen.Item1;
+            extra["missing_layers"] = frozen.Item2;
+            extra["annotation_scale"] = anno;
+            return Created($"Viewport created in '{layoutName}'.", new[] { id }, extra);
         });
+
+        private static string SetViewport(JObject req, Document doc) => InTransaction(doc, (tr, db) =>
+        {
+            var id = Resolve(db, S(req["handle"]));
+            var vp = Open<Viewport>(tr, id, OpenMode.ForWrite);
+            bool locked = vp.Locked;
+            vp.Locked = false;
+            if (req["on"] != null) vp.On = B(req["on"]);
+            if (req["scale"] != null) vp.CustomScale = D(req["scale"]);
+            if (req["twist_deg"] != null) vp.TwistAngle = Rad(req["twist_deg"]);
+            if (req["view_center"] != null) SetViewCenter(vp, Flat(P3(req["view_center"])));
+            var frozen = LayersInViewport(tr, db, vp, req["freeze_layers"] as JArray, true);
+            var thawed = LayersInViewport(tr, db, vp, req["thaw_layers"] as JArray, false);
+            string anno = null;
+            if (req["annotation_scale"] != null) anno = ApplyAnnotationScale(db, vp, S(req["annotation_scale"]));
+            vp.Locked = req["locked"] != null ? B(req["locked"]) : locked;
+            var extra = ViewportWindow(vp);
+            extra["modified"] = new JArray(id.Handle.ToString());
+            extra["frozen"] = frozen.Item1; extra["thawed"] = thawed.Item1;
+            extra["missing_layers"] = new JArray(frozen.Item2.Concat(thawed.Item2));
+            if (anno != null) extra["annotation_scale"] = anno;
+            return Ok("Viewport updated.", extra);
+        });
+
+        // ── viewport geometry ─────────────────────────────────────────────────────
+        //
+        // ViewCenter lives in the viewport's own display coordinates (DCS): with a
+        // twist, or a view target away from the origin, it is not a model-space
+        // point. These two matrices are the bridge, the same one the snapshot
+        // reader uses, so what the planner asks for is what the reader reports.
+
+        public static Matrix3d Dcs2Wcs(Viewport vp) =>
+            Matrix3d.Rotation(-vp.TwistAngle, vp.ViewDirection, vp.ViewTarget)
+            * Matrix3d.Displacement(vp.ViewTarget - Point3d.Origin)
+            * Matrix3d.PlaneToWorld(vp.ViewDirection);
+
+        private static void SetViewCenter(Viewport vp, Point3d wcs)
+        {
+            var dcs = wcs.TransformBy(Dcs2Wcs(vp).Inverse());
+            vp.ViewCenter = new Point2d(dcs.X, dcs.Y);
+        }
+
+        /// <summary>The model-space window a viewport shows: its centre, the four
+        /// corners (twist applied, so a rotated sheet reports a rotated ring) and the
+        /// axis-aligned box around them.</summary>
+        public static JObject ViewportWindow(Viewport vp)
+        {
+            double aspect = vp.Height > 1e-9 ? vp.Width / vp.Height : 1.0;
+            double halfH = vp.ViewHeight / 2.0, halfW = halfH * aspect;
+            var vc = vp.ViewCenter;
+            var m = Dcs2Wcs(vp);
+            var corners = new[] { (-halfW, -halfH), (halfW, -halfH), (halfW, halfH), (-halfW, halfH) }
+                .Select(o => new Point3d(vc.X + o.Item1, vc.Y + o.Item2, 0).TransformBy(m)).ToArray();
+            var c = new Point3d(vc.X, vc.Y, 0).TransformBy(m);
+            double R4(double v) => Math.Round(v, 4);
+            return new JObject
+            {
+                ["scale"] = vp.CustomScale,
+                ["twist_deg"] = R4(Deg(vp.TwistAngle)),
+                ["model_center"] = new JArray(R4(c.X), R4(c.Y)),
+                ["model_window"] = new JArray(
+                    new JArray(R4(corners.Min(q => q.X)), R4(corners.Min(q => q.Y))),
+                    new JArray(R4(corners.Max(q => q.X)), R4(corners.Max(q => q.Y)))),
+                ["model_ring"] = new JArray(corners.Select(q => new JArray(R4(q.X), R4(q.Y)))),
+            };
+        }
+
+        /// <summary>Freezes (or thaws) the named layers in one viewport. Names that are
+        /// not layers of this drawing are reported back, never an error: an xref
+        /// layer list is allowed to be longer than what is attached.</summary>
+        private static Tuple<int, JArray> LayersInViewport(Transaction tr, Database db, Viewport vp, JArray names, bool freeze)
+        {
+            var missing = new JArray();
+            if (names == null || names.Count == 0) return Tuple.Create(0, missing);
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+            var ids = new ObjectIdCollection();
+            foreach (var n in names)
+            {
+                string name = n?.ToString();
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                if (lt.Has(name)) ids.Add(lt[name]); else missing.Add(name);
+            }
+            if (ids.Count > 0)
+            {
+                if (freeze) vp.FreezeLayersInViewport(ids.GetEnumerator());
+                else vp.ThawLayersInViewport(ids.GetEnumerator());
+            }
+            return Tuple.Create(ids.Count, missing);
+        }
+
+        /// <summary>Gives the viewport the annotation scale that matches its custom scale
+        /// (or the one named), so annotative labels and text show on the sheet. Creates
+        /// the scale (1" = 40') when the drawing has none for that ratio.</summary>
+        private static string ApplyAnnotationScale(Database db, Viewport vp, string want)
+        {
+            try
+            {
+                var occ = db.ObjectContextManager?.GetContextCollection("ACDB_ANNOTATIONSCALES");
+                if (occ == null) return null;
+                double target = vp.CustomScale;
+                bool byName = !string.IsNullOrWhiteSpace(want) && !want.Equals("auto", StringComparison.OrdinalIgnoreCase);
+                AnnotationScale found = null;
+                foreach (ObjectContext ctx in occ)
+                {
+                    if (!(ctx is AnnotationScale a)) continue;
+                    if (byName) { if (a.Name.Equals(want, StringComparison.OrdinalIgnoreCase)) { found = a; break; } }
+                    else if (a.DrawingUnits > 0 && Math.Abs(a.PaperUnits / a.DrawingUnits - target) <= Math.Abs(target) * 1e-6) { found = a; break; }
+                }
+                if (found == null)
+                {
+                    if (byName) throw new ArgumentException($"annotation scale '{want}' does not exist in this drawing");
+                    if (target <= 0) return null;
+                    double units = 1.0 / target;
+                    string name = Math.Abs(units - Math.Round(units)) < 1e-6 ? $"1\" = {Math.Round(units)}'" : $"1:{units:0.###}";
+                    found = new AnnotationScale { Name = name, PaperUnits = 1.0, DrawingUnits = units };
+                    occ.AddContext(found);
+                }
+                vp.AnnotationScale = found;
+                return found.Name;
+            }
+            catch (ArgumentException) { throw; }
+            catch (SysException ex) { return $"(not set: {ex.Message})"; }
+        }
 
         private static string ZoomView(JObject req, Document doc) => InTransaction(doc, (tr, db) =>
         {

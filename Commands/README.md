@@ -55,6 +55,26 @@ events and after every bridge write, returned in `X-Drawing-Revision`), the
 `CAD_SPATIAL_GATE=0` / `CAD_SPATIAL_VERIFY=0` switch the two halves off. The
 dashboard runner keeps its warning-only behaviour and adds a `run_verified` event.
 
+## What the model-space snapshot covers
+
+`GET /modelspace` (ModelSpaceCollector + CivilCoverage.cs) reads, without creating
+anything in the drawing: lines / arcs / polylines / circles / ellipses / splines /
+points / texts / dimensions / hatches / blocks; alignments with profiles; gravity
+pipe networks; **pressure networks** (pipes, fittings, appurtenances -- needs
+AeccPressurePipesMgd.dll); surfaces with their **border loops** (from the
+triangles, skipped above 400k triangles); corridors with **corridor feature lines**
+per baseline and code; feature lines; **parcels with loop segments**; **COGO points**
+and point groups; sample lines; catchments; gradings; intersections; survey
+figures; view frames; profile / section views; Civil 3D **labels**; and every
+**paper-space layout** with its viewports (model-space window each) and title texts.
+Optional API members are read by name (CivilCoverage) so a member missing on a
+release degrades to a missing field, never a failed snapshot.
+
+The spatial index (`spatial.py`) puts all of it in cells: linework and chains as
+segments, blocks / texts / labels / structures / fittings / appurtenances / COGO
+points / intersections as point pieces, parcel and surface loops as rings,
+viewports as rings tagged `viewport`, alignments as linework tagged `alignment`.
+
 ## Driving dashboards from the chat (the free worker)
 
 A dashboard run is the worker with no model in it: a sequence of blocks executed
@@ -92,6 +112,113 @@ and the attention queue (persisted to `dashboard/uploads/runs.json`), and the
 chat asks when the user asks. Server routes: `POST /dashboards/{id}/run` (with
 `policy`), `/resume`, `/stop`, `GET /dashboards/{id}/status`, `GET /status?since=`,
 `GET /wait?since=&timeout=`, `GET /attention`, `POST /attention/{id}/resolve`.
+
+## Naming layers from their words
+
+A layer name is read as `[xref|]D-MAJR-MINR[-MINR…][-FUTR]` against the abbreviation
+dictionary in `layer_words.json` (`layer_words.py`): the major's tag key is the
+**family** (`sswr` → `sanitary`), the minors' words are appended to make the **tag**
+(`C-SSWR-PIPE` → `sanitary_pipe`, `C-WATR-HYDR` → `water_hydrant`), and the discipline
+or a state token sets the piece's **state** (`V-` existing, `C-` proposed, `-FUTR`
+future, `DEMO` / `ABNDN` / `TEMP`). Unknown tokens are kept as themselves, so an
+unfamiliar layer still gets a stable name and is reported as *unverified*.
+Precedence: pad layers → hand rules in `layer_tags.json` (layer / block name) → an
+edited entry in `layer_tags.learned.json` → derivation → hand rules on entity type →
+the type → `other`. The first time a layer family is seen its derivation is written
+to `layer_tags.learned.json`; set `"edited": true` there (or use `edit_learned`) to
+override it. Every query word may be a full tag or a family (`water` = every
+`water_*`), and `find_entities`, checks (`state`, `other_state`) and the gate
+(`state`, `proposed_state` on each conflict) understand states.
+
+Tools: `list_tags` (precedence, families, dictionary and learned summaries, how the
+drawing's layers were named), `explain_layer(layer)`, `rename_word(abbr, word, kind,
+tag_key, glyph)` (edits the dictionary for every layer using that abbreviation),
+`edit_learned(family, tag, family_of, state, note)` (overrides one family),
+`define_tag(..., family)` (pins a hand rule). Both server processes reload the rules
+and the dictionary when the files change on disk.
+
+## Exemplars and playbooks (representation → generalization)
+
+A finished plan of one type (water, sanitary, street …) is exported as an
+**exemplar bundle** under `CAD_EXEMPLAR_DIR/<type>/<name>/` (outside the repo; it
+holds client geometry): `snapshot.json`, `base.json` and `delta.json` (the drawing
+split by the type's **base spec** `playbooks/<type>/base.json`, which people write:
+kept categories, xrefs, tags and kinds are the base, everything else the designer
+added), `index_finished/` and `index_base/` (site map, summary, `cells.jsonl` with one
+sentence and one card per cell), `diff.json` (base → finished, cell by cell),
+`relations.json` (per delta tag: feet, points, region share, station/offset/side per
+alignment, nearest base and delta tags, spacing) and `unmatched.json` (layers the
+vocabulary has no word for). `exemplars.py` is also a CLI (`export`, `export-json`,
+`brief`, `list`); `playbooks.py init <type>` writes a base spec template.
+
+| Tool | Does |
+|---|---|
+| `export_exemplar(dashboard, plan_type, name, notes, overwrite)` | reads the drawing and writes the bundle; lists delta layers to name with `define_tag` |
+| `list_exemplars(plan_type)` / `read_exemplar(plan_type, name, part)` | what is on disk; one part of a bundle |
+| `playbook_brief(plan_type, max_chars)` | bounded, coordinate-free digest of every bundle of a type + the output contract |
+| `save_playbook(plan_type, markdown, checks_json)` | validates and writes `playbooks/<type>/playbook.md` + `checks.json` |
+| `get_playbook` / `list_playbooks` | read back |
+| `check_drawing(dashboard, plan_type, checks_json, scope)` | evaluate checks now, whole drawing or the latest run's new handles |
+| `calibrate_checks(plan_type, checks_json)` | evaluate checks over every bundle's delta; a check the exemplars fail is a bad check |
+
+**Checks** (`checks.py`) are declarative, evaluated against the spatial index:
+`count`, `within`, `no_crossing`, `inside`, `exists_along`, `label_per`, `spacing`,
+`offset`; common fields `id, kind, tag, name, layer, scope (delta|all), severity
+(error|warn), why`. `run_on_dashboard(..., checks="water")` (or `POST /run` with
+`checks`) evaluates them after the run over what it created: results under the run's
+`checks`, a `run_checked` event, and an attention item of kind `checks` on failure.
+The run still finishes and nothing is undone.
+
+## Sheets (cutting layouts from model space)
+
+A plan type's `playbooks/<type>/sheets.json` says what a sheet of that type looks like
+(`sheets.py`): the template layout to clone (`template.file` + `template.layout`, the
+title block), where the viewport sits on the paper (`viewport`, inches), the scales allowed
+(feet per inch: 40 = 1" = 40'), `overlap`, `margin`, `max_sheets`, `twist_deg`,
+`layout_name` (`{type_code}-{n:02d}`), what the sheets are about (`subject.tags`, default the
+base spec's delta tags), what stays visible in the viewport (`visible.tags` / `layers` /
+`xrefs`; everything else is frozen per viewport; `hidden` wins), the title-block attributes to
+fill, the `furniture` (blocks or mtext with an `anchor` -- `sheet` = paper point, `viewport` =
+offset from a `corner` -- a `rotation` (`north` follows the twist) and a `when`: `always`,
+`first_sheet`, `last_sheet`, `{tag_present}` or a checks.py check with `include_if`), and
+`tables` (rows = a tag's entities on that sheet with station/offset along the alignment).
+
+The planner (`sheets.plan_windows`) finds the extent of the subject in the spatial index
+(the drawing's main cluster when the subject names nothing), picks the first scale whose
+grid needs at most `max_sheets`, tiles the extent with overlapping windows the viewport
+shows at that scale, drops windows that hold none of the subject, and numbers the rest
+in page order (rows from the top, columns west to east). `sheet_payloads` turns each into
+ONE plugin `sequence`: `manage_layouts clone_from_template` (or `create`) →
+`create_viewport` (view centre, scale, twist, `freeze_layers`, annotation scale) →
+`set_block_attributes` on `@0` (the title block leads the clone's `created` list) →
+`insert_block` / `draw_mtext` / `create_table` with `layout`. A sheet exists whole or not
+at all.
+
+C# side: `TargetSpace(tr, db, req)` lets `insert_block`, `draw_text`, `draw_mtext`,
+`draw_leader`, `create_table`, `draw_polyline` and `draw_rectangle` take a `layout`;
+`manage_layouts` gained `clone_from_template` (page setup via `CopyFrom`, entities via
+`WblockCloneObjects`, template viewports skipped) and `delete`; `create_viewport` gained
+`twist_deg`, `freeze_layers`, `annotation_scale` and replies with the model window/ring;
+`set_viewport` edits one. ViewCenter lives in the viewport's DCS, so `Dcs2Wcs` (twist,
+target) is used both to set it and to read it back -- the snapshot's `layouts[].viewports[]`
+now carry `model_ring` (twisted), `frozen_layers` (names), `locked`, `annotation_scale`, and
+every layout lists its `blocks` (position, rotation, attributes) and `tables`.
+
+Runtime: the `cut_sheets` block (dashboard palette, expanded at run time like driveways)
+and the chat tools `get_sheet_spec` / `save_sheet_spec` / `plan_sheets` (dry run, in words)
+/ `cut_sheets` (runs it on the dashboard) / `list_sheets`. The gate ignores viewport
+frames (`spatial.conflicts`), the verifier expects them (`create_viewport` in
+`_payload_pieces`), the index keeps `windows`, and two check kinds read them: `covered`
+(every subject probe inside an on viewport) and `sheet_has` (a block / table / text on
+every layout, from the snapshot). Exemplar bundles gain `sheets.json`
+(`sheets.sheet_stats`: scales, viewport rectangles, overlap, margin, frozen sets,
+furniture) and the brief a "Sheets in the exemplars" section; `get_sheet_spec` on a type
+with no spec suggests one from those numbers.
+
+Not done: match lines between adjacent sheets, Civil 3D pipe/structure tables, Sheet Set
+Manager (layouts are named predictably for it), an along-alignment window strategy for
+plan-and-profile sets. Untested against Civil 3D so far: `clone_from_template` on a real
+.dwt, `FreezeLayersInViewport`, annotation-scale creation.
 
 ## Sequences
 
@@ -186,39 +313,63 @@ the kind tag `label_grading` wrote (an untagged spot elevation whose anchor is w
 `curb_tolerance` of `curb_layer` counts as a curb label; `mode` forces one treatment):
 
 * **position** — `lot_row`, `lot_setback`, `swale_meet`, `swale_high`, `lot_corner`: dragged
-  clear of linework and of each other by greedy candidate placement with local-search
-  repair, scored on a raster occupancy grid (below).
+  clear of linework, of each other and of each other's leaders by greedy candidate
+  placement with local-search repair, scored on a raster occupancy grid (below).
 * **align** — `curb_transition`, `drive_curb`: rotated to the back of curb's tangent at the
-  anchor (folded so text reads left to right) and otherwise left where they are. Done
-  first, so their rotated boxes are obstacles for the positioned labels.
+  anchor (folded so text reads left to right) and, when the style then puts the text on
+  the road side, flipped in place so it sits on the outside of the curb — never dragged.
+  Outside is the side toward the label's pad (the tagged one, else the nearest on
+  `pad_layers` within `side_reach`, 80 ft), else away from a `centreline_layer`
+  (`c-rway-center`) line within `centreline_reach` (40 ft: a road's own centreline is
+  close, a rear easement's 100 ft off is not this curb's), else toward `row_layer`
+  (`c-rway-line`) within `side_reach`; a reference that lies within 15° of the curb
+  tangent is ignored. Rotations are normalised to [0, 2π) before they are set: Civil 3D
+  silently ignores a negative `RotationAngle`. The flip is Civil 3D's own label
+  flip (`AllowsFlipping` / `Flipped`), else a 180° rotation when the style is plan
+  readable and does not flip anchors with the text; a label that can do neither is
+  reported as a problem and left rotated. `curb_side: keep` rotates only. `curb_layer`
+  may be one suffix or a list. Done first, so their rotated geometry is what the
+  positioned labels keep clear of.
 * `pad_fp`, `drive_slope`, `swale_slope` and untagged slope labels are outside the spec and
   listed as skipped unless `include_other`. `kinds` limits a run to the tags named.
 
 1. Linework within reach of the labels (model space and xrefs; every visible layer unless
    `obstacle_layers` / `ignore_layers` say otherwise; surfaces, corridors, hatches and
-   views are never obstacles) is rasterised into cells about half a text height across,
-   dilated by `clearance`. Text, mtext and mleaders go into a second "label" grid as whole
-   boxes; labels that are not being moved contribute their text block only (a dragged
-   label's leader and a two-point slope label's line are not obstacles).
+   views are never obstacles) is rasterised into cells about a quarter of a text height across,
+   dilated by `clearance`. Text and mtext go into a second "label" plane as whole boxes.
+   Labels and mleaders that are not being moved are exploded and stamped from what they
+   really draw: text, borders and markers into the label plane, leaders and slope arrow
+   lines into a third "leader" plane (a label that will not explode falls back to an
+   estimated text block and a straight leader; the count is in `grid.fixed_fallback`).
 2. Each label is tried undragged and dragged in each of 8 directions (`directions`, in
    preference order) at `leader_lengths` (default 1, 2, 3, 4.5 text heights). Every candidate
    is measured by applying the offset and reading the label's extents back, so the text
-   box is what Civil 3D actually draws.
+   box is what Civil 3D actually draws. Its leader is modelled as a straight segment from
+   the anchor to the middle of the text's nearer vertical side.
 3. Cost = `line` × linework cells under the text + `label` × other-label cells under the
-   text + `leader` × linework cells under the leader + `length` × leader length in text
-   heights + `direction` × preference rank − `stay` when it is the current position
-   (`weights`, defaults 10 / 25 / 1 / 1 / 0.5 / 2).
+   text + `leader_label` × (leader cells under the text + other-label cells along the
+   leader) + `leader_leader` × leader cells along the leader + `leader` × linework cells
+   under the leader + `length` × leader length in text heights + `direction` × preference
+   rank − `stay` when it is the current position (`weights`, defaults
+   10 / 25 / 25 / 10 / 1 / 1 / 0.5 / 2). `label_gap` (ft, default 0) grows the text box
+   when counting, so placed labels keep that much from other text and leaders.
 4. Labels are placed most-constrained first (fewest clean candidates), each taking its
-   cheapest candidate given the grid so far; then up to `max_passes` repair passes revisit
-   every label that still overlaps and move it when a cheaper spot has opened up.
+   cheapest candidate given the grid so far and stamping its text box and leader; then up
+   to `max_passes` repair passes revisit every label that still overlaps anything and move
+   it when a cheaper spot has opened up.
 
 Selection: `handles`, or `types` (`elevation` / `slope` / `surface` / `all`) + `layer`
 suffix + `window`. Labels already dragged or pinned stay put and count as obstacles unless
-`include_dragged` / `include_pinned`. Compute rolls every temporary measurement back;
-draw applies all offsets in one transaction. The report lists, per label, the chosen
-offset (or undragged), its text box, `line_hits`, `label_hits`, `cost`, `moved` and
-`clean`, plus grid statistics, so a label that could not be cleared is visible rather
-than hidden. Deterministic.
+`include_dragged` / `include_pinned` (counts per kind in `skipped_dragged_by_kind` /
+`skipped_pinned_by_kind`). Compute rolls every temporary measurement, rotation and flip
+back; draw applies everything in one transaction. The report lists, per positioned label,
+the chosen offset (or undragged), its text box, `line_hits`, `label_hits`,
+`leader_label_hits`, `leader_cross_hits`, `cost`, `moved` and `clean`; per aligned label
+`rotation_deg`, `curb_distance`, `side` (outside / inside / centred / unknown),
+`side_method` (already / flipped / rotated_180 / none), `outward_ref` and `outward_detail`
+(what each reference measured); plus grid
+statistics, so a label that could not be cleared is visible rather than hidden.
+Deterministic.
 
 ## Known limits
 

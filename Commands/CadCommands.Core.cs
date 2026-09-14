@@ -326,6 +326,20 @@ namespace CADAgent
                                                   forWrite ? OpenMode.ForWrite : OpenMode.ForRead);
         }
 
+        /// <summary>Where a drawing intent appends: model space unless the request names a
+        /// paper-space layout in "layout" (sheet furniture: title-block fill, north arrows,
+        /// notes, tables). Only the intents that call this can write to a sheet.</summary>
+        public static BlockTableRecord TargetSpace(Transaction tr, Database db, JObject req)
+        {
+            string layoutName = S(req["layout"]);
+            if (string.IsNullOrWhiteSpace(layoutName)) return ModelSpace(tr, db);
+            var ld = (DBDictionary)tr.GetObject(db.LayoutDictionaryId, OpenMode.ForRead);
+            if (!ld.Contains(layoutName)) throw new ArgumentException($"layout '{layoutName}' does not exist (see manage_layouts list)");
+            var layout = (Layout)tr.GetObject(ld.GetAt(layoutName), OpenMode.ForRead);
+            if (layout.ModelType) throw new ArgumentException("layout must name a paper space layout, not Model (leave it out for model space)");
+            return (BlockTableRecord)tr.GetObject(layout.BlockTableRecordId, OpenMode.ForWrite);
+        }
+
         /// <summary>The block table record an entity lives in (model space, a layout, or a block definition), opened for write.</summary>
         public static BlockTableRecord OwnerSpace(Transaction tr, AcadEntity entity) =>
             (BlockTableRecord)tr.GetObject(entity.OwnerId, OpenMode.ForWrite);

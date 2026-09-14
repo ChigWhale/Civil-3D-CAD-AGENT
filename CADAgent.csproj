@@ -50,6 +50,13 @@
       <Private>False</Private>
     </Reference>
 
+    <!-- Pressure networks (water): PressurePipeNetwork, PressurePipe, fittings, appurtenances
+         and the CivilDocument.GetPressurePipeNetworkIds extension live in their own assembly -->
+    <Reference Include="AeccPressurePipesMgd">
+      <HintPath>$(Civil3DPath)\AeccPressurePipesMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
     <!-- AEC base types required by Civil3D objects (Entity, Handle, etc.) -->
     <Reference Include="AecBaseMgd">
       <HintPath>$(AutoCADPath)\ACA\AecBaseMgd.dll</HintPath>
@@ -63,6 +70,12 @@
     <None Remove="PipeInvertSetter\**" />
     <Compile Remove="PipeInvertSetter.Tests\**" />
     <None Remove="PipeInvertSetter.Tests\**" />
+    <Compile Remove="ReeseOclock\**" />
+    <None Remove="ReeseOclock\**" />
+    <EmbeddedResource Remove="ReeseOclock\**" />
+    <Compile Remove="Gambol\**" />
+    <None Remove="Gambol\**" />
+    <EmbeddedResource Remove="Gambol\**" />
   </ItemGroup>
 
   <!-- Pipe elevation solver (ICadObjectHandler) exposed through /handler -->

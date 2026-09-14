@@ -121,7 +121,15 @@ def fetch_snapshot(file, layers=None, base=None) -> tuple:
             if isinstance(nested, dict) and "error" not in nested:
                 for category in ("polylines", "lines", "arcs"):
                     if nested.get(category):
-                        data[category] = list(data.get(category) or []) + nested[category]
+                        # Stamp provenance: an xref-dependent layer reads "xref|layer",
+                        # so the exemplar split can tell base material (the xrefs) from
+                        # what was drawn in this drawing.
+                        stamped = []
+                        for e in nested[category]:
+                            layer = str(e.get("layer") or "")
+                            stamped.append({**e, "source": "nested",
+                                            "xref": layer.split("|", 1)[0] if "|" in layer else ""})
+                        data[category] = list(data.get(category) or []) + stamped
         except (requests.exceptions.RequestException, ValueError):
             pass    # older plugin without /nested: model space alone
     return data, rev
@@ -142,6 +150,13 @@ def _fingerprint(data: dict) -> str:
 
 def get(file, layers=None, base=None, force=False) -> Entry:
     """The current index for a drawing, built only when needed."""
+    # An edit to the rules or the word dictionary made through the other server
+    # process must reach this one: reload when the files moved, which bumps the
+    # vocabulary version and so retires every cached index below.
+    try:
+        spatial.TAGS.refresh_if_changed()
+    except Exception:
+        pass
     layers = list(layers) if layers is not None else spatial.merge_layers()
     key = drawing_key(file)
     want_layers = tuple(sorted(set(l.lower() for l in layers)))

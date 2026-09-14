@@ -37,7 +37,10 @@ except ImportError:  # pragma: no cover - depends only on how the app was starte
 
 # Shared with the MCP tool of the same name, so both draw identical geometry.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import checks as checks_mod
 import driveways
+import playbooks
+import sheets
 import spatial
 import spatial_cache
 import swales
@@ -253,7 +256,7 @@ _signal = asyncio.Event()
 
 class Run:
     def __init__(self, dashboard_id: str, file: str, commands: list, policy: dict,
-                 label: str = "", source: str = "browser"):
+                 label: str = "", source: str = "browser", checks_spec: dict | None = None):
         global _run_counter
         _run_counter += 1
         self.id = f"{dashboard_id}-{_run_counter}"
@@ -263,6 +266,8 @@ class Run:
         self.policy = policy
         self.label = label
         self.source = source
+        self.checks_spec = checks_spec     # {"plan_type": str, "checks": [...]} or None
+        self.checks: dict | None = None    # results after the run
         self.status = "queued"          # queued | checking | paused | running | finished | failed | stopped
         self.total = len(commands)
         self.done = 0
@@ -302,6 +307,8 @@ class Run:
             "verification": self.verification,
             "results": len(self.results),
             "last_result": (self.results[-1]["result"][:300] if self.results else None),
+            "checks_plan": (self.checks_spec or {}).get("plan_type"),
+            "checks": self.checks,
             "error": self.error,
             "decisions": self.decisions[-5:],
             "created": self.created, "started": self.started, "finished": self.finished,
@@ -409,7 +416,7 @@ async def list_alignment_names(dashboard_id: str):
 # Bumped whenever the server or its static files change in a way a running
 # instance cannot pick up. cad_mcp_server.py probes /version on startup and
 # treats a server that doesn't answer with this value as stale.
-DASHBOARD_VERSION = "2026-09-10.3"
+DASHBOARD_VERSION = "2026-09-14.2"
 
 
 @app.get("/version")
@@ -433,6 +440,8 @@ async def _expand(payload: dict, file: str, dashboard_id: str = None) -> list:
     space when it reaches one and expands it in place, keeping the block id on
     every payload so the browser still highlights the block it came from."""
     expander = payload.get("expander")
+    if expander == "sheets":
+        return await _expand_sheets(payload, file)
     planners = {"driveways": driveways.plan, "swales": swales.plan}
     if expander not in planners:
         raise RuntimeError(f"Unknown expanding block '{expander}'.")
@@ -492,6 +501,38 @@ async def _expand(payload: dict, file: str, dashboard_id: str = None) -> list:
     return [{**p, "_block": block_id, "_expanded": True} for p in built]
 
 
+async def _expand_sheets(payload: dict, file: str) -> list:
+    """The cut_sheets block: the plan type's sheet spec, the drawing's index,
+    then one sequence per sheet (see sheets.py). The plan itself is kept on
+    every payload as _sheet so the browser and the verifier can name sheets."""
+    params = payload.get("params") or {}
+    plan_type = str(params.get("plan_type") or "").strip()
+    if not plan_type:
+        raise RuntimeError("cut_sheets needs a plan_type (a type under playbooks/ with a sheets.json).")
+    try:
+        spec = sheets.load_spec(plan_type)
+    except (sheets.SheetError, playbooks.PlaybookError) as e:
+        raise RuntimeError(str(e))
+    try:
+        entry = await asyncio.to_thread(spatial_cache.get, file, None, PLUGIN_BASE)
+    except spatial_cache.PluginError as e:
+        raise RuntimeError(str(e))
+    scale = params.get("scale")
+    max_sheets = params.get("max_sheets")
+    twist = params.get("twist_deg")
+    try:
+        plan, built = sheets.plan_and_payloads(
+            entry.index, entry.data, spec, plan_type,
+            scale=float(scale) if scale not in (None, "", 0) else None,
+            max_sheets=int(float(max_sheets)) if max_sheets not in (None, "", 0) else None,
+            twist_deg=float(twist) if twist not in (None, "") else None,
+            drawing=file, title=str(params.get("title") or ""))
+    except sheets.SheetError as e:
+        raise RuntimeError(str(e))
+    block_id = payload.get("_block")
+    return [{**p, "_block": block_id, "_expanded": True} for p in built]
+
+
 async def _warn_conflicts(dashboard_id: str, tool: str, index, payloads: list) -> list:
     """The dry-run gate for a run: every payload's proposed geometry checked
     against the cached index. On the dashboard this is a warning, not a
@@ -535,7 +576,14 @@ def _plugin_failure(response) -> str | None:
     if body.get("error"):
         return str(body["error"])
     if body.get("ok") is False:
-        return str(body.get("message") or "the plugin reported a failure")
+        message = str(body.get("message") or "the plugin reported a failure")
+        # a failed sequence names the step; its own message says why
+        step = body.get("failed_step")
+        results = body.get("results")
+        if isinstance(step, int) and isinstance(results, list) and 0 <= step < len(results) \
+                and isinstance(results[step], dict) and results[step].get("message"):
+            message += f" Step {step}: {results[step]['message']}"
+        return message
     return None
 
 
@@ -558,6 +606,9 @@ async def _run_sequence(run: "Run") -> None:
                 resolved.append(payload)
         commands = resolved
         run.total = len(commands)
+        # A sheet cut draws nothing in model space, so its acceptance checks
+        # judge the whole drawing rather than "what the run created".
+        run.sheet_cut = bool(commands) and all(isinstance(p, dict) and "_sheet" in p for p in commands)
 
         # The index from before the run: the gate for every payload, expanded
         # or hand-built, and the "before" half of the post-run check. Built
@@ -598,7 +649,7 @@ async def _run_sequence(run: "Run") -> None:
                               "args": {"step": f"{index}/{len(commands)}"},
                               "_ts": started})
 
-            body = {k: v for k, v in payload.items() if k not in ("_block", "_expanded")}
+            body = {k: v for k, v in payload.items() if not str(k).startswith("_")}
             body["file"] = file
             timeout = LONG_PLUGIN_TIMEOUT if tool in LONG_INTENTS else PLUGIN_TIMEOUT
 
@@ -651,10 +702,13 @@ async def _run_sequence(run: "Run") -> None:
     finally:
         # Verify first, then announce the outcome: a client woken by
         # run_finished must find the verification already on the record.
+        after = None
         if completed and writes:
             run.status = "verifying"
             _touch(run)
-            await _verify_run(run, before, writes)
+            after = await _verify_run(run, before, writes)
+        if run.checks_spec:
+            await _check_run(run, after)
         run.status = outcome
         run.finished = time.time()
         _touch(run)
@@ -750,13 +804,13 @@ async def _pause_for_decision(run: "Run", conflicts: list) -> None:
     _resolve_attention(item["id"], run.decisions[-1]["reason"] if run.decisions else "resumed")
 
 
-async def _verify_run(run: "Run", before, payloads: list) -> None:
+async def _verify_run(run: "Run", before, payloads: list):
     """After a run: rebuild the index and say what changed, in the words the
     run was planned in, flagging any changed cell outside the area the
-    payloads should have touched."""
+    payloads should have touched. Returns the rebuilt index (or None)."""
     spatial_cache.invalidate(run.file)
     if before is None:
-        return
+        return None
     try:
         after = (await asyncio.to_thread(spatial_cache.get, run.file, None, PLUGIN_BASE)).index
         report = before.verify(after, payloads)
@@ -764,7 +818,7 @@ async def _verify_run(run: "Run", before, payloads: list) -> None:
         run.warnings.append(f"post-run check skipped: {e}")
         await _broadcast({"type": "run_warning", "dashboard": run.dashboard, "tool": "verify",
                           "message": f"post-run check skipped: {e}", "_ts": time.time()})
-        return
+        return None
     n_new, n_gone = len(report["new_handles"]), len(report["removed_handles"])
     message = (f"{report['changed_cells']} cell(s) changed, {n_new} new object(s), {n_gone} removed"
                + ("" if report["ok"] else
@@ -781,6 +835,69 @@ async def _verify_run(run: "Run", before, payloads: list) -> None:
     if not report["ok"]:
         await _attend(run, "unexpected", message,
                       {"unexpected": report["unexpected"][:12], "new_handles": report["new_handles"][:200]})
+    return after
+
+
+async def _check_run(run: "Run", after) -> None:
+    """Acceptance checks from the run's playbook, over what the run created
+    (the verification's new handles) or the whole drawing when there is no
+    verification. Failures never change the run's outcome: they land on the
+    record, in a run_checked event, and on the attention queue."""
+    spec = run.checks_spec or {}
+    try:
+        if after is None:
+            spatial_cache.invalidate(run.file)
+            after = (await asyncio.to_thread(spatial_cache.get, run.file, None, PLUGIN_BASE)).index
+        scope = None
+        note = "scope: whole drawing (no verification for this run)"
+        if getattr(run, "sheet_cut", False):
+            note = "scope: whole drawing (a sheet cut draws nothing in model space)"
+        elif run.verification and run.verification.get("new_handles") is not None:
+            scope = set(run.verification.get("new_handles") or [])
+            note = f"scope: the {len(scope)} handle(s) this run created"
+        entry = spatial_cache.peek(run.file)
+        data = entry.data if entry is not None else None      # the snapshot, for sheet_has
+        results = await asyncio.to_thread(checks_mod.evaluate, after, spec.get("checks") or [], scope, data)
+        summary = checks_mod.summarize(results)
+        run.checks = {"plan_type": spec.get("plan_type"), **summary, "note": note, "results": results[:50]}
+    except Exception as e:
+        run.warnings.append(f"acceptance checks skipped: {e}")
+        await _broadcast({"type": "run_warning", "dashboard": run.dashboard, "tool": "checks",
+                          "message": f"acceptance checks skipped: {e}", "_ts": time.time()})
+        return
+    _touch(run)
+    await _broadcast({"type": "run_checked", "dashboard": run.dashboard, "run": run.id,
+                      "ok": run.checks["ok"], "message": run.checks["message"],
+                      "failed": run.checks["failed_ids"], "warned": run.checks["warned_ids"], "_ts": time.time()})
+    if not run.checks["ok"]:
+        failed = [r for r in results if not r["ok"] and r["severity"] == "error"]
+        await _attend(run, "checks", f"{spec.get('plan_type')} checks: {run.checks['message']}",
+                      {"plan_type": spec.get("plan_type"),
+                       "failed": [{k: r[k] for k in ("id", "kind", "tag", "expected", "actual", "offenders", "why")}
+                                  for r in failed][:20]})
+
+
+def _checks_of(raw) -> dict | None:
+    """The run's acceptance checks: a plan type (its saved checks.json), an
+    inline list, or {plan_type, checks} with inline checks overriding the file."""
+    if raw in (None, "", [], {}):
+        return None
+    if isinstance(raw, str):
+        return {"plan_type": raw.strip(), "checks": playbooks.load_checks(raw.strip())}
+    if isinstance(raw, list):
+        check_list = raw
+        plan_type = "inline"
+    elif isinstance(raw, dict):
+        plan_type = str(raw.get("plan_type") or "inline")
+        check_list = raw.get("checks")
+        if check_list is None:
+            check_list = playbooks.load_checks(plan_type)
+    else:
+        raise ValueError("checks must be a plan type, a list of checks, or {plan_type, checks}")
+    errors = checks_mod.validate(check_list)
+    if errors:
+        raise ValueError("checks did not validate: " + "; ".join(errors[:8]))
+    return {"plan_type": plan_type, "checks": check_list}
 
 
 def _conflict_summary(conflicts: list) -> dict:
@@ -837,16 +954,19 @@ async def run_script(dashboard_id: str, request: Request):
         else:
             commands = blocks.parse_script(body.get("script", ""))
         policy = _policy_of(body.get("policy"))
-    except ValueError as e:
+        checks_spec = _checks_of(body.get("checks"))
+    except (ValueError, playbooks.PlaybookError) as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
     run = Run(dashboard_id, d["file"], commands, policy,
               label=str(body.get("label") or "").strip()[:80],
-              source=str(body.get("source") or "browser").strip()[:20])
+              source=str(body.get("source") or "browser").strip()[:20],
+              checks_spec=checks_spec)
     _runs[dashboard_id] = run
     run.task = asyncio.create_task(_run_sequence(run))
     _touch(run)
-    return {"queued": len(commands), "run": run.id, "policy": policy}
+    return {"queued": len(commands), "run": run.id, "policy": policy,
+            "checks": checks_spec["plan_type"] if checks_spec else None}
 
 
 @app.get("/dashboards/{dashboard_id}/status")
@@ -928,7 +1048,9 @@ def _digest(since: int | None = None, dashboard_id: str | None = None, limit: in
 
 @app.get("/status")
 async def status_all(since: int = -1, dashboard: str | None = None):
-    return _digest(None if since < 0 else since, dashboard)
+    """since=-1 (the default) returns the whole recent history; a cursor from
+    an earlier answer returns only what happened after it."""
+    return _digest(since, dashboard)
 
 
 @app.get("/wait")
@@ -943,7 +1065,7 @@ async def wait_for_attention(since: int = -1, timeout: float = 40.0, dashboard: 
         hits = [e for e in _history if e.get("seq", 0) > since and e.get("type") in _ATTENTION_EVENTS
                 and (dashboard is None or e.get("dashboard") == dashboard)]
         if hits or time.time() >= deadline:
-            out = _digest(None if since < 0 else since, dashboard)
+            out = _digest(since, dashboard)
             out["woke"] = [{"type": e["type"], "dashboard": e.get("dashboard"),
                             "message": e.get("message") or e.get("error")} for e in hits[-10:]]
             out["timed_out"] = not hits
@@ -952,6 +1074,21 @@ async def wait_for_attention(since: int = -1, timeout: float = 40.0, dashboard: 
             await asyncio.wait_for(_signal.wait(), timeout=max(0.05, deadline - time.time()))
         except asyncio.TimeoutError:
             pass
+
+
+@app.post("/_test/playbooks_dir")
+async def set_playbooks_dir(request: Request):
+    """Test hook: point playbook lookups at a temporary folder so an end-to-end
+    test never writes into the repo's playbooks/. Only honoured when the server
+    is aimed at a stub plugin (CAD_PLUGIN_BASE set), never in normal use."""
+    if not os.environ.get("CAD_PLUGIN_BASE"):
+        return JSONResponse({"error": "test hooks are disabled"}, status_code=403)
+    body = await request.json()
+    path = str((body or {}).get("path") or "").strip()
+    if not path or not os.path.isdir(path):
+        return JSONResponse({"error": "path must be an existing folder"}, status_code=400)
+    playbooks.PLAYBOOKS_DIR = path
+    return {"ok": True, "playbooks_dir": path}
 
 
 @app.get("/attention")
