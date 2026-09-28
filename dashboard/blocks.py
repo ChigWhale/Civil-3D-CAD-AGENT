@@ -447,6 +447,113 @@ BLOCK_SPECS = [
              "help": "Fills {title} in the title block and furniture."},
         ],
     },
+    {
+        "type": "lay_pressure_run",
+        "label": "Lay Pressure Run",
+        "group": "Generated",
+        "description": ("Real Civil 3D pressure network parts (water): pipes along the "
+                        "alignment offset to one side between two stations, bend fittings "
+                        "at the vertices, hydrants every so many feet. Uses the drawing's "
+                        "pressure parts list; one all-or-nothing transaction. Reads the "
+                        "drawing when it runs."),
+        "expand": "pressure_run",   # reads the live drawing; see _expand in server.py
+        "fields": [
+            {"name": "alignment", "label": "Alignment", "type": "text", "default": "",
+             "help": "Alignment name (blank when the drawing has one)."},
+            {"name": "offset", "label": "Offset (ft)", "type": "number", "default": 10},
+            {"name": "side", "label": "Side", "type": "choice", "default": "right", "options": ["right", "left"],
+             "help": "Looking up-station."},
+            {"name": "from_station", "label": "From station", "type": "number", "optional": True},
+            {"name": "to_station", "label": "To station", "type": "number", "optional": True},
+            {"name": "pipe_size", "label": "Pipe size", "type": "text", "default": "",
+             "help": "A description substring or nominal diameter from list_pressure_parts (blank = the only pipe)."},
+            {"name": "hydrant_every", "label": "Hydrant spacing (ft)", "type": "number", "default": 0,
+             "help": "0 = no hydrants."},
+            {"name": "hydrant_part", "label": "Hydrant part", "type": "text", "default": "Hydrant"},
+            {"name": "network", "label": "Network", "type": "text", "default": "",
+             "help": "Existing pressure network name, or a new one to create."},
+            {"name": "parts_list", "label": "Parts list", "type": "text", "default": ""},
+            {"name": "layer", "label": "Layer", "type": "text", "default": ""},
+        ],
+    },
+    {
+        "type": "draw_profile_views",
+        "label": "Draw Profile Views",
+        "group": "Generated",
+        "description": ("Sanitary sewer profile views, one per 1000 ft of each alignment from "
+                        "1+00 (split to 500 ft where 36/40 ft of elevation cannot hold it): "
+                        "restations to 1+00, samples the EG surface, adds the network's pipes "
+                        "and manholes, labels pipes, manholes and every 1+00 station, and "
+                        "places the views east of the drawing. One all-or-nothing transaction. "
+                        "Reads the drawing and playbooks/<type>/sheets.json when it runs."),
+        "expand": "profile_views",   # reads the live drawing; see _expand in server.py
+        "fields": [
+            {"name": "plan_type", "label": "Plan type", "type": "text", "default": "sanitary",
+             "help": "A type under playbooks/ whose sheets.json has a profile section (see get_sheet_spec)."},
+            {"name": "alignment", "label": "Alignments", "type": "multichoice",
+             "options_from": "alignments", "default": [],
+             "help": "Select none to draw views for every alignment in the drawing."},
+            {"name": "span", "label": "Elevation span (ft)", "type": "choice", "default": "40", "options": ["40", "36"]},
+            {"name": "station_host", "label": "Station labels on", "type": "choice", "default": "flowline",
+             "options": ["flowline", "eg"],
+             "help": "flowline: a profile through the pipe inverts carries the 1+00 labels; eg: the surface profile does."},
+            {"name": "surface", "label": "EG surface", "type": "text", "optional": True,
+             "help": "Blank: the surface named like EG, or the only one."},
+            {"name": "structure_label", "label": "MH label style", "type": "text", "optional": True,
+             "help": "Structure profile label style for every manhole (blank = drawing default)."},
+        ],
+    },
+    {
+        "type": "create_sanitary_profile",
+        "label": "Create Sanitary Profile",
+        "group": "Generated",
+        "description": ("The whole sanitary profile production in a set order: 1. draw JUST the "
+                        "profile views (no labels, no blocks), alphabetical by alignment, an "
+                        "alignment that fails is skipped and the rest drawn; 2. arrange them two "
+                        "to a sheet, centred, and cut the sheets from the template with the "
+                        "border and one full-sheet viewport; 3. LAST, the labels and the "
+                        "dimension line: pipe and 1+00 station labels anchored to the bottom of "
+                        "each view, the MH and MH -> Alignment labels where their styles put "
+                        "them. Alignments whose views already exist are left as they are."),
+        "expand": "sanitary_profile",   # see _expand_sanitary_profile in server.py
+        "fields": [
+            {"name": "plan_type", "label": "Plan type", "type": "text", "default": "sanitary",
+             "help": "A type under playbooks/ whose sheets.json has a profile section."},
+            {"name": "alignment", "label": "Alignments", "type": "multichoice",
+             "options_from": "alignments", "default": [],
+             "help": "Select none for every alignment in the drawing."},
+            {"name": "span", "label": "Elevation span (ft)", "type": "choice", "default": "40", "options": ["40", "36"]},
+            {"name": "station_host", "label": "Station labels on", "type": "choice", "default": "flowline",
+             "options": ["flowline", "eg"],
+             "help": "flowline: a profile through the pipe inverts carries the 1+00 labels; eg: the surface profile does."},
+            {"name": "surface", "label": "EG surface", "type": "text", "optional": True,
+             "help": "Blank: the surface named like EG, or the only one."},
+            {"name": "structure_label", "label": "MH label style", "type": "text", "optional": True,
+             "help": "Blank: the spec's (else the drawing's default structure profile label style)."},
+            {"name": "title", "label": "Sheet title", "type": "text", "default": "",
+             "help": "Fills {title} in the title block and furniture."},
+        ],
+    },
+    {
+        "type": "cut_profile_sheets",
+        "label": "Cut Profile Sheets",
+        "group": "Generated",
+        "description": ("Sheets for the drawing's profile views: two stacked viewports per "
+                        "sheet at the profile scale (1\" = 40'), the template layout cloned, "
+                        "the title block filled ({alignment} {stations}), furniture placed. "
+                        "One all-or-nothing sequence per sheet. Expanded at its turn in a run, "
+                        "so it can follow Draw Profile Views in the same run."),
+        "expand": "profile_sheets",   # deferred: see DEFERRED_EXPANDERS in server.py
+        "fields": [
+            {"name": "plan_type", "label": "Plan type", "type": "text", "default": "sanitary",
+             "help": "A type under playbooks/ with a sheets.json (template, slots, scale)."},
+            {"name": "alignment", "label": "Alignments", "type": "multichoice",
+             "options_from": "alignments", "default": [],
+             "help": "Select none for the views of every alignment."},
+            {"name": "title", "label": "Sheet title", "type": "text", "default": "",
+             "help": "Fills {title} in the title block and furniture."},
+        ],
+    },
 ]
 
 
@@ -578,6 +685,69 @@ BLOCK_SPECS.append({
         {"name": "leader_lengths", "label": "Leader lengths", "type": "strings", "optional": True,
          "help": "Feet, comma separated. Blank = 1, 2, 3 and 4.5 text heights."},
         {"name": "max_passes", "label": "Repair passes", "type": "int", "default": 10},
+    ],
+})
+
+
+# -- Grading sheets from a key map ----------------------------------------------
+#
+# The sheet windows of a grading set are drawn in a separate key map drawing:
+# a rectangle per sheet (linework, not always closed) with the sheet's number
+# inside. The first block reads that drawing and keeps its cells for the
+# dashboard; the second lets the user pick cells, labels each cell's window
+# with the grading label commands, then cuts one sheet per cell.
+
+BLOCK_SPECS.append({
+    "type": "read_key_map",
+    "label": "Grading Key Map",
+    "group": "Generated",
+    "description": ("Reads the grading key map drawing (another .dwg, in the same coordinates) "
+                    "and keeps its sheet cells for this dashboard: every closed area of the "
+                    "linework that holds a key text becomes a cell named by that key. Lines "
+                    "need not be closed polylines: endpoints are snapped, crossings split, "
+                    "open tails ignored. Writes nothing; the Cut Grading Sheets block lists "
+                    "the cells it found. Civil 3D opens the key map if it is not open."),
+    "expand": "key_map",   # reads the key map drawing; see _expand in server.py
+    "fields": [
+        {"name": "key_map_file", "label": "Key map drawing", "type": "text", "optional": True,
+         "help": "Full path of the key map .dwg. Blank = key_map.file in the plan type's sheets.json."},
+        {"name": "plan_type", "label": "Plan type", "type": "text", "default": "grading",
+         "help": "A type under playbooks/ whose sheets.json has a key_map section."},
+        {"name": "cell_layers", "label": "Cell linework layers", "type": "strings", "optional": True,
+         "help": "Layer name suffixes, comma separated. Blank = the spec's, else every layer."},
+        {"name": "key_layers", "label": "Key text layers", "type": "strings", "optional": True,
+         "help": "Layer name suffixes of the sheet-number text. Blank = the spec's, else every layer."},
+        {"name": "snap", "label": "Snap (ft)", "type": "number", "optional": True,
+         "help": "Gaps between lines up to this are closed. Blank = the spec's (0.5)."},
+    ],
+})
+
+BLOCK_SPECS.append({
+    "type": "cut_grading_sheets",
+    "label": "Cut Grading Sheets",
+    "group": "Generated",
+    "description": ("label_grading then space_labels once over the whole drawing (with the "
+                    "plan type's grading.labels / grading.spacing parameters), then one sheet "
+                    "per chosen key-map cell: the template layout cloned, the viewport cut on "
+                    "the cell (scale from the cell's size, twist from its rotation), the title "
+                    "block filled with the key, the furniture placed. Needs the Grading Key "
+                    "Map block (or read_key_map) run first."),
+    "expand": "grading_sheets",   # reads the stored key map and the drawing; see _expand in server.py
+    "fields": [
+        {"name": "plan_type", "label": "Plan type", "type": "text", "default": "grading"},
+        {"name": "cells", "label": "Cells", "type": "multichoice",
+         "options_from": "keymap_cells", "default": [],
+         "help": "Which key-map cells become sheets in this drawing. None = all of them."},
+        {"name": "scale", "label": "Scale (ft per inch)", "type": "number", "optional": True,
+         "help": "Blank = derived from each cell's size over the viewport. 40 forces 1\" = 40'."},
+        {"name": "title", "label": "Sheet title", "type": "text", "default": "",
+         "help": "Fills {title} in the title block and furniture."},
+        {"name": "labels", "label": "Label first", "type": "bool", "default": True,
+         "help": "Off = cut the sheets only; no label_grading / space_labels pass."},
+        {"name": "label_scope", "label": "Label pass", "type": "choice",
+         "options": ["drawing", "cells"], "default": "drawing",
+         "help": "drawing = one label_grading + one space_labels over the whole drawing (fast). "
+                 "cells = the pair once per chosen cell, inside its window."},
     ],
 })
 
@@ -757,6 +927,17 @@ BLOCK_SPECS.extend(_generated_specs())
 
 SPECS_BY_TYPE = {spec["type"]: spec for spec in BLOCK_SPECS}
 
+# Only these groups appear in the browser's "Add block" menu. The rest -- one
+# line, one arc, one layer at a time -- are quicker to do by hand in CAD than
+# through a form, so they stay out of sight but fully runnable: an LLM composing
+# a run through list_blocks / run_on_dashboard, a typed script line, or a saved
+# sequence that already holds one can still use every block in BLOCK_SPECS.
+PALETTE_GROUPS = ("Generated",)
+
+
+def in_palette(spec: dict) -> bool:
+    return spec.get("group") in PALETTE_GROUPS
+
 MAX_REPEAT = 500
 MAX_BLOCKS = 200
 MAX_COMMANDS = 2000
@@ -772,9 +953,14 @@ def usage(spec: dict) -> str:
 
 
 def palette() -> list:
-    """BLOCK_SPECS without the builders, for the browser to render forms from."""
+    """BLOCK_SPECS without the builders, for the browser to render forms from.
+
+    Every block is listed so a sequence holding any of them can be rendered and
+    run; "palette" says whether the browser offers it in the "Add block" menu.
+    """
     return [
-        {**{k: v for k, v in spec.items() if k != "build"}, "usage": usage(spec)}
+        {**{k: v for k, v in spec.items() if k != "build"},
+         "usage": usage(spec), "palette": in_palette(spec)}
         for spec in BLOCK_SPECS
     ]
 

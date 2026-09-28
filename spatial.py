@@ -577,7 +577,8 @@ READ_ONLY_INTENTS = frozenset({
     "get_properties", "select_entities", "entity_key_points", "closest_point_on",
     "intersections", "tangent_points", "measure_entities", "angle_between",
     "point_along", "bounding_box", "find_duplicates", "zoom_view",
-    "list_surface_label_styles", "export_block", "save_drawing",
+    "list_surface_label_styles", "export_block", "save_drawing", "list_pressure_parts",
+    "profile_context", "block_dynamic_properties",
 })
 
 
@@ -711,6 +712,8 @@ class Piece:
     handle: str
     layer: str
     name: str = ""     # block name, label kind, text -- whatever names the thing
+    group: str = ""    # a second family the piece answers to: its Civil 3D part kind
+                       # (pipe, structure, fitting, appurtenance), whatever its layer says
 
     def chords(self, per_arc=None):
         if self.kind == "seg":
@@ -828,16 +831,16 @@ def _snapshot_pieces(data: dict):
             a, b = _xy(pipe.get("start_point")), _xy(pipe.get("end_point"))
             if a is None or b is None:
                 continue
-            yield Piece("seg", (a, b), tag_for(pipe.get("layer"), name=net_name, type="pipe"),
+            yield Piece("seg", (a, b), _part_tag(pipe.get("layer"), "pipe", "pipe", net_name),
                         str(pipe.get("handle")), str(pipe.get("layer") or net_name),
-                        str(pipe.get("name") or ""))
+                        str(pipe.get("name") or ""), "pipe")
         for s in net.get("structures", []) or []:
             p = _xy(s.get("insertion_point"))
             if p is None:
                 continue
-            yield Piece("pt", p, tag_for(s.get("layer"), name=net_name, type="structure"),
+            yield Piece("pt", p, _part_tag(s.get("layer"), "structure", "structure", net_name),
                         str(s.get("handle")), str(s.get("layer") or net_name),
-                        str(s.get("name") or ""))
+                        str(s.get("name") or ""), "structure")
 
     for fl in data.get("feature_lines", []) or []:
         pts = [q for q in (_xy(p) for p in fl.get("points") or []) if q is not None]
@@ -884,9 +887,10 @@ def _snapshot_pieces(data: dict):
                 p = _xy(part.get("position"))
                 if p is None:
                     continue
-                yield Piece("pt", p, tag_for(part.get("layer"), name=part.get("part_type") or part.get("name"), type=kind),
+                part_word = part.get("part_type") or part.get("name")
+                yield Piece("pt", p, _part_tag(part.get("layer"), part_word, kind, net_name),
                             str(part.get("handle")), str(part.get("layer") or net_name),
-                            str(part.get("part_type") or part.get("description") or part.get("name") or ""))
+                            str(part.get("part_type") or part.get("description") or part.get("name") or ""), kind)
 
     # Parcels: every loop segment, tagged by the parcel's layer or "parcel".
     for pc in data.get("parcels", []) or []:
@@ -975,6 +979,24 @@ def _viewport_verts(vp: dict) -> list:
     if lo is None or hi is None:
         return []
     return [(lo[0], lo[1]), (hi[0], lo[1]), (hi[0], hi[1]), (lo[0], hi[1])]
+
+
+def _part_tag(layer, part_word, kind, net_name="") -> str:
+    """The tag of a Civil 3D network part. Its layer names the family (c-watr-*
+    -> water); the part itself says what it is (Hydrant, Valve, Elbow,
+    structure), so a hydrant on the water main's layer is water_hydrant, not
+    water_main. Off any family layer it keeps the kind's own tag (appurtenance,
+    structure ...). The part kind is also its piece group, so "appurtenance"
+    or "structure" still finds it whatever the layer said."""
+    c = classify(layer, name=part_word, type=kind)
+    word = re.sub(r"[^a-z0-9]+", "_", str(part_word or "").lower()).strip("_")
+    if not word or c.source in ("pad", "type", "other") or c.family in ("", kind, "other"):
+        return c.tag
+    if c.tag == f"{c.family}_{word}" or c.tag.endswith("_" + word):
+        return c.tag
+    tag = f"{c.family}_{word}"
+    TAGS._families.setdefault(tag, c.family)
+    return tag
 
 
 def _snapshot_polygons(data: dict):
@@ -1103,6 +1125,15 @@ def _one_payload_pieces(p: dict, handle: str):
         yield from _ring_pieces(verts, closed, tag, handle, layer, p.get("bulges"))
     elif intent == "draw_rectangle":
         yield from _ring_pieces(_rect_verts(p), True, tag, handle, layer)
+    elif intent == "lay_pressure_run":
+        # the pressure run's path and its appurtenances, before the plugin has drawn them
+        path = [q for q in (_xy(v) for v in p.get("path") or []) if q is not None]
+        for i, (a, b) in enumerate(zip(path, path[1:])):
+            yield Piece("seg", (a, b), tag, f"{handle}/s{i}", layer)
+        for i, ap in enumerate(p.get("appurtenances") or []):
+            q = _xy(ap.get("point") if isinstance(ap, dict) else ap)
+            if q is not None:
+                yield Piece("pt", q, tag, f"{handle}/a{i}", layer, str((ap or {}).get("part") or "") if isinstance(ap, dict) else "")
     elif intent == "create_viewport":
         # The window a new sheet will show, as the ring the index will hold once
         # the plugin reports it back: planned cells, never a conflict (see
@@ -1247,6 +1278,7 @@ class SpatialIndex:
         self.family_tags: dict = defaultdict(set)      # family -> {tags present}
         self.layer_info: dict = {}                     # layer -> how it was named, feet, points
         self.windows: dict = {}                        # viewport handle -> {ring, layout, on}
+        self.label_targets: dict = {}                  # label handle -> handle of the object it labels
         self.unmatched: Counter = Counter()            # layer -> ft of linework nothing could name
         self.unmatched_points: Counter = Counter()     # layer -> point pieces tagged by type only
         self.tags_version = TAGS.version
@@ -1294,6 +1326,8 @@ class SpatialIndex:
         self.tag_handles[piece.tag].add(piece.handle)
         self.entity_state[piece.handle] = state
         self.family_tags[TAGS.family_of(piece.tag)].add(piece.tag)
+        if piece.group and piece.group != piece.tag:
+            self.family_tags[piece.group].add(piece.tag)    # "appurtenance" finds water_hydrant too
         info = self.layer_info.get(piece.layer)
         if info is None:
             info = self.layer_info[piece.layer] = {"tag": piece.tag, "family": TAGS.family_of(piece.tag),
@@ -1304,6 +1338,9 @@ class SpatialIndex:
         info["handles"] += 1
 
     def _insert(self, data):
+        for lbl in data.get("labels", []) or []:
+            if lbl.get("target") and lbl.get("handle"):
+                self.label_targets[str(lbl["handle"])] = str(lbl["target"])
         for lay in data.get("layouts", []) or []:
             for vp in lay.get("viewports") or []:
                 verts = _viewport_verts(vp)
@@ -1610,6 +1647,12 @@ class SpatialIndex:
         if tag is None or tag == "":
             return None
         return self.tags_of(tag)
+
+    def labels_of(self, handle) -> set:
+        """Handles of the labels that belong to one object (by the label's
+        FeatureId), empty when the plugin did not report targets."""
+        h = str(handle)
+        return {l for l, t in self.label_targets.items() if t == h}
 
     def pieces_for(self, handle) -> list:
         """Every piece of one entity, once each (a piece sits in every cell it crosses)."""

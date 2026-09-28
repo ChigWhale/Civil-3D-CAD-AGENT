@@ -1,0 +1,13 @@
+# Everything the packaged Python needs at run time (the embeddable Python
+# ships nothing). torch, transformers and the legacy LangChain scripts are
+# not part of the product; models are served by llama-server over HTTP.
+fastapi
+uvicorn[standard]
+python-multipart
+mcp<2            # 2.x renamed FastMCP to MCPServer; cad_mcp_server.py is written against 1.x
+requests
+numpy
+pillow
+pypdfium2
+openpyxl
+anthropic

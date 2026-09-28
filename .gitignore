@@ -17,3 +17,15 @@ dashboard/uploads/
 
 # Claude
 .claude/
+
+# Test dashboard state (servers aimed at the stub plugin)
+dashboard/uploads-test/
+
+
+# Packaging (package/build.ps1) and launcher run state
+package/stage/
+package/downloads/
+package/dist/
+.run/
+cad-agent.json
+install.json

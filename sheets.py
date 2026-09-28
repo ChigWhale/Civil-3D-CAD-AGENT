@@ -22,11 +22,13 @@ import fnmatch
 import json
 import math
 import os
+import re
 import time
 from collections import Counter
 
 import checks as checks_mod
 import playbooks
+import profiles
 import spatial
 from spatial import _signed_offset, _point_in_polygon
 
@@ -73,6 +75,17 @@ def default_spec(plan_type: str) -> dict:
              "rotation": 0, "scale": 1.0, "layer": "0", "when": "always"},
         ],
         "tables": [],
+        "profile": {
+            "scale": 40.0,
+            "span": 40.0,
+            "station_host": "eg",
+            "surface": "",
+            "sheets": {k: dict(v) for k, v in profiles.PROFILE_DEFAULTS["sheets"].items()},
+            "styles": dict(profiles.PROFILE_DEFAULTS["styles"]),
+            "placement": dict(profiles.PROFILE_DEFAULTS["placement"]),
+            "name_format": profiles.PROFILE_DEFAULTS["name_format"],
+            "drag_lift": profiles.PROFILE_DEFAULTS["drag_lift"],
+        },
         "_notes": [
             "TEMPLATE: template.file is the .dwg/.dwt with the title-block layout named template.layout;",
             "  leave both empty to cut plain layouts. subject.tags default to the base spec's delta tags.",
@@ -85,6 +98,17 @@ def default_spec(plan_type: str) -> dict:
             "  {plan_type} {drawing} {date} {north_deg} {layout}.",
             "tables: {title, per: sheet|set, anchor, corner, at, columns: [no, name, station, offset, side, ...],",
             "  rows: {tag, state, along}} -- rows are the tag's entities on that sheet, sorted by station.",
+            "profile (sanitary profile sheets): scale = horizontal ft per inch (40: 1000 ft = 25 in); span = 36 or 40 ft",
+            "  of elevation per view; sheets[span] = the template layout to clone for that span, its paper size (in),",
+            "  slots = where each view's datum corner sits on the paper (in from the lower-left; first slot = first view),",
+            "  band_set / profile_view = style overrides for that span. Each sheet is ONE viewport the size of the sheet",
+            "  border; the views are placed in model space to match the slots. station_host eg|flowline = which profile",
+            "  carries the 1+00 station labels; styles = Civil 3D style names, matched loosely on dashes/arrows (a miss",
+            "  falls back to the drawing default with a warning). Title block / furniture may use {alignment} {stations} {views}.",
+            "key_map (grading sheets): {file: the key map .dwg, cell_layers / key_layers: layer suffixes (blank = all),",
+            "  snap: gaps up to this many feet are closed, key_pattern: regex a key text must match}. Cells are the closed",
+            "  faces of the linework; the sheet's scale is the cell width over viewport.width; layout_name may use {key}.",
+            "grading: {labels: label_grading parameters, spacing: space_labels parameters} run per chosen cell before the cut.",
         ],
     }
 
@@ -138,18 +162,20 @@ def validate_spec(spec) -> list:
         errors.append("template.file and template.layout go together (both set, or both empty)")
     name = spec.get("layout_name", "{type_code}-{n:02d}")
     try:
-        str(name).format(type_code="X", n=1, plan_type="t", scale=40)
+        str(name).format(type_code="X", n=1, plan_type="t", scale=40, key="K")
     except (KeyError, ValueError, IndexError) as e:
         errors.append(f"layout_name pattern is not usable: {e}")
-    if "{n" not in str(name):
-        errors.append("layout_name must contain {n} so every sheet gets its own name")
+    if "{n" not in str(name) and "{key" not in str(name):
+        errors.append("layout_name must contain {n} (or {key} for key-map sheets) so every sheet gets its own name")
     for i, f in enumerate(spec.get("furniture") or []):
         where = f"furniture[{i}]"
         if not isinstance(f, dict):
             errors.append(f"{where}: not an object")
             continue
-        if not (f.get("block") or f.get("mtext")):
-            errors.append(f"{where}: needs block (a block name) or mtext (text)")
+        if not (f.get("block") or f.get("mtext") or f.get("xref")):
+            errors.append(f"{where}: needs block (a block name), mtext (text) or xref (a name, with source_file)")
+        if f.get("xref") and not f.get("source_file"):
+            errors.append(f"{where}: an xref needs source_file (the .dwg to reference)")
         anchor = f.get("anchor", "sheet")
         if anchor not in ("sheet", "viewport"):
             errors.append(f"{where}: anchor must be sheet or viewport")
@@ -175,6 +201,85 @@ def validate_spec(spec) -> list:
                 errors.append(f"{where}: unknown column {col!r}; known: {', '.join(TABLE_COLUMNS)}")
         if t.get("per", "sheet") not in ("sheet", "set"):
             errors.append(f"{where}: per must be sheet or set")
+    prof = spec.get("profile")
+    if prof is not None:
+        if not isinstance(prof, dict):
+            errors.append("profile must be an object {scale, span, slots, station_host, styles, placement}")
+        else:
+            _num(prof.get("scale", 40), "profile.scale", errors, lo=0.01)
+            try:
+                span = float(prof.get("span", 40))
+            except (TypeError, ValueError):
+                span = None
+            if span is None or span not in profiles.SPANS:
+                errors.append("profile.span must be 36 or 40 (feet of elevation per profile view)")
+            if str(prof.get("station_host", "flowline")).lower() not in ("flowline", "eg"):
+                errors.append("profile.station_host must be flowline or eg")
+            table = prof.get("sheets")
+            if table is not None:
+                if not isinstance(table, dict):
+                    errors.append("profile.sheets must be an object keyed by span: {\"36\": {layout, paper, slots}, \"40\": {...}}")
+                else:
+                    for key, entry in table.items():
+                        where = f"profile.sheets[{key!r}]"
+                        if str(key) not in ("36", "40"):
+                            errors.append(f"{where}: the span must be 36 or 40")
+                        if not isinstance(entry, dict):
+                            errors.append(f"{where}: not an object")
+                            continue
+                        paper = entry.get("paper")
+                        if paper is not None and not (isinstance(paper, (list, tuple)) and len(paper) == 2):
+                            errors.append(f"{where}.paper must be [width, height] in inches")
+                        elif paper is not None:
+                            _num(paper[0], f"{where}.paper[0]", errors, lo=1)
+                            _num(paper[1], f"{where}.paper[1]", errors, lo=1)
+                        slots = entry.get("slots")
+                        if slots is not None:
+                            if not isinstance(slots, list) or not 1 <= len(slots) <= 2:
+                                errors.append(f"{where}.slots must hold one or two [x, y] paper points (a view's datum corner)")
+                            else:
+                                for i, sl in enumerate(slots):
+                                    if not (isinstance(sl, (list, tuple)) and len(sl) == 2):
+                                        errors.append(f"{where}.slots[{i}] must be [x, y] in paper inches")
+            if prof.get("styles") is not None and not isinstance(prof.get("styles"), dict):
+                errors.append("profile.styles must be an object of style names")
+    km = spec.get("key_map")
+    if km is not None:
+        if not isinstance(km, dict):
+            errors.append("key_map must be an object {file, cell_layers, key_layers, snap, key_pattern}")
+        else:
+            if km.get("file") is not None and not isinstance(km.get("file"), str):
+                errors.append("key_map.file must be a path string")
+            for k in ("cell_layers", "key_layers"):
+                v = km.get(k)
+                if v is not None and not isinstance(v, (list, str)):
+                    errors.append(f"key_map.{k} must be a list of layer suffixes (or a comma-separated string)")
+            if km.get("snap") is not None:
+                _num(km.get("snap"), "key_map.snap", errors, lo=0.001)
+            pat = km.get("key_pattern")
+            if pat:
+                try:
+                    re.compile(str(pat))
+                except re.error as e:
+                    errors.append(f"key_map.key_pattern is not a valid regular expression: {e}")
+    gr = spec.get("grading")
+    if gr is not None:
+        if not isinstance(gr, dict):
+            errors.append("grading must be an object {labels: {...}, spacing: {...}}")
+        else:
+            labels = gr.get("labels")
+            if labels is not None and not isinstance(labels, dict):
+                errors.append("grading.labels must be an object of label_grading parameters")
+            elif labels and str(labels.get("drive_curb_side", "right")) not in ("right", "left", "both"):
+                errors.append("grading.labels.drive_curb_side must be right, left or both")
+            spacing = gr.get("spacing")
+            if spacing is not None and not isinstance(spacing, dict):
+                errors.append("grading.spacing must be an object of space_labels parameters")
+            elif spacing:
+                if str(spacing.get("types", "surface")) not in ("surface", "elevation", "slope", "all"):
+                    errors.append("grading.spacing.types must be surface, elevation, slope or all")
+                if str(spacing.get("mode", "auto")) not in ("auto", "position", "align"):
+                    errors.append("grading.spacing.mode must be auto, position or align")
     return errors
 
 
@@ -272,12 +377,17 @@ def spec_warnings(spec: dict) -> list:
     tpl = spec.get("template") or {}
     if tpl.get("file") and not os.path.exists(str(tpl["file"])):
         out.append(f"template.file not found: {tpl['file']}")
+    if tpl.get("file") and not tpl.get("title_block") and (spec.get("title_block") or {}).get("attributes"):
+        out.append("template.title_block is blank, so the title_block.attributes (SHEET, OF, ...) are not filled; "
+                   "name the template's attributed block to fill them")
     for f in spec.get("furniture") or []:
         sf = f.get("source_file")
         if f.get("block") and sf and not os.path.exists(str(sf)):
             out.append(f"furniture {f.get('block')}: source_file not found: {sf}")
         elif f.get("block") and not sf:
             out.append(f"furniture {f.get('block')}: no source_file; the block must already be defined in the drawing")
+        elif f.get("xref") and sf and not os.path.exists(str(sf)):
+            out.append(f"furniture xref {f.get('xref')}: source_file not found: {sf}")
     known = set(spatial.TAGS.known_words())
     for w in list((spec.get("subject") or {}).get("tags") or []) + list((spec.get("visible") or {}).get("tags") or []):
         if str(w).lower() not in known:
@@ -476,9 +586,82 @@ def plan_windows(index, spec: dict, plan_type: str = "", scale=None, max_sheets=
             "tried": tried, "warnings": warnings}
 
 
-def _layout_name(spec, plan_type, n, scale):
+def plan_from_cells(index, spec: dict, cells: list, plan_type: str = "", scale=None, keys=None) -> dict:
+    """A plan (the same shape plan_windows returns) from key-map cells: one
+    sheet per chosen cell, its window the cell's ring, its scale derived from
+    the cell's size over the viewport's paper size unless `scale` says
+    otherwise, its twist the cell's. `keys` = the cells wanted (None = all)."""
+    cells = list(cells or [])
+    if not cells:
+        raise SheetError("the key map has no cells")
+    by_key = {}
+    for c in cells:
+        k = str(c.get("key"))
+        if k in by_key:
+            raise SheetError(f"the key map has two cells keyed {k!r}; give each cell its own key")
+        by_key[k] = c
+    if keys:
+        wanted = [str(k).strip() for k in keys if str(k).strip()]
+        missing = [k for k in wanted if k not in by_key]
+        if missing:
+            raise SheetError(f"no cell keyed {', '.join(missing)}; the key map has " +
+                             ", ".join(sorted(by_key, key=profiles.natural_key)))
+        chosen = [by_key[k] for k in wanted]
+    else:
+        chosen = sorted(cells, key=lambda c: profiles.natural_key(c.get("key")))
+    vp = spec["viewport"]
+    words = subject_words(spec, plan_type)
+    state = (spec.get("subject") or {}).get("state") or None
+    allowed = [float(s) for s in spec.get("scales") or []]
+    warnings, sheets = [], []
+    tag_of = index.entity_tag
+    for n, cell in enumerate(chosen, start=1):
+        key = str(cell.get("key"))
+        width, height = float(cell.get("width") or 0.0), float(cell.get("height") or 0.0)
+        if width <= 0 or height <= 0:
+            raise SheetError(f"cell {key} has no size")
+        derived, cross = width / vp["width"], height / vp["height"]
+        if abs(derived - cross) > 0.02 * derived:
+            warnings.append(f"cell {key} is {width:,.0f} x {height:,.0f} ft, not the viewport's "
+                            f"{vp['width']:g} x {vp['height']:g} aspect; scale taken from the width")
+        if abs(derived - round(derived)) <= 0.005 * derived:
+            derived = float(round(derived))
+        s = float(scale) if scale else derived
+        if allowed and not any(abs(s - a) <= 0.005 * a for a in allowed):
+            warnings.append(f"cell {key}: 1\" = {s:g}' is not one of the spec's scales "
+                            f"({', '.join(f'{a:g}' for a in allowed)})")
+        ring = [[float(p[0]), float(p[1])] for p in cell["ring"]]
+        handles = sorted(_handles_in_ring(index, ring, None))
+        subject = sorted(_handles_in_ring(index, ring, words, state)) if words else list(handles)
+        if not handles:
+            warnings.append(f"cell {key} holds nothing in this drawing")
+        twist = float(cell.get("twist_deg") or 0.0)
+        counts = Counter(tag_of.get(h, "other") for h in handles)
+        sheets.append({"n": n, "key": key, "layout": _layout_name(spec, plan_type, n, s, key=key),
+                       "center": [float(cell["center"][0]), float(cell["center"][1])], "ring": ring,
+                       "row": int(cell.get("row") or 0), "col": int(cell.get("col") or 0),
+                       "scale": s, "scale_text": scale_text(s), "twist_deg": twist, "north_deg": twist,
+                       "window": [[float(v) for v in cell["bbox"][0]], [float(v) for v in cell["bbox"][1]]],
+                       "width": width, "height": height, "handles": handles, "subject_handles": subject,
+                       "tags": dict(counts.most_common()), "values": {"key": key}})
+    scales = sorted({sh["scale"] for sh in sheets})
+    twists = sorted({sh["twist_deg"] for sh in sheets})
+    if len(scales) > 1:
+        warnings.append("the cells are not all the same size: scales " + ", ".join(f"{v:g}" for v in scales))
+    xs = [p[0] for sh in sheets for p in sh["ring"]]
+    ys = [p[1] for sh in sheets for p in sh["ring"]]
+    rows = 1 + max(sh["row"] for sh in sheets)
+    cols = 1 + max(sh["col"] for sh in sheets)
+    return {"plan_type": plan_type, "scale": scales[0], "scale_text": scale_text(scales[0]),
+            "paper_scale": paper_scale(scales[0]), "twist_deg": twists[0] if len(twists) == 1 else 0.0,
+            "count": len(sheets), "grid": [rows, cols], "sheets": sheets,
+            "extent": [round(v, 2) for v in (min(xs), min(ys), max(xs), max(ys))], "extent_source": "key_map",
+            "subject": words, "tried": [], "warnings": warnings}
+
+
+def _layout_name(spec, plan_type, n, scale, key=""):
     return str(spec.get("layout_name") or "{type_code}-{n:02d}").format(
-        type_code=spec.get("type_code") or "S", n=n, plan_type=plan_type, scale=int(round(scale)))
+        type_code=spec.get("type_code") or "S", n=n, plan_type=plan_type, scale=int(round(scale)), key=key)
 
 
 def describe_plan(index, plan: dict) -> list:
@@ -489,8 +672,15 @@ def describe_plan(index, plan: dict) -> list:
         what = ", ".join(f"{n} {t.replace('_', ' ')}" for t, n in list(sh["tags"].items())[:6])
         x0, y0 = min(p[0] for p in sh["ring"]), min(p[1] for p in sh["ring"])
         x1, y1 = max(p[0] for p in sh["ring"]), max(p[1] for p in sh["ring"])
-        lines.append(f"  {sh['layout']}: row {sh['row'] + 1}, column {sh['col'] + 1}; "
-                     f"x {x0:,.0f}-{x1:,.0f}, y {y0:,.0f}-{y1:,.0f}; holds {what or 'nothing named'}")
+        head = f"  {sh['layout']}: "
+        if sh.get("key") is not None:
+            head += f"key {sh['key']}, {scale_text(sh.get('scale') or plan['scale'])}"
+            if sh.get("twist_deg"):
+                head += f", twist {sh['twist_deg']:g} deg"
+            head += "; "
+        else:
+            head += f"row {sh['row'] + 1}, column {sh['col'] + 1}; "
+        lines.append(head + f"x {x0:,.0f}-{x1:,.0f}, y {y0:,.0f}-{y1:,.0f}; holds {what or 'nothing named'}")
     lines.extend("  note: " + w for w in plan.get("warnings") or [])
     return lines
 
@@ -557,11 +747,13 @@ def _fill(text, values: dict):
 
 
 def _values(sheet, plan, spec, plan_type, drawing, title) -> dict:
-    return {"n": sheet["n"], "count": plan["count"], "scale": int(round(plan["scale"])),
-            "scale_text": plan["scale_text"], "title": title or "", "plan_type": plan_type,
+    s = float(sheet.get("scale") or plan["scale"])
+    return {"n": sheet["n"], "count": plan["count"], "scale": int(round(s)),
+            "scale_text": scale_text(s), "title": title or "", "plan_type": plan_type,
             "drawing": os.path.splitext(os.path.basename(str(drawing or "")))[0],
             "date": time.strftime("%Y-%m-%d"), "north_deg": round(sheet.get("north_deg", 0.0), 2),
-            "layout": sheet["layout"], "type_code": spec.get("type_code") or ""}
+            "layout": sheet["layout"], "type_code": spec.get("type_code") or "",
+            **(sheet.get("values") or {})}
 
 
 def _anchor_point(entry, spec) -> list:
@@ -610,7 +802,13 @@ def furniture_for(sheet, plan, spec, index, plan_type="", drawing="", title="") 
         at = _anchor_point(entry, spec)
         rot = entry.get("rotation", 0)
         rot = float(sheet.get("north_deg", 0.0)) if rot == "north" else float(rot or 0)
-        if entry.get("block"):
+        if entry.get("xref"):
+            # the border / title block arriving as an xref on the sheet
+            out.append({"intent": "attach_xref", "layout": sheet["layout"], "name": _fill(entry["xref"], values),
+                        "path": entry.get("source_file"), "position": at, "rotation_deg": rot,
+                        "scale": entry.get("scale", 1.0), "layer": entry.get("layer", "0"),
+                        "overlay": bool(entry.get("overlay", False))})
+        elif entry.get("block"):
             payload = {"intent": "insert_block", "layout": sheet["layout"], "name": _fill(entry["block"], values),
                        "position": at, "rotation_deg": rot, "scale": entry.get("scale", 1.0),
                        "layer": entry.get("layer", "0"),
@@ -725,12 +923,18 @@ def sheet_payloads(plan: dict, spec: dict, index, data, plan_type="", drawing=""
                           "source_file": tpl["file"], "source_layout": tpl["layout"]})
         else:
             steps.append({"intent": "manage_layouts", "action": "create", "name": sheet["layout"]})
+        # a key-map plan carries the scale and twist per sheet; a tiled plan has one for all
         steps.append({"intent": "create_viewport", "layout": sheet["layout"], "center": list(vp["center"]),
                       "width": vp["width"], "height": vp["height"], "view_center": list(sheet["center"]),
-                      "scale": paper_scale(plan["scale"]), "twist_deg": plan["twist_deg"],
+                      "scale": paper_scale(sheet.get("scale") or plan["scale"]),
+                      "twist_deg": float(sheet.get("twist_deg", plan["twist_deg"])),
                       "freeze_layers": frozen, "locked": True, "layer": vp.get("layer", "vport")})
         attrs = (spec.get("title_block") or {}).get("attributes") or {}
-        if tpl.get("file") and attrs:
+        # only when the template layout carries an attributed title block (named in
+        # template.title_block): the border may arrive as an xref instead, and
+        # then "@0" (the first object the clone created) points at nothing and the
+        # whole sheet would be rolled back
+        if tpl.get("file") and tpl.get("title_block") and attrs:
             values = _values(sheet, plan, spec, plan_type, drawing, title)
             steps.append({"intent": "set_block_attributes", "handle": "@0",
                           "attributes": {k: _fill(v, values) for k, v in attrs.items()}})
@@ -738,8 +942,10 @@ def sheet_payloads(plan: dict, spec: dict, index, data, plan_type="", drawing=""
         steps.extend(tables_for(sheet, plan, spec, index, plan_type, drawing, title))
         # "_sheet" travels with the payload for the dashboard and the verifier; the
         # runner strips underscored keys before posting, so the plugin never sees it.
-        out.append({"intent": "sequence", "steps": steps,
-                    "_sheet": {k: sheet[k] for k in ("n", "layout", "center", "ring", "scale", "tags")}})
+        marker = {k: sheet[k] for k in ("n", "layout", "center", "ring", "scale", "tags")}
+        if sheet.get("key") is not None:
+            marker["key"] = sheet["key"]
+        out.append({"intent": "sequence", "steps": steps, "_sheet": marker})
     return out
 
 
@@ -749,12 +955,315 @@ def plan_and_payloads(index, data, spec, plan_type, scale=None, max_sheets=None,
     return plan, sheet_payloads(plan, spec, index, data, plan_type, drawing, title)
 
 
+# ── Profile sheets: one viewport per profile view ────────────────────────────
+
+
+def profile_views_in(data: dict, alignments=None, names=None) -> list:
+    """The drawing's profile views with extents, in alignment order (as the
+    drawing lists its alignments) then by start station."""
+    if isinstance(alignments, str):
+        alignments = [a.strip() for a in alignments.split(",") if a.strip()]
+    if isinstance(names, str):
+        names = [n.strip() for n in names.split(",") if n.strip()]
+    want_a = {str(a).lower() for a in alignments or []}
+    want_n = {str(n).lower() for n in names or []}
+    order = {str(a.get("name") or "").lower(): i for i, a in enumerate((data or {}).get("alignments") or [])}
+    out = []
+    for pv in (data or {}).get("profile_views") or []:
+        ring = pv.get("extents")
+        if not (isinstance(ring, list) and len(ring) >= 2):
+            continue
+        if want_a and str(pv.get("alignment") or "").lower() not in want_a:
+            continue
+        if want_n and str(pv.get("name") or "").lower() not in want_n:
+            continue
+        out.append(pv)
+    # alphabetical by alignment (SS-A before SS-B), then by station
+    out.sort(key=lambda pv: (profiles.natural_key(pv.get("alignment")), float(pv.get("station_start") or 0.0),
+                             profiles.natural_key(pv.get("name"))))
+    return out
+
+
+def _on_a_sheet(pv: dict, data: dict) -> str:
+    """The layout whose viewport already shows this view (its insertion inside
+    the viewport's model window), else ''."""
+    at, _ = _view_origin(pv)
+    for lay in (data or {}).get("layouts") or []:
+        for vp in lay.get("viewports") or []:
+            win = vp.get("model_window")
+            try:
+                (x0, y0), (x1, y1) = win
+            except (TypeError, ValueError):
+                continue
+            if x0 - 1e-6 <= at[0] <= x1 + 1e-6 and y0 - 1e-6 <= at[1] <= y1 + 1e-6:
+                return str(lay.get("name") or "?")
+    return ""
+
+
+def _next_sheet_number(spec: dict, plan_type: str, scale: float, data: dict) -> int:
+    """One past the highest sheet number the drawing already has for this
+    layout_name pattern, so a second cut continues SS-03, SS-04 ..."""
+    names = {str(lay.get("name") or "").lower() for lay in (data or {}).get("layouts") or []}
+    n = 1
+    while _layout_name(spec, plan_type, n, scale).lower() in names and n < MAX_SHEETS_HARD * 4:
+        n += 1
+    return n
+
+
+def _ring_box(ring) -> tuple:
+    xs = [float(p[0]) for p in ring]
+    ys = [float(p[1]) for p in ring]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _stations_text(views: list) -> str:
+    by = {}
+    for pv in views:
+        by.setdefault(str(pv.get("alignment") or ""), []).append(pv)
+    parts = []
+    for name, group in by.items():
+        s0 = min(float(pv.get("station_start") or 0.0) for pv in group)
+        s1 = max(float(pv.get("station_end") or 0.0) for pv in group)
+        span = f"STA {profiles.station_text(s0)} TO {profiles.station_text(s1)}"
+        parts.append(span if len(by) == 1 else f"{name} {span}")
+    return " / ".join(parts)
+
+
+def _view_span(pv: dict) -> float:
+    try:
+        return float(pv.get("elevation_max")) - float(pv.get("elevation_min"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _view_length(pv: dict) -> float:
+    try:
+        return float(pv.get("station_end")) - float(pv.get("station_start"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _view_origin(pv: dict):
+    """The view's insertion (datum corner): Civil 3D's Location, else the lower-left
+    of its extents (bands make that a little low; a warning says so)."""
+    loc = pv.get("location")
+    if isinstance(loc, (list, tuple)) and len(loc) >= 2:
+        return [float(loc[0]), float(loc[1])], False
+    x0, y0, _x1, _y1 = _ring_box(pv["extents"])
+    return [x0, y0], True
+
+
+def arrange_profile_views(data: dict, spec: dict, plan_type: str = "", alignments=None, views=None) -> tuple:
+    """(request, groups): the drawing's profile views assigned to sheets -- two
+    per sheet in alphabetical order of alignment then station, a sheet never
+    mixing spans -- and laid out in sheet windows (paper x scale) in a grid
+    where the views already sit, each view's datum corner at its slot. The
+    request is the plugin's `arrange_profile_views` (only the views that must
+    move, with the windows as `proposed` for the gate); `groups` feed
+    profile_sheet_payloads so the sheets are built from the planned windows.
+    Views already shown by a sheet's viewport are left alone."""
+    ps = profiles.profile_spec(spec)
+    scale = float(ps["scale"])
+    pvs = [pv for pv in profile_views_in(data, alignments, views) if not _on_a_sheet(pv, data)]
+    if not pvs:
+        raise SheetError("no profile views to arrange (none in the drawing, or all already on sheets)")
+    groups = []
+    for pv in pvs:
+        span = int(round(_view_span(pv)))
+        if span not in (36, 40):
+            raise SheetError(f"{pv.get('name')} spans {_view_span(pv):g} ft; sheets are defined for 36 and 40 ft views")
+        lay = profiles.sheet_layout(ps, span)
+        if groups and groups[-1]["span"] == span and len(groups[-1]["views"]) < len(lay["slots"]):
+            groups[-1]["views"].append(pv)
+        else:
+            groups.append({"span": span, "layout": lay, "views": [pv]})
+    # the grid goes where the views are now: from the left-most and highest sheet window the
+    # views imply (each view's datum corner less its slot offset), so views that already
+    # stand in their windows are not moved again -- arranging twice changes nothing
+    implied = []
+    for g in groups:
+        win_h = g["layout"]["paper"][1] * scale
+        for i, pv in enumerate(g["views"]):
+            dx, dy = profiles.slot_offset(g["layout"], i, _view_length(pv), scale)
+            at, _ = _view_origin(pv)
+            implied.append((at[0] - dx, at[1] - dy + win_h))
+    base_x, base_y = min(o[0] for o in implied), max(o[1] for o in implied)
+    per_row = max(1, int(ps["placement"].get("sheets_per_row", 4) or 4))
+    col_gap, row_gap = float(ps["placement"]["col_gap"]), float(ps["placement"]["row_gap"])
+    moves, boxes = [], []
+    col_x, row_y = base_x, base_y
+    row_h = 0.0
+    k = 0
+    for g in groups:
+        paper_w, paper_h = g["layout"]["paper"]
+        win_w, win_h = paper_w * scale, paper_h * scale
+        if k % per_row == 0 and k > 0:
+            col_x = base_x
+            row_y -= row_h + row_gap
+            row_h = 0.0
+        origin = [round(col_x, 4), round(row_y - win_h, 4)]
+        g["origin"] = origin
+        boxes.append({"min": list(origin), "max": [round(origin[0] + win_w, 4), round(origin[1] + win_h, 4)]})
+        for i, pv in enumerate(g["views"]):
+            dx, dy = profiles.slot_offset(g["layout"], i, _view_length(pv), scale)
+            want = [round(origin[0] + dx, 4), round(origin[1] + dy, 4)]
+            at, _ = _view_origin(pv)
+            if abs(at[0] - want[0]) > 0.01 or abs(at[1] - want[1]) > 0.01:
+                moves.append({"name": pv.get("name"), "handle": pv.get("handle"), "location": want, "from": [round(at[0], 4), round(at[1], 4)]})
+                try:
+                    x0, y0, x1, y1 = _ring_box(pv["extents"])
+                    boxes.append({"min": [x0, y0], "max": [x1, y1]})       # where it was: those cells change too
+                except (KeyError, TypeError, ValueError):
+                    pass
+        col_x += win_w + col_gap
+        row_h = max(row_h, win_h)
+        k += 1
+    request = {"intent": "arrange_profile_views", "views": moves, "proposed": {"boxes": boxes, "segments": []}}
+    return request, groups
+
+
+def profile_sheet_payloads(data: dict, index, spec: dict, plan_type: str = "", drawing: str = "", title: str = "",
+                           alignments=None, views=None, groups=None) -> tuple:
+    """(plan, payloads): the drawing's profile views on sheets, two to a sheet
+    (the span's slots), in alphabetical order of alignment then station. Two
+    views share a sheet when they physically share a sheet window -- the
+    planner put the second at the lower slot of the first's window -- so a run
+    that drew one alignment at a time still comes out right (one view per
+    sheet where the window has only one). The span picks the template layout
+    (36 ft -> 34x22, 40 ft -> 36x24). Each sheet is ONE viewport the size of the
+    sheet border, looking at the window (lower-left = insertion - slot x
+    scale). Views already shown by a layout's viewport are skipped, and sheet
+    numbers continue after the layouts the drawing has. One `sequence` per
+    sheet: template layout, viewport, title block, furniture."""
+    ps = profiles.profile_spec(spec)
+    pvs = profile_views_in(data, alignments, views)
+    if not pvs:
+        raise SheetError("the drawing has no profile views to put on sheets (draw_profile_views first)")
+    scale = float(ps["scale"])
+    pscale = paper_scale(scale)
+    # whatever the spec says is visible, a profile sheet must show the profile views: their
+    # grid, bands and text sit on the profile family's layers (C-PROF-*)
+    vis = dict(spec.get("visible") or {})
+    vis["tags"] = list(vis.get("tags") or []) + ["profile"]
+    vis["layers"] = list(vis.get("layers") or []) + ["c-prof*", "*prof*"]
+    frozen = freeze_list(index, data, {**spec, "visible": vis})["freeze"]
+    tpl = spec.get("template") or {}
+    vp_layer = (spec.get("viewport") or {}).get("layer", "vport")
+    plan = {"plan_type": plan_type, "scale": scale, "scale_text": scale_text(scale), "paper_scale": pscale,
+            "twist_deg": 0.0, "count": 0, "warnings": [], "sheets": [], "skipped": []}
+    todo = []
+    for pv in pvs:
+        on = _on_a_sheet(pv, data)
+        if on:
+            plan["skipped"].append(f"{pv.get('name')} is already on {on}")
+        else:
+            todo.append(pv)
+    if not todo:
+        raise SheetError("every profile view is already on a sheet: " + "; ".join(plan["skipped"][:6]))
+
+    if groups is not None:
+        # arranged first: the windows are the planner's, not read back from the views
+        groups = [dict(g) for g in groups]
+    else:
+        groups = []
+    # else: group by the window the views physically share
+    for pv in (todo if not groups else []):
+        span = int(round(_view_span(pv)))
+        if span not in (36, 40):
+            raise SheetError(f"{pv.get('name')} spans {_view_span(pv):g} ft; sheets are defined for 36 and 40 ft views")
+        lay = profiles.sheet_layout(ps, span)
+        at, approx = _view_origin(pv)
+        if approx:
+            plan["warnings"].append(f"{pv.get('name')}: no Location reported; its window was taken from its extents")
+        joined = False
+        if groups:
+            g = groups[-1]
+            k = len(g["views"])
+            if g["span"] == span and k < len(lay["slots"]):
+                dx, dy = profiles.slot_offset(lay, k, _view_length(pv), scale)
+                want = [g["origin"][0] + dx, g["origin"][1] + dy]
+                if abs(at[0] - want[0]) <= 1.0 and abs(at[1] - want[1]) <= 1.0:
+                    g["views"].append(pv)
+                    joined = True
+        if not joined:
+            dx0, dy0 = profiles.slot_offset(lay, 0, _view_length(pv), scale)
+            groups.append({"span": span, "layout": lay, "origin": [at[0] - dx0, at[1] - dy0], "views": [pv]})
+    for g in groups:
+        if len(g["views"]) < len(g["layout"]["slots"]):
+            plan["warnings"].append(f"{g['views'][0].get('name')} is alone on its sheet")
+
+    n0 = _next_sheet_number(spec, plan_type, scale, data)
+    plan["count"] = len(groups)
+    plan["first_number"] = n0
+    payloads = []
+    for i, g in enumerate(groups):
+        n = n0 + i
+        lay = g["layout"]
+        paper_w, paper_h = lay["paper"]
+        layout_name = _layout_name(spec, plan_type, n, scale)
+        source_layout = lay["layout"] or tpl.get("layout") or ""
+        steps = []
+        if tpl.get("file") and source_layout:
+            steps.append({"intent": "manage_layouts", "action": "clone_from_template", "name": layout_name,
+                          "source_file": tpl["file"], "source_layout": source_layout})
+        else:
+            if tpl.get("file") and not source_layout:
+                plan["warnings"].append(f"{layout_name}: no template layout for the {g['span']} ft span; a plain layout was made")
+            steps.append({"intent": "manage_layouts", "action": "create", "name": layout_name})
+        border = lay.get("border") or {}
+        if border.get("source_file"):
+            # the span's border (x-border 36x24 / 34x22) on the sheet before the viewport, so
+            # the viewport is fitted to it
+            steps.append({"intent": "attach_xref", "layout": layout_name,
+                          "name": border.get("xref") or os.path.splitext(os.path.basename(border["source_file"]))[0],
+                          "path": border["source_file"], "position": [float(border["at"][0]), float(border["at"][1])],
+                          "rotation_deg": 0.0, "scale": float(border.get("scale") or 1.0), "layer": border.get("layer") or "0",
+                          "overlay": False})
+            if not os.path.exists(str(border["source_file"])):
+                plan["warnings"].append(f"{layout_name}: border file not found: {border['source_file']}")
+        win_x0, win_y0 = g["origin"]
+        centre = [round(win_x0 + paper_w * scale / 2.0, 4), round(win_y0 + paper_h * scale / 2.0, 4)]
+        # the viewport is the paper, always: centred on it, the paper's size, looking at
+        # the sheet window (paper x scale), so a view's slot on the paper is where it prints
+        steps.append({"intent": "create_viewport", "layout": layout_name, "fit": "paper",
+                      "center": [round(paper_w / 2.0, 4), round(paper_h / 2.0, 4)], "width": paper_w, "height": paper_h,
+                      "view_center": centre, "scale": pscale, "twist_deg": 0.0, "freeze_layers": frozen,
+                      "locked": True, "layer": vp_layer})
+        ring = spatial.viewport_ring(centre, pscale, paper_w, paper_h, 0.0)
+        names = [str(pv.get("name") or "") for pv in g["views"]]
+        align_names = []
+        for pv in g["views"]:
+            a = str(pv.get("alignment") or "")
+            if a and a not in align_names:
+                align_names.append(a)
+        handles = [pv.get("handle") for pv in g["views"] if pv.get("handle")]
+        sheet = {"n": n, "layout": layout_name, "center": centre, "ring": ring, "scale": scale, "row": i, "col": 0,
+                 "tags": {"profile_view": len(g["views"])}, "handles": handles, "subject_handles": handles, "north_deg": 0.0,
+                 "views": names, "source_layout": source_layout, "paper": [paper_w, paper_h], "span": g["span"],
+                 "values": {"alignment": " / ".join(align_names), "stations": _stations_text(g["views"]), "views": ", ".join(names)}}
+        attrs = (spec.get("title_block") or {}).get("attributes") or {}
+        # "@0" is the title block the clone created; a template layout that carries none
+        # (page setup only, the border arriving as an xref) has nothing to fill
+        if tpl.get("file") and tpl.get("title_block") and attrs:
+            values = _values(sheet, plan, spec, plan_type, drawing, title)
+            steps.append({"intent": "set_block_attributes", "handle": "@0",
+                          "attributes": {k: _fill(v, values) for k, v in attrs.items()}})
+        steps.extend(furniture_for(sheet, plan, spec, index, plan_type, drawing, title))
+        plan["sheets"].append(sheet)
+        payloads.append({"intent": "sequence", "steps": steps,
+                         "_sheet": {**{k: sheet[k] for k in ("n", "layout", "center", "ring", "scale", "tags")}, "views": names}})
+    return plan, payloads
+
+
 # ── Reading what is there ────────────────────────────────────────────────────
 
 
-def list_layouts(data: dict, index=None) -> list:
+def list_layouts(data: dict, index=None, verify: bool = False) -> list:
     """The sheets a drawing already has, in words: viewports with their model
-    windows, what each window holds, and the furniture on the paper."""
+    windows, what each window holds, and the furniture on the paper. With
+    verify, each viewport also carries the index's sentence at the window's
+    centre and corners and the raw view numbers, for checking the window
+    transform against what the layout tab shows."""
     out = []
     for lay in (data or {}).get("layouts") or []:
         vps = []
@@ -766,12 +1275,15 @@ def list_layouts(data: dict, index=None) -> list:
                 counts.pop("viewport", None)          # other sheets' frames are not content
                 holds = dict(counts.most_common(12))
             s = vp.get("scale")
-            vps.append({"handle": vp.get("handle"), "on": vp.get("on", True), "scale": s,
-                        "scale_text": scale_text(1.0 / s) if s else None, "twist_deg": vp.get("twist_deg", 0),
-                        "model_center": vp.get("model_center"), "model_window": vp.get("model_window"),
-                        "paper_center": vp.get("paper_center"), "paper_size": vp.get("paper_size"),
-                        "frozen_layers": len(vp.get("frozen_layers") or []) if isinstance(vp.get("frozen_layers"), list)
-                        else vp.get("frozen_layers"), "holds": holds})
+            entry = {"handle": vp.get("handle"), "on": vp.get("on", True), "scale": s,
+                     "scale_text": scale_text(1.0 / s) if s else None, "twist_deg": vp.get("twist_deg", 0),
+                     "model_center": vp.get("model_center"), "model_window": vp.get("model_window"),
+                     "paper_center": vp.get("paper_center"), "paper_size": vp.get("paper_size"),
+                     "frozen_layers": len(vp.get("frozen_layers") or []) if isinstance(vp.get("frozen_layers"), list)
+                     else vp.get("frozen_layers"), "holds": holds}
+            if verify and index is not None and ring:
+                entry["verify"] = window_words(index, vp, ring)
+            vps.append(entry)
         out.append({"name": lay.get("name"), "tab_order": lay.get("tab_order"), "paper_size": lay.get("paper_size"),
                     "viewports": vps,
                     "blocks": [{"name": b.get("name"), "position": b.get("position"),
@@ -779,6 +1291,24 @@ def list_layouts(data: dict, index=None) -> list:
                     "tables": [{"title": t.get("title"), "rows": t.get("rows")} for t in lay.get("tables") or []],
                     "texts": len(lay.get("texts") or [])})
     return out
+
+
+def window_words(index, vp: dict, ring) -> dict:
+    """What the index says sits under a window's centre and its SW / NE corners,
+    plus the raw view numbers the plugin reported. A person compares the
+    sentences with the layout tab; a mismatch on a twisted sheet points at the
+    DCS transform, a mismatch everywhere at the view centre."""
+    c = vp.get("model_center") or [sum(p[0] for p in ring) / len(ring), sum(p[1] for p in ring) / len(ring)]
+    sw = min(ring, key=lambda p: (p[1], p[0]))
+    ne = max(ring, key=lambda p: (p[1], p[0]))
+
+    def words(p):
+        key = spatial.key_at(float(p[0]), float(p[1]))
+        return index.describe(key) if key in index.cells else "an empty cell"
+
+    return {"at_center": words(c), "at_sw": words(sw), "at_ne": words(ne),
+            "raw": {k: vp.get(k) for k in ("view_center_dcs", "view_target", "view_direction", "view_height",
+                                            "twist_deg", "scale") if vp.get(k) is not None}}
 
 
 def _ring_of(vp):

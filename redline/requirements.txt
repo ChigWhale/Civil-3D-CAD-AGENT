@@ -1,0 +1,6 @@
+# redline/ runtime: stdlib + these. torch / transformers are NOT needed;
+# models are served over HTTP by Ollama (dev) or llama-server (packaged).
+requests
+pillow
+numpy
+pymupdf

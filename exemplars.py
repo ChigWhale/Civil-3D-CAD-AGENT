@@ -69,7 +69,8 @@ class ExemplarError(RuntimeError):
 
 
 def exemplar_root() -> str:
-    root = os.environ.get("CAD_EXEMPLAR_DIR", "").strip()
+    import cadagent_config
+    root = cadagent_config.folder("exemplar_dir", "exemplars", None)
     if not root:
         raise ExemplarError("CAD_EXEMPLAR_DIR is not set: point it at a folder outside the repo "
                             "(bundles hold client drawing data)")
@@ -759,6 +760,8 @@ def build_brief(plan_type: str, max_chars: int = 60_000, palette=None, root: str
                            "suggestion from these numbers) and save it with save_sheet_spec.")
     else:
         sheet_lines.append("(no layouts in these exemplars; the sheet spec must be written from the standard)")
+    sheet_lines.append("Design runs draw nothing on sheets: a `covered` check is judged after cut_sheets, "
+                       "not after every step.")
     cross = cross + [""] + _fit(sheet_lines, 3000)
 
     pal = ["## Blocks that produce these tags"]

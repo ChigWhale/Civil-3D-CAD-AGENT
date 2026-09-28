@@ -1,0 +1,7 @@
+{
+  "comment": "VERIFY W/ CITY STD DETAIL",
+  "kind": "note",
+  "context": {"nearest": [{"tag": "appurtenance", "handle": "A1E1", "distance": 3.0}]},
+  "answer": {"skip": true, "reason": "judgement: checking against a city standard is a person's call, not a drawing edit"},
+  "why": "A comment that asks for a check, not a change, is not a chain."
+}

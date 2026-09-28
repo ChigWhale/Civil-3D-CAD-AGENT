@@ -107,7 +107,7 @@ namespace CADAgent
             "get_properties", "select_entities", "entity_key_points", "closest_point_on",
             "intersections", "tangent_points", "measure_entities", "angle_between",
             "point_along", "bounding_box", "find_duplicates", "zoom_view",
-            "list_surface_label_styles", "export_block", "save_drawing",
+            "list_surface_label_styles", "export_block", "save_drawing", "list_pressure_parts", "profile_context", "block_dynamic_properties",
         };
     }
 }

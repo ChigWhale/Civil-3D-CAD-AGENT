@@ -47,12 +47,14 @@
       </div>
 
       <div class="lane-run">
-        <!-- 100+ blocks: a search box with a grouped menu instead of a wall of buttons. -->
+        <!-- A search box with a grouped menu. Only the Generated blocks are offered
+             here; the primitive draw/modify/layer blocks stay runnable for LLM-built
+             chains but are quicker by hand than through a form. -->
         <div class="palette-row">
           <span class="palette-label">Add block</span>
           <div class="palette">
             <input type="search" class="palette-search" spellcheck="false" autocomplete="off"
-                   placeholder="Search commands… draw, offset, trim, dimension, layer">
+                   placeholder="Search blocks… driveways, swales, labels, sheets, profiles">
             <div class="palette-menu" hidden></div>
           </div>
           <span class="palette-count"></span>

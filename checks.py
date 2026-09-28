@@ -34,8 +34,11 @@ KINDS = {
                                                               "min_fraction": 0.8},
                      "doc": "walking the alignment(s) every `step` ft, the share of stations with a subject "
                             "within `half_width` >= min_fraction"},
-    "label_per":    {"required": [],             "optional": {"label": "label", "distance": 10.0},
-                     "doc": "every subject has a `label` within `distance` ft"},
+    "label_per":    {"required": [],             "optional": {"label": "label", "distance": 10.0, "by": "auto"},
+                     "doc": "every subject has a `label`: by=target -> a label whose labelled object IS the "
+                            "subject (Civil 3D FeatureId, any distance); by=distance -> any `label` within "
+                            "`distance` ft; by=auto (default) -> target when the drawing reports label targets, "
+                            "else distance"},
     "spacing":      {"required": ["max"],        "optional": {"along": "*", "min": 0.0},
                      "doc": "subjects projected to station along the alignment(s); consecutive gaps within [min, max]"},
     "offset":       {"required": ["min", "max"], "optional": {"alignment": "*", "min_fraction": 0.9},
@@ -258,7 +261,24 @@ def _eval_within(index, c, subs, of=None, distance=None):
 
 
 def _eval_label_per(index, c, subs):
-    return _eval_within(index, c, subs, of=c.get("label") or "label", distance=c.get("distance"))
+    by = str(c.get("by") or "auto").lower()
+    targets = getattr(index, "label_targets", {}) or {}
+    if by == "auto":
+        by = "target" if targets else "distance"
+    if by != "target":
+        r = _eval_within(index, c, subs, of=c.get("label") or "label", distance=c.get("distance"))
+        r["detail"]["by"] = "distance"
+        return r
+    wanted = index.tags_of(str(c.get("label") or "label"))
+    offenders = []
+    for h in subs:
+        mine = [l for l in index.labels_of(h) if index.entity_tag.get(l) in wanted]
+        if not mine:
+            offenders.append(h)
+    ok = not offenders
+    return _result(c, ok, f"every {c['tag']} labelled (a {c.get('label') or 'label'} whose target is the subject)",
+                   f"{len(subs) - len(offenders)} of {len(subs)}", {"by": "target", "targets_known": len(targets)},
+                   offenders, len(subs))
 
 
 def _eval_no_crossing(index, c, subs):

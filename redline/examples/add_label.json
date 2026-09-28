@@ -1,0 +1,8 @@
+{
+  "comment": "LABEL PIPE SIZE",
+  "kind": "arrow",
+  "context": {"nearest": [{"tag": "water_main", "handle": "0B01", "distance": 2.0, "at": [300.0, 30.0]}],
+              "texts": [{"handle": "MT1", "text": "8\" PVC C900", "distance": 6.0}]},
+  "answer": {"blocks": [{"type": "draw_leader", "params": {"points": [[300, 30], [315, 45]], "text": "8\" PVC", "layer": "c-anno-text"}}]},
+  "why": "The size comes from a label already on the drawing (never guessed); a leader from the pipe to a clear spot."
+}

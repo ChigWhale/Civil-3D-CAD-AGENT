@@ -1,0 +1,9 @@
+{
+  "comment": "DELETE - NOT NEEDED",
+  "kind": "strike",
+  "context": {"nearest": [{"tag": "other", "handle": "F9", "distance": 0.4, "at": [40.0, 90.0]},
+                          {"tag": "curb", "handle": "N1", "distance": 70.0}],
+              "within": {"other": {"count": 1, "handles": ["F9"]}}},
+  "answer": {"blocks": [{"type": "delete", "params": {"handles": ["F9"]}}]},
+  "why": "A strike-out erases the thing it crosses: the nearest entity under the ink."
+}

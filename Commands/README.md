@@ -220,6 +220,156 @@ Manager (layouts are named predictably for it), an along-alignment window strate
 plan-and-profile sets. Untested against Civil 3D so far: `clone_from_template` on a real
 .dwt, `FreezeLayersInViewport`, annotation-scale creation.
 
+## Pressure runs (real water parts)
+
+`Commands/CadCommands.Pressure.cs`: `list_pressure_parts` (read-only: networks, every
+pressure parts list with pipes / fittings / appurtenances by description, type, family,
+nominal diameter, elbow angle) and `lay_pressure_run` (`path`, `pipe_size`, `fittings:
+auto` + `bend_tolerance_deg`, `appurtenances: [{point, part, size}]`, `network`,
+`parts_list`, `layer`, `apply`). apply=false resolves every part against the list and
+reports `proposed` {segments, points}; apply=true creates the network when missing
+(`PressurePipeNetwork.Create` + `PartsListId`), `AddLinePipe` per segment, `AddFitting`
+(the elbow nearest the deflection) at bends with `ConnectToPipe` on both ports, and
+`AddAppurtenance` per point, in one transaction. Parts are matched by description
+substring or nominal diameter; appurtenances by `PressurePartType` name (Hydrant, Valve
+...) or description. Python: `pressure_run.plan` builds the path as the alignment offset
+to a side between two stations with hydrants every N ft; the `lay_pressure_run` block
+(expanded at run time) and the chat tools `list_pressure_parts` / `lay_pressure_run`
+(compute with the gate's verdict, or a background dashboard run). The gate reads the
+path from the payload (`spatial._one_payload_pieces`). Untested live: part matching
+against a real catalog, `ConnectToPipe` port numbering, appurtenance connection (they
+are placed on the path, not tied in). Gravity networks (sanitary, storm) are not created
+yet.
+
+## Sanitary profile sheets
+
+`Commands/CadCommands.Profiles.cs`, three intents, all on the application thread:
+
+* `profile_context` (read-only): per alignment the station range, whether it starts at
+  1+00 (`restation {needed, shift}`), the EG surface sampled every `sample_step` ft
+  (`Alignment.PointLocation` + `Surface.FindElevationAtXY`, off-surface points skipped),
+  existing profiles and profile views, the pipes and structures of the drawing's gravity
+  networks that lie along it (`Alignment.StationOffset` within `offset_tolerance`; a pipe
+  needs both ends near the alignment, an end past the alignment's ends counts as
+  `partial`), each pipe with `start/end_station`, `start/end_invert` (= endpoint Z - inner
+  diameter / 2; the raw Z is reported too), diameter, slope; each structure with station,
+  rim, sump, part size. Plus the surfaces, networks, the style catalogues (profile view
+  styles with their vertical exaggeration, band sets, profile styles and label sets, pipe
+  profile / structure / major station label styles) with the drawing's defaults, and the
+  drawing extent. `surface`: exact or unique substring, blank = "EG" or the only surface.
+* `draw_profile_views`: `{apply, span, surface, restation, restation_to, station_host:
+  flowline|eg, station_increment, drag_to_datum {pipe, station, lift}, styles {...},
+  views: [{name, alignment, alignment_handle, station_start, station_end, elevation_min,
+  elevation_max, insertion, pipes: [handles], structures: [handles]}], proposed}`. apply=false
+  validates (alignments, surface, styles, free names, handles) and reports; apply=true, in
+  ONE transaction: restation (`ReferencePointStation`), the EG profile
+  (`Profile.CreateFromSurface`, reused when an EG profile from that surface exists), the
+  flowline profile (`Profile.CreateByLayout` + a PVI per pipe end, lowest invert wins),
+  `ProfileView.Create` with user-specified station and elevation ranges, the band items
+  pointed at EG / flowline, `Part.AddToProfileView` for the view's parts (the new
+  `ProfileViewPart` found by diffing model space), `PipeProfileLabel.Create` per pipe,
+  `StructureProfileLabel.Create` twice per manhole (`structure_label`,
+  `structure_alignment_label`), `ProfileStationLabelGroup.Create` on the host profile every
+  `station_increment`, then pipe labels and station sub-entities dragged so their text sits
+  `lift` model units above the datum line. Any failure aborts: "nothing was kept". Styles
+  are picked like grading labels: exact name, unique substring, else the drawing default
+  with a warning; the flowline profile prefers a "no display" style when the drawing has one.
+* `label_profile_views`: the same label rules on views that already exist (`views: [names]`,
+  blank = all); parts shown in a view are found by their ProfileViewPart's extents.
+
+Python: `profiles.py` plans from the context (windows of 1000 ft from 1+00, the remainder
+as one view; the datum is a multiple of 4 ft chosen so the content -- inverts, sumps, rims,
+surface -- sits in the middle of the 36 or 40 ft span (`centred_datum`); a window the span
+cannot hold is split at the 1+00 nearest its middle, a half that still does not fit gets a
+raised top and a warning; views placed east of the drawing, one row per alignment) and emits
+`proposed` boxes with fill lines so the verifier counts the labels as planned.
+
+Labels, as drawn 2026-09-16 on the test drawing: label styles are a tree
+(`LabelStyle.ChildrenCount` / indexer), so the catalogue lists children ("MH", "MH —> Alignment"
+under "— SANITARY PROFILE [STRUCTURES] —") and names are matched loosely (`NormStyle`: any run
+of dashes before ">" is one arrow, spacing and case ignored), so the spec can say "MH ->
+Alignment". Two rows inside each view: bottom (station labels every 1+00 on the surface
+profile, then the "MH" label per manhole, then the pipe labels), top ("MH —> Alignment"); each
+label is dragged to its row and settled against the labels already there, so two pipes over
+one run stack rather than overlap. Furniture may be an xref (`{"xref": "x-border",
+"source_file": ...}`, `attach_xref` with `layout`): the border, north arrow and notes
+come from the x-border xref, not blocks.
+
+Order of work (2026-09-17): a run goes **draw the views -> arrange them -> create and place
+labels and blocks, last**. `draw_profile_views` creates the views, profiles and parts only
+(no labels, no blocks -- nothing with a position that a move could leave behind); the
+`draw_profile_views` block then adds a deferred `profile_place` step, planned at its turn:
+`arrange_profile_views` (the drawing's views into their sheet windows, two per sheet,
+alphabetical; idempotent -- views already in a window are not moved) and
+`drag_profile_labels`, which on each view that has no labels yet CREATES them (pipe,
+"MH", "MH —> Alignment", station group) and then places everything by dimension anchor,
+plotted inches from the graph view top or bottom (`profile.dimension_anchor`: top -3.0 for
+"MH —> Alignment", bottom 0.75 for "MH", station 0.5, pipe 0.2 + pipe_row 0.35 per extra
+pipe over one run) via the per-label `Label.DimensionAnchorOption` / `DimensionAnchorValue`
+and the per-sub-entity pair for station labels (the label-group `DefaultDimensionAnchor*`
+pair crashes Civil 3D). ONE "Ano-ProfDimLine" dynamic block per view spans its whole station
+range along the datum (`dim_line.lift` above it; `dim_line.property` "Distance1" = span, then
+shifted onto the view's start).
+`arrange_profile_views` carries a moved view's dimension-line blocks along (`dim_lines.block`
+in its request; the labels are the view's children and follow by themselves), so a later
+`cut_profile_sheets` (which arranges again) leaves nothing behind. The creating transaction
+also sets the pipe network's "Default Profile Label Placement" for structures around each
+`StructureProfileLabel.Create` (`dimension_anchor.at_creation`), then puts it back.
+
+**Create Sanitary Profile** (block `create_sanitary_profile`, chat tool of the same name;
+2026-09-17) is the two blocks as one run in a set order: 1. `draw_profile_views` with
+`skip_failures` -- JUST the views (no labels, no blocks), alphabetical by alignment, one
+transaction per alignment, an alignment that throws is rolled back and listed under
+`skipped` with the step that failed; alignments whose views already exist are left out
+(`profiles.plan(skip_existing=True)`); 2. the deferred `profile_sheets` (arrange two to a
+window, centred, then the sheets); 3. LAST the deferred `profile_labels`: one
+`drag_profile_labels` over the views, which creates the labels and the dimension line and
+anchors the pipe and station labels to the view bottom. The "MH" and "MH —> Alignment"
+labels are created and left where their styles put them (`do.anchors` false,
+`dimension_anchor.at_creation` false).
+
+Sheets (2026-09-16 afternoon): the span picks the template layout -- `profile.sheets["36"]`
+= "DWG to PDF (34x22)", `["40"]` = "DWG to PDF (36x24)" in the
+`layout template .dwt` -- with its paper size,
+`slots` (paper inches where each view's datum corner goes; the first slot is the upper view)
+and a per-span band set. Each sheet is ONE viewport the size of the sheet border
+(`create_viewport` with `fit: "layout"` takes the extents of what the cloned layout carries,
+else the plot paper size), so the planner lays each sheet's views out as a unit: a "sheet
+window" of paper x scale in model space, one row per alignment, a view's insertion = window
+origin + slot x scale. `sheets.profile_sheet_payloads` groups the drawing's views the same
+way (per alignment and span, in station order), recovers the window from the first view's
+Location and slot, and warns when a view is not where the planner put it. `manage_layouts
+list` with `source_file` lists a template file's layouts (the "From template" choices) with
+paper sizes. Title block and furniture as for plan sheets plus `{alignment}` `{stations}`
+`{views}`. Blocks `draw_profile_views` and
+`cut_profile_sheets` (the latter expanded at its turn in a run, so both can go in one run);
+chat tools `profile_context`, `plan_profile_views`, `draw_profile_views`,
+`cut_profile_sheets`, `produce_profile_sheets`. Spec: `playbooks/sanitary/sheets.json`.
+Tests: `tests/test_profiles.py`, `tests/run_profiles.py`. Untested live: every Civil 3D
+call above (compiled against 2025; signatures checked against AeccDbMgd 13.7), the
+centreline-Z convention for inverts, band item write-back, `DraggedOffset` on station
+sub-entities, and whether the real profile view extents fit the default slots.
+
+### Grading sheets from a key map (2026-09-21)
+
+A grading set's sheet windows are not tiled: they are drawn in a separate **key map**
+drawing (same real-world coordinates as the plan; only its viewport is at a small scale),
+one rectangle per sheet with the sheet's number written inside. The linework is seldom
+closed polylines, so `keymap.py` builds the planar graph of it (endpoints snapped within
+`snap`, crossings and T-junctions split, dangling tails pruned) and takes the faces; a key
+text names the smallest face it sits in. `sheets.plan_from_cells` turns cells into a plan:
+scale = cell width / viewport width (a 1200 x 840 ft cell on the 30 x 21 in viewport is
+1" = 40'), twist from the cell's rotation, layout `{type_code}-{key}` (GR-12), `{key}` in
+the title block. No plugin change: `HttpBridge.ResolveDocument` opens the key map .dwg by
+path. Blocks `read_key_map` (reads and keeps the cells for the dashboard, no plugin step)
+and `cut_grading_sheets` (pick cells; `label_grading` then `space_labels` once over the whole
+drawing -- `label_scope: cells` runs them inside each cell's `window` instead -- then one
+sequence per cell); chat tools `read_key_map`, `list_key_map`,
+`plan_grading_sheets`, `cut_grading_sheets`. Spec: `playbooks/grading/sheets.json`
+(`key_map` and `grading` sections). Tests: `tests/test_keymap.py`,
+`tests/run_grading_sheets.py`. Untested live: the twist sign on a real rotated cell, text
+insertion points for keys that are not left-justified, the template on the cut.
+
 ## Sequences
 
 `{"intent": "sequence", "steps": [ {...}, {...} ]}` runs several intents inside one
@@ -247,6 +397,8 @@ runs entirely on that thread.
 | `CadCommands.Query.cs` | list_intents, get_properties, select_entities, entity_key_points, closest_point_on, intersections, tangent_points, measure_entities, angle_between, point_along, bounding_box, find_duplicates |
 | `GradingLabels.cs` | label_grading, list_surface_label_styles (also the `grading_labels` handler behind `POST /handler`) |
 | `LabelSpacing.cs` | space_labels (also the `label_spacing` handler behind `POST /handler`) |
+| `CadCommands.Pressure.cs` | list_pressure_parts, lay_pressure_run |
+| `CadCommands.Profiles.cs` | profile_context, draw_profile_views, label_profile_views |
 
 The original intents (`draw_line`, `draw_arc`, `draw_shape`, `create_layer`,
 `add_to_layer`, `edit_layer`, `remove_from_layer`, `delete`) stay in

@@ -6,6 +6,11 @@ dashboard, and this server resolves that dashboard's user-assigned drawing. Two
 dashboards assigned to different drawings can be worked in parallel, because the
 plugin locks each drawing independently.
 
+One labelled exception: the redline pipeline (redline/), launched by the user
+on a scanned PDF, assigns the drawing whose name is printed in that PDF's title
+block. It creates its dashboard with source "redline" and the file in the same
+request; no chat tool reaches that path.
+
 Why dashboards rather than chats: Claude Desktop reuses one cad_mcp_server.py
 process across every chat and exposes no chat identity, so a chat cannot be
 identified. A dashboard is an explicit workspace the user creates instead.
@@ -39,7 +44,10 @@ except ImportError:  # pragma: no cover - depends only on how the app was starte
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import checks as checks_mod
 import driveways
+import keymap
 import playbooks
+import pressure_run
+import profiles
 import sheets
 import spatial
 import spatial_cache
@@ -49,18 +57,38 @@ import swales
 # live drawing (CAD_PLUGIN_BASE=http://127.0.0.1:5399).
 # 127.0.0.1, not "localhost": localhost resolves to IPv6 ::1 first on this machine
 # and stalls ~2s per request before falling back to IPv4 (measured 2.06s vs 0.015s).
-PLUGIN_BASE = os.environ.get("CAD_PLUGIN_BASE", "http://127.0.0.1:5199")
+import cadagent_config
+PLUGIN_BASE = cadagent_config.get("plugin_base")
 PLUGIN_TIMEOUT = 30
 # Whole-drawing commands measure thousands of labels or walk every xref; they take minutes,
 # not seconds, and a 30 s read timeout was being reported as "not reachable" while the
 # plugin was still busy finishing the job.
 LONG_PLUGIN_TIMEOUT = 900
-LONG_INTENTS = {"label_grading", "space_labels", "list_surface_label_styles"}
+LONG_INTENTS = {"label_grading", "space_labels", "list_surface_label_styles", "lay_pressure_run",
+                "profile_context", "draw_profile_views", "label_profile_views", "arrange_profile_views",
+                "drag_profile_labels", "block_dynamic_properties"}
+# Generated blocks that must read the drawing as EARLIER STEPS of the same run
+# left it (sheets over profile views the run itself draws) are expanded at
+# their turn, not before the run starts.
+DEFERRED_EXPANDERS = {"profile_sheets", "profile_place", "profile_labels"}
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
+# Runs, attention items and avatars live here. A server aimed at a stub plugin
+# (CAD_PLUGIN_BASE set) keeps its own folder, so a test run can never append to
+# the live server's history or leave attention items on real dashboards;
+# CAD_DASHBOARD_STATE points either kind of server somewhere else.
+# A packaged install (cad-agent.json with data_dir) keeps it under the data dir
+# instead, so the program folder stays read-only.
+UPLOAD_DIR = Path(os.environ.get("CAD_DASHBOARD_STATE")
+                  or cadagent_config.writable("dashboard",
+                                              str(BASE_DIR / ("uploads-test" if os.environ.get("CAD_PLUGIN_BASE") else "uploads"))))
 STATIC_DIR = BASE_DIR / "static"
 UPLOAD_DIR.mkdir(exist_ok=True)
+if os.environ.get("CAD_PLUGIN_BASE"):
+    # a stub-aimed server must not write stub layer families into the repo's learned file
+    import layer_words
+    spatial.TAGS.learned = layer_words.Learned(str(UPLOAD_DIR / "layer_tags.learned.json"))
+    spatial.TAGS._bump()
 
 _HISTORY_LEN = 400
 
@@ -163,15 +191,28 @@ async def create_dashboard(request: Request):
     except Exception:
         body = {}
 
+    source = str(body.get("source") or "browser").strip()[:20]
+    file = None
+    if source == "redline":
+        # the redline pipeline names the drawing printed on the sheet it was given
+        file = str(body.get("file") or "").strip() or None
+        if file:
+            for other in _dashboards.values():
+                if other["file"] and other["file"].lower() == file.lower():
+                    return JSONResponse({"error": f"'{file}' is already assigned to {other['name']}."},
+                                        status_code=400)
     did = str(_next_id)
     _next_id += 1
     _dashboards[did] = {
         "name": (body.get("name") or f"Dashboard {did}").strip(),
-        "file": None,
+        "file": file,
+        "source": source,
         "created": time.time(),
     }
     await _broadcast({"type": "dashboard_created", "dashboard": did,
                       "name": _dashboards[did]["name"], "_ts": time.time()})
+    if file:
+        await _broadcast({"type": "dashboard_file_set", "dashboard": did, "file": file, "_ts": time.time()})
     return {"id": did, **{k: v for k, v in _dashboards[did].items() if k != "created"}}
 
 
@@ -241,6 +282,11 @@ async def set_dashboard_file(dashboard_id: str, request: Request):
 
 RUN_POLICIES = ("warn", "pause", "stop")
 _RUNS_FILE = UPLOAD_DIR / "runs.json"
+# The grading key map read for a dashboard (its sheet cells), kept in memory by
+# dashboard id and mirrored to disk by the TARGET drawing's path: dashboard ids
+# start over when the server restarts, the drawing's path does not.
+_KEYMAPS_FILE = UPLOAD_DIR / "keymaps.json"
+_keymaps: dict[str, dict] = {}               # dashboard id -> key map record
 
 _run_counter = 0
 _runs: dict[str, "Run"] = {}                 # dashboard id -> its latest run
@@ -383,6 +429,144 @@ def _load_runs() -> None:
 _load_runs()
 
 
+def _keymap_record(dashboard_id: str) -> dict | None:
+    """The key map read for this dashboard: from memory, else the one saved for
+    the dashboard's drawing (promoted into memory)."""
+    rec = _keymaps.get(dashboard_id)
+    if rec:
+        return rec
+    d = _dashboards.get(dashboard_id)
+    if not d or not d.get("file"):
+        return None
+    try:
+        with _KEYMAPS_FILE.open("r", encoding="utf-8") as f:
+            stored = json.load(f)
+    except Exception:
+        return None
+    rec = stored.get(spatial_cache.drawing_key(d["file"])) if isinstance(stored, dict) else None
+    if isinstance(rec, dict) and rec.get("cells"):
+        _keymaps[dashboard_id] = rec
+        return rec
+    return None
+
+
+def _store_keymap(dashboard_id: str, record: dict) -> None:
+    _keymaps[dashboard_id] = record
+    try:
+        try:
+            with _KEYMAPS_FILE.open("r", encoding="utf-8") as f:
+                stored = json.load(f)
+        except Exception:
+            stored = {}
+        if not isinstance(stored, dict):
+            stored = {}
+        stored[spatial_cache.drawing_key(record["target"])] = record
+        _KEYMAPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _KEYMAPS_FILE.open("w", encoding="utf-8") as f:
+            json.dump(stored, f)
+    except Exception:
+        pass    # best effort, like the run history
+
+
+async def _read_key_map(dashboard_id: str, file: str, params: dict) -> dict:
+    """Reads the key map drawing (params.key_map_file, else the plan type's
+    key_map.file) through the plugin, turns its linework into cells, and keeps
+    the result for the dashboard. Raises RuntimeError with the reason."""
+    plan_type = str(params.get("plan_type") or "grading").strip() or "grading"
+    km_spec: dict = {}
+    try:
+        km_spec = dict(sheets.load_spec(plan_type).get("key_map") or {})
+    except (sheets.SheetError, playbooks.PlaybookError) as e:
+        if not params.get("key_map_file"):
+            raise RuntimeError(f"no key map file given and the {plan_type} sheet spec cannot name one: {e}")
+    path = str(params.get("key_map_file") or km_spec.get("file") or "").strip()
+    if not path:
+        raise RuntimeError("say which drawing is the key map: key_map_file on the block, or key_map.file "
+                           f"in playbooks/{plan_type}/sheets.json")
+    if spatial_cache.drawing_key(path) == spatial_cache.drawing_key(file):
+        raise RuntimeError("the key map must be a different drawing from the one the sheets go in")
+
+    def pick(name, default):
+        v = params.get(name)
+        return v if v not in (None, "", [], 0) else km_spec.get(name, default)
+
+    cell_layers = keymap.layer_list(pick("cell_layers", []))
+    key_layers = keymap.layer_list(pick("key_layers", []))
+    try:
+        snap = float(pick("snap", keymap.DEFAULT_SNAP) or keymap.DEFAULT_SNAP)
+    except (TypeError, ValueError):
+        raise RuntimeError("snap must be a number of feet")
+    pattern = str(pick("key_pattern", "") or "")
+    try:
+        # an empty layer list: model space only, no /nested merge (the cells are drawn here)
+        entry = await asyncio.to_thread(spatial_cache.get, path, [], PLUGIN_BASE)
+    except spatial_cache.PluginError as e:
+        raise RuntimeError(f"could not read the key map {path}: {e}")
+    try:
+        result = keymap.cells_from_snapshot(entry.data, cell_layers, key_layers, snap, pattern or None)
+    except keymap.KeyMapError as e:
+        raise RuntimeError(f"{path}: {e}")
+    words = keymap.describe_cells(result)
+    if not result["cells"]:
+        raise RuntimeError(f"no cell with a key found in {path}: " + "; ".join(w.strip() for w in words[1:8]))
+    record = {"file": path, "target": file, "read_at": time.time(), "revision": entry.revision,
+              "params": {"plan_type": plan_type, "cell_layers": cell_layers, "key_layers": key_layers,
+                         "snap": snap, "key_pattern": pattern},
+              "cells": result["cells"], "faces_without_key": result["faces_without_key"],
+              "keys_without_cell": result["keys_without_cell"], "counts": result["counts"],
+              "warnings": result["warnings"], "words": words}
+    _store_keymap(dashboard_id, record)
+    return record
+
+
+@app.post("/dashboards/{dashboard_id}/keymap")
+async def read_keymap(dashboard_id: str, request: Request):
+    """Reads the grading key map for this dashboard and keeps its cells.
+    Body: {key_map_file?, plan_type?, cell_layers?, key_layers?, snap?, key_pattern?}."""
+    d = _dashboards.get(dashboard_id)
+    if d is None:
+        return JSONResponse({"error": f"No dashboard '{dashboard_id}'."}, status_code=404)
+    if not d["file"]:
+        return JSONResponse({"error": "Assign a drawing to this dashboard first: the key map's cells "
+                                      "are kept for that drawing."}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        return await _read_key_map(dashboard_id, d["file"], body if isinstance(body, dict) else {})
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.get("/dashboards/{dashboard_id}/keymap")
+async def get_keymap(dashboard_id: str):
+    d = _dashboards.get(dashboard_id)
+    if d is None:
+        return JSONResponse({"error": f"No dashboard '{dashboard_id}'."}, status_code=404)
+    rec = _keymap_record(dashboard_id)
+    if rec is None:
+        return {"cells": [], "why": "no key map read for this dashboard yet: run the Grading Key Map block "
+                                    "or read_key_map first"}
+    return rec
+
+
+@app.get("/dashboards/{dashboard_id}/keymap_cells")
+async def list_keymap_cells(dashboard_id: str):
+    """The keys of the cells read for this dashboard, for the Cut Grading Sheets
+    picker. Lists what was read; it never opens the key map on its own, so
+    drawing a form cannot open a drawing in Civil 3D."""
+    d = _dashboards.get(dashboard_id)
+    if d is None:
+        return JSONResponse({"error": f"No dashboard '{dashboard_id}'."}, status_code=404)
+    if not d["file"]:
+        return {"keymap_cells": [], "why": "no drawing assigned yet"}
+    rec = _keymap_record(dashboard_id)
+    if rec is None:
+        return {"keymap_cells": [], "why": "run the Grading Key Map block first"}
+    return {"keymap_cells": [c["key"] for c in rec.get("cells") or []]}
+
+
 @app.get("/dashboards/{dashboard_id}/alignments")
 async def list_alignment_names(dashboard_id: str):
     """Alignment names in the dashboard's assigned drawing.
@@ -416,7 +600,7 @@ async def list_alignment_names(dashboard_id: str):
 # Bumped whenever the server or its static files change in a way a running
 # instance cannot pick up. cad_mcp_server.py probes /version on startup and
 # treats a server that doesn't answer with this value as stale.
-DASHBOARD_VERSION = "2026-09-14.2"
+DASHBOARD_VERSION = "2026-09-28.2"
 
 
 @app.get("/version")
@@ -442,6 +626,22 @@ async def _expand(payload: dict, file: str, dashboard_id: str = None) -> list:
     expander = payload.get("expander")
     if expander == "sheets":
         return await _expand_sheets(payload, file)
+    if expander == "pressure_run":
+        return await _expand_pressure_run(payload, file)
+    if expander == "profile_views":
+        return await _expand_profile_views(payload, file)
+    if expander == "profile_sheets":
+        return await _expand_profile_sheets(payload, file)
+    if expander == "profile_place":
+        return await _expand_profile_place(payload, file)
+    if expander == "sanitary_profile":
+        return await _expand_sanitary_profile(payload, file)
+    if expander == "profile_labels":
+        return await _expand_profile_labels(payload, file)
+    if expander == "key_map":
+        return await _expand_key_map(payload, file, dashboard_id)
+    if expander == "grading_sheets":
+        return await _expand_grading_sheets(payload, file, dashboard_id)
     planners = {"driveways": driveways.plan, "swales": swales.plan}
     if expander not in planners:
         raise RuntimeError(f"Unknown expanding block '{expander}'.")
@@ -501,6 +701,120 @@ async def _expand(payload: dict, file: str, dashboard_id: str = None) -> list:
     return [{**p, "_block": block_id, "_expanded": True} for p in built]
 
 
+async def _expand_pressure_run(payload: dict, file: str) -> list:
+    """The lay_pressure_run block: the alignment offset to a path with hydrant
+    points (pressure_run.plan), as one plugin request with apply=true. The
+    gate reads the path from the payload itself."""
+    params = payload.get("params") or {}
+    try:
+        entry = await asyncio.to_thread(spatial_cache.get, file, None, PLUGIN_BASE)
+    except spatial_cache.PluginError as e:
+        raise RuntimeError(str(e))
+
+    def num(k, default=None):
+        v = params.get(k)
+        return default if v in (None, "") else float(v)
+
+    try:
+        request, _ = pressure_run.plan(
+            entry.data, params.get("alignment") or "", offset=num("offset", 10.0), side=params.get("side") or "right",
+            from_station=num("from_station"), to_station=num("to_station"), hydrant_every=num("hydrant_every", 0.0),
+            hydrant_part=params.get("hydrant_part") or "Hydrant", pipe_size=params.get("pipe_size") or "",
+            network=params.get("network") or "", parts_list=params.get("parts_list") or "", layer=params.get("layer") or "")
+    except pressure_run.PressureRunError as e:
+        raise RuntimeError(str(e))
+    request["apply"] = True
+    return [{**request, "_block": payload.get("_block"), "_expanded": True}]
+
+
+async def _expand_key_map(payload: dict, file: str, dashboard_id: str) -> list:
+    """The read_key_map block: reads the key map drawing, keeps its cells for
+    the dashboard, tells the run what it found, and adds no plugin step."""
+    started = time.time()
+    record = await _read_key_map(dashboard_id, file, payload.get("params") or {})
+    keys = [c["key"] for c in record["cells"]]
+    summary = {"file": record["file"], "count": len(keys), "keys": keys, "counts": record["counts"],
+               "faces_without_key": record["faces_without_key"], "keys_without_cell": record["keys_without_cell"],
+               "warnings": record["warnings"], "words": record["words"]}
+    run = _runs.get(dashboard_id)
+    if run is not None:
+        run.results.append({"step": 0, "tool": "read_key_map", "block": payload.get("_block"), "stage": "read",
+                            "ok": True, "error": None, "result": json.dumps(summary)[:_RESULT_KEEP],
+                            "duration_ms": round((time.time() - started) * 1000)})
+        run.warnings.extend(f"key map: {w}" for w in record["warnings"])
+    shown = ", ".join(keys[:12]) + (", ..." if len(keys) > 12 else "")
+    await _broadcast({"type": "keymap_read", "dashboard": dashboard_id, "run": run.id if run else None,
+                      "block": payload.get("_block"), "count": len(keys), "keys": keys[:40],
+                      "message": f"key map: {len(keys)} cell(s) ({shown})",
+                      "duration_ms": round((time.time() - started) * 1000), "_ts": time.time()})
+    return []
+
+
+async def _expand_grading_sheets(payload: dict, file: str, dashboard_id: str) -> list:
+    """The cut_grading_sheets block: label_grading then space_labels over the
+    whole drawing (the spec's grading.labels / grading.spacing) -- one pass
+    each, which is far faster than a pass per sheet -- then one sequence per
+    chosen key-map cell. label_scope "cells" runs the label pair inside each
+    cell's window instead (all the label steps first, then the sheets)."""
+    params = payload.get("params") or {}
+    plan_type = str(params.get("plan_type") or "grading").strip() or "grading"
+    try:
+        spec = sheets.load_spec(plan_type)
+    except (sheets.SheetError, playbooks.PlaybookError) as e:
+        raise RuntimeError(str(e))
+    record = _keymap_record(dashboard_id)
+    if not record:
+        raise RuntimeError("no key map read for this dashboard yet: run the Grading Key Map block "
+                           "(or read_key_map) first")
+    try:
+        entry = await asyncio.to_thread(spatial_cache.get, file, None, PLUGIN_BASE)
+    except spatial_cache.PluginError as e:
+        raise RuntimeError(str(e))
+    keys = params.get("cells") or []
+    if isinstance(keys, str):
+        keys = [k.strip() for k in keys.split(",") if k.strip()]
+    scale = params.get("scale")
+    try:
+        plan = sheets.plan_from_cells(entry.index, spec, record["cells"], plan_type,
+                                      scale=float(scale) if scale not in (None, "", 0) else None,
+                                      keys=[str(k) for k in keys] or None)
+        built = sheets.sheet_payloads(plan, spec, entry.index, entry.data, plan_type, drawing=file,
+                                      title=str(params.get("title") or ""))
+    except sheets.SheetError as e:
+        raise RuntimeError(str(e))
+    block_id = payload.get("_block")
+    out = []
+    if _truthy(params.get("labels", True)):
+        grading = spec.get("grading") or {}
+
+        def label_pair():
+            for block_type, section in (("label_grading", "labels"), ("space_labels", "spacing")):
+                try:
+                    yield blocks.build_block(block_type, {**(grading.get(section) or {}), "apply": True})
+                except ValueError as e:
+                    raise RuntimeError(f"grading.{section} in the {plan_type} sheet spec: {e}")
+
+        # the label steps are part of the sheet cut (the _sheet marker keeps the run
+        # a sheet cut, so its checks judge the whole drawing)
+        if str(params.get("label_scope") or "drawing").lower() == "cells":
+            for sheet, seq in zip(plan["sheets"], built):
+                for p in label_pair():
+                    p["window"] = [list(sheet["window"][0]), list(sheet["window"][1])]
+                    out.append({**p, "_sheet": seq["_sheet"], "_block": block_id, "_expanded": True})
+        else:
+            for p in label_pair():
+                out.append({**p, "_sheet": {"n": 0, "layout": "", "scope": "drawing"},
+                            "_block": block_id, "_expanded": True})
+    out.extend({**p, "_block": block_id, "_expanded": True} for p in built)
+    run = _runs.get(dashboard_id)
+    if plan["warnings"]:
+        if run is not None:
+            run.warnings.extend(f"grading sheets: {w}" for w in plan["warnings"])
+        await _broadcast({"type": "run_warning", "dashboard": dashboard_id, "tool": "cut_grading_sheets",
+                          "message": "; ".join(plan["warnings"])[:400], "_ts": time.time()})
+    return out
+
+
 async def _expand_sheets(payload: dict, file: str) -> list:
     """The cut_sheets block: the plan type's sheet spec, the drawing's index,
     then one sequence per sheet (see sheets.py). The plan itself is kept on
@@ -531,6 +845,221 @@ async def _expand_sheets(payload: dict, file: str) -> list:
         raise RuntimeError(str(e))
     block_id = payload.get("_block")
     return [{**p, "_block": block_id, "_expanded": True} for p in built]
+
+
+def _alignment_names(params: dict) -> list:
+    raw = params.get("alignment")
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    return [str(a).strip() for a in raw or [] if str(a).strip()]
+
+
+async def _plan_profile_views(params: dict, file: str, skip_existing: bool = False) -> tuple:
+    """(draw request, spec): the plugin's profile_context read and the views planned
+    (profiles.plan: 1000 ft windows from 1+00, 36/40 ft spans, split to 500 ft, two to a
+    sheet window). skip_existing: an alignment whose views exist is left out, not refused."""
+    plan_type = str(params.get("plan_type") or "sanitary").strip()
+    try:
+        spec = sheets.load_spec(plan_type)
+    except (sheets.SheetError, playbooks.PlaybookError):
+        spec = sheets.default_spec(plan_type)      # views need no template; the profile defaults do
+    request = {"intent": "profile_context", "file": file}
+    names = _alignment_names(params)
+    if names:
+        request["alignments"] = names
+    if params.get("surface"):
+        request["surface"] = str(params["surface"])
+    try:
+        response = await asyncio.to_thread(requests.post, f"{PLUGIN_BASE}/execute", json=request, timeout=LONG_PLUGIN_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"profile_context: the plugin did not answer ({e})")
+    error = _plugin_failure(response)
+    if error:
+        raise RuntimeError(f"profile_context: {error}")
+    try:
+        context = response.json()
+    except ValueError:
+        raise RuntimeError("profile_context: the plugin did not answer with JSON")
+    try:
+        entry = await asyncio.to_thread(spatial_cache.get, file, None, PLUGIN_BASE)
+        data = entry.data
+    except spatial_cache.PluginError:
+        data = None
+    styles = {}
+    if params.get("structure_label"):
+        styles["structure_label"] = str(params["structure_label"])
+    span = params.get("span")
+    try:
+        draw, _summary = profiles.plan(
+            context, span=float(span) if span not in (None, "") else None, alignments=names or None,
+            styles=styles, spec=spec, data=data, station_host=str(params.get("station_host") or ""),
+            surface=str(params.get("surface") or ""), skip_existing=skip_existing)
+    except profiles.ProfileError as e:
+        raise RuntimeError(str(e))
+    draw["apply"] = True
+    return draw, spec
+
+
+async def _expand_profile_views(payload: dict, file: str) -> list:
+    """The draw_profile_views block: the views planned and drawn (apply=true), then
+    the deferred placement (arrange + labels). The gate reads the planned boxes
+    from the payload's proposed."""
+    params = payload.get("params") or {}
+    draw, _spec = await _plan_profile_views(params, file)
+    # the order is draw the views -> arrange them -> place labels and dimension lines: the
+    # draw creates views and labels only; the placement is a deferred block, planned at its
+    # turn from the drawing as the draw left it (an arrange first, then the placement pass),
+    # so nothing placed is left behind by a move
+    drag = {"intent": "drag_profile_labels", "views": [v["name"] for v in draw.get("views") or []],
+            "styles": draw.get("styles"), "dim_lines": draw.get("dim_lines"), "drag_to_datum": draw.get("drag_to_datum"),
+            "dimension_anchor": {**(draw.get("dimension_anchor") or {}), "at_creation": False},
+            "station_host": draw.get("station_host"), "station_increment": draw.get("station_increment"),
+            # anchors: the per-label DimensionAnchorOption/Value pair (verified live 2026-09-17,
+            # 62/62, no crash); the label-group Default* pair is the one that crashed Civil 3D
+            # the MH labels are created with their styles and left alone (user's call 2026-09-17;
+            # anchor values are FEET in the API -- the spec's -3.0 in drew a 36 in tail)
+            "do": {"dim_lines": True, "anchors": False, "reset_structure_anchors": True, "pipes": True, "stations": True},
+            "proposed": draw.get("proposed")}
+    place = {"intent": "__expand__", "expander": "profile_place", "params": {**params, "drag": drag}}
+    return [{**draw, "_block": payload.get("_block"), "_expanded": True},
+            {**place, "_block": payload.get("_block")}]
+
+
+async def _expand_profile_place(payload: dict, file: str) -> list:
+    """The second half of the draw_profile_views block, planned at its turn: the drawing's
+    profile views arranged into their sheet windows (two per sheet, alphabetical -- the views
+    the draw just made and any unpaired ones), THEN the placement pass that anchors the
+    structure labels, inserts and stretches the dimension lines and seats the pipe and
+    station labels on the views where they now stand."""
+    params = payload.get("params") or {}
+    plan_type = str(params.get("plan_type") or "sanitary").strip()
+    try:
+        spec = sheets.load_spec(plan_type)
+    except (sheets.SheetError, playbooks.PlaybookError):
+        spec = sheets.default_spec(plan_type)
+    block_id = payload.get("_block")
+    out = []
+    try:
+        entry = await asyncio.to_thread(spatial_cache.get, file, None, PLUGIN_BASE)
+    except spatial_cache.PluginError as e:
+        raise RuntimeError(str(e))
+    try:
+        arrange, _groups = sheets.arrange_profile_views(entry.data, spec, plan_type, alignments=_alignment_names(params) or None)
+        if arrange.get("views"):
+            arrange["dim_lines"] = dict(profiles.profile_spec(spec).get("dim_line") or {})
+            out.append({**arrange, "_block": block_id, "_expanded": True})
+    except sheets.SheetError as e:
+        if not str(e).startswith("no profile views to arrange"):
+            raise RuntimeError(str(e))
+    drag = params.get("drag")
+    if isinstance(drag, dict) and drag.get("views"):
+        out.append({**drag, "_block": block_id, "_expanded": True})
+    return out
+
+
+async def _expand_sanitary_profile(payload: dict, file: str) -> list:
+    """The Create Sanitary Profile block, in this SET order:
+    1. draw JUST the profile views (no labels, no blocks), alphabetical by alignment,
+       one transaction per alignment so an alignment that fails is skipped;
+       alignments whose views already exist are left out;
+    2. arrange the views two to a sheet window, centred, and cut the sheets
+       (deferred profile_sheets, planned once the views exist);
+    3. LAST, create and place the labels and the dimension line on every view
+       (deferred profile_labels): pipe and station labels anchored to the view
+       bottom, the "MH" and "MH -> Alignment" labels left where their styles put
+       them."""
+    params = payload.get("params") or {}
+    block_id = payload.get("_block")
+    draw, _spec = await _plan_profile_views(params, file, skip_existing=True)
+    out = []
+    if draw.get("views"):
+        draw["skip_failures"] = True
+        out.append({**draw, "_block": block_id, "_expanded": True})
+    sheet_params = {k: params.get(k) for k in ("plan_type", "alignment", "alignments", "title") if k in params}
+    out.append({"intent": "__expand__", "expander": "profile_sheets", "params": {**sheet_params, "tolerant": True}, "_block": block_id})
+    label_params = {k: params.get(k) for k in ("plan_type", "alignment", "alignments", "station_host", "structure_label") if k in params}
+    label_params["styles"] = draw.get("styles") or {}
+    out.append({"intent": "__expand__", "expander": "profile_labels", "params": label_params, "_block": block_id})
+    return out
+
+
+async def _expand_profile_labels(payload: dict, file: str) -> list:
+    """The last step of Create Sanitary Profile, planned at its turn: one
+    drag_profile_labels over the drawing's profile views of the chosen
+    alignments. It creates the labels a view lacks and the dimension line, and
+    anchors the pipe and station labels to the view bottom; the MH labels are
+    created and left alone (do.anchors off, no placement default at creation)."""
+    params = payload.get("params") or {}
+    plan_type = str(params.get("plan_type") or "sanitary").strip()
+    try:
+        spec = sheets.load_spec(plan_type)
+    except (sheets.SheetError, playbooks.PlaybookError):
+        spec = sheets.default_spec(plan_type)
+    ps = profiles.profile_spec(spec)
+    try:
+        entry = await asyncio.to_thread(spatial_cache.get, file, None, PLUGIN_BASE)
+    except spatial_cache.PluginError as e:
+        raise RuntimeError(str(e))
+    pvs = sheets.profile_views_in(entry.data, _alignment_names(params) or None)
+    if not pvs:
+        return []
+    boxes = []
+    for pv in pvs:
+        try:
+            x0, y0, x1, y1 = sheets._ring_box(pv["extents"])
+            boxes.append({"min": [x0, y0 - 60.0], "max": [x1, y1]})
+        except (KeyError, TypeError, ValueError):
+            pass
+    styles = dict(ps.get("styles") or {})
+    styles.update({k: v for k, v in (params.get("styles") or {}).items() if v})
+    if params.get("structure_label"):
+        styles["structure_label"] = str(params["structure_label"])
+    host = str(params.get("station_host") or ps.get("station_host") or "eg").strip().lower()
+    drag = {"intent": "drag_profile_labels", "views": [pv.get("name") for pv in pvs],
+            "styles": styles, "dim_lines": dict(ps.get("dim_line") or {}),
+            "drag_to_datum": {"pipe": True, "station": True, "lift": ps["drag_lift"]},
+            "dimension_anchor": {**dict(ps.get("dimension_anchor") or {}), "at_creation": False},
+            "station_host": host, "station_increment": ps["station_increment"],
+            "do": {"dim_lines": True, "anchors": False, "reset_structure_anchors": True, "pipes": True, "stations": True},
+            "proposed": {"boxes": boxes, "segments": []}}
+    return [{**drag, "_block": payload.get("_block"), "_expanded": True}]
+
+
+async def _expand_profile_sheets(payload: dict, file: str) -> list:
+    """The cut_profile_sheets block: the drawing's profile views (as the drawing
+    is NOW -- this block is expanded at its turn) on sheets, two per sheet."""
+    params = payload.get("params") or {}
+    plan_type = str(params.get("plan_type") or "sanitary").strip()
+    try:
+        spec = sheets.load_spec(plan_type)
+    except (sheets.SheetError, playbooks.PlaybookError) as e:
+        raise RuntimeError(str(e))
+    try:
+        entry = await asyncio.to_thread(spatial_cache.get, file, None, PLUGIN_BASE)
+    except spatial_cache.PluginError as e:
+        raise RuntimeError(str(e))
+    tolerant = bool(params.get("tolerant"))
+    try:
+        # the views are first moved into their sheet windows (two per sheet, alphabetical),
+        # then every sheet is built from those planned windows
+        arrange, groups = sheets.arrange_profile_views(entry.data, spec, plan_type, alignments=_alignment_names(params) or None)
+        arrange["dim_lines"] = dict(profiles.profile_spec(spec).get("dim_line") or {})
+    except sheets.SheetError as e:
+        if not (tolerant and str(e).startswith("no profile views to arrange")):
+            raise RuntimeError(str(e))
+        return []            # every view is on a sheet already: nothing to arrange, nothing to cut
+    try:
+        _plan, built = sheets.profile_sheet_payloads(
+            entry.data, entry.index, spec, plan_type, drawing=file, title=str(params.get("title") or ""),
+            alignments=_alignment_names(params) or None, groups=groups)
+    except sheets.SheetError as e:
+        if not tolerant:
+            raise RuntimeError(str(e))
+        built = []
+    block_id = payload.get("_block")
+    out = [{**arrange, "_block": block_id, "_expanded": True}] if arrange.get("views") else []
+    out.extend({**p, "_block": block_id, "_expanded": True} for p in built)
+    return out
 
 
 async def _warn_conflicts(dashboard_id: str, tool: str, index, payloads: list) -> list:
@@ -600,21 +1129,23 @@ async def _run_sequence(run: "Run") -> None:
         _touch(run)
         resolved = []
         for payload in commands:
-            if payload.get("intent") == "__expand__":
+            if payload.get("intent") == "__expand__" and payload.get("expander") not in DEFERRED_EXPANDERS:
                 resolved.extend(await _expand(payload, file, dashboard_id))
             else:
                 resolved.append(payload)
         commands = resolved
         run.total = len(commands)
         # A sheet cut draws nothing in model space, so its acceptance checks
-        # judge the whole drawing rather than "what the run created".
-        run.sheet_cut = bool(commands) and all(isinstance(p, dict) and "_sheet" in p for p in commands)
+        # judge the whole drawing rather than "what the run created". (A grading
+        # cut's label steps carry _sheet too: they belong to a sheet.)
+        run.sheet_cut = bool(commands) and all(
+            isinstance(p, dict) and ("_sheet" in p or p.get("expander") in DEFERRED_EXPANDERS) for p in commands)
 
         # The index from before the run: the gate for every payload, expanded
         # or hand-built, and the "before" half of the post-run check. Built
         # once per run, however many steps follow.
         writes = [p for p in commands
-                  if str(p.get("intent") or "") not in spatial.READ_ONLY_INTENTS]
+                  if str(p.get("intent") or "") not in spatial.READ_ONLY_INTENTS and p.get("intent") != "__expand__"]
         conflicts = []
         if writes:
             try:
@@ -638,7 +1169,22 @@ async def _run_sequence(run: "Run") -> None:
         _touch(run)
         await _broadcast({"type": "run_started", "dashboard": dashboard_id, "run": run.id,
                           "total": len(commands), "_ts": time.time()})
-        for index, payload in enumerate(commands, start=1):
+        i = 0
+        while i < len(commands):
+            payload = commands[i]
+            if payload.get("intent") == "__expand__":
+                # deferred: planned against the drawing as the earlier steps left it
+                try:
+                    expanded = await _expand(payload, file, dashboard_id)
+                except Exception as e:
+                    raise RuntimeError(f"{payload.get('expander')} could not be planned at its turn: {e}")
+                commands[i:i + 1] = expanded
+                run.total = len(commands)
+                writes.extend(p for p in expanded if str(p.get("intent") or "") not in spatial.READ_ONLY_INTENTS)
+                if not expanded:
+                    continue
+                payload = commands[i]
+            index = i + 1
             tool = payload["intent"]
             started = time.time()
             # "block" travels with every event so the browser can highlight the
@@ -658,7 +1204,11 @@ async def _run_sequence(run: "Run") -> None:
             # proposed labels checked against the drawing, the run's policy
             # applied, and only then the real (apply) step.
             if tool in _COMPUTE_FIRST and _truthy(body.get("apply", True)) and before is not None:
-                await _gate_compute_first(run, before, body, index, timeout)
+                proposed = await _gate_compute_first(run, before, body, index, timeout)
+                if proposed:
+                    # what the compute pass proposed is what the apply pass draws:
+                    # the verifier plans those cells, so the labels are not "unexpected"
+                    writes.append({"proposed": proposed, "layer": body.get("layer", "")})
 
             try:
                 response = await asyncio.to_thread(
@@ -691,6 +1241,7 @@ async def _run_sequence(run: "Run") -> None:
                 raise RuntimeError(error)
             completed += 1
             run.done = completed
+            i += 1
     except asyncio.CancelledError:
         outcome = "stopped"
         raise
@@ -737,10 +1288,11 @@ def _truthy(value) -> bool:
     return bool(value)
 
 
-async def _gate_compute_first(run: "Run", before, body: dict, index: int, timeout: float) -> None:
+async def _gate_compute_first(run: "Run", before, body: dict, index: int, timeout: float):
     """Runs a label command's compute stage, checks what it proposes against
     the drawing, and applies the run's conflict policy before the apply step.
-    The compute report is kept on the run record so a chat can read it."""
+    The compute report is kept on the run record so a chat can read it.
+    Returns the proposed geometry (None when the compute pass gave none)."""
     started = time.time()
     compute = {**body, "apply": False}
     try:
@@ -765,14 +1317,14 @@ async def _gate_compute_first(run: "Run", before, body: dict, index: int, timeou
                            f"{report.get('message') or report.get('error') or 'see results'}")
     proposed = report.get("proposed")
     if not proposed:
-        return
+        return None
     try:
         conflicts = before.conflicts([{"proposed": proposed, "layer": body.get("layer", "")}])
     except Exception as e:
         run.warnings.append(f"step {index}: proposed-geometry check skipped: {e}")
-        return
+        return proposed
     if not conflicts:
-        return
+        return proposed
     run.conflicts = list(run.conflicts) + conflicts
     await _broadcast({"type": "run_warning", "dashboard": run.dashboard, "tool": body.get("intent"),
                       "message": f"step {index}: {len(conflicts)} conflict(s) -- {_conflict_words(conflicts)}",
@@ -785,6 +1337,7 @@ async def _gate_compute_first(run: "Run", before, body: dict, index: int, timeou
         await _pause_for_decision(run, conflicts)
         run.status = "running"
         _touch(run)
+    return proposed
 
 
 async def _pause_for_decision(run: "Run", conflicts: list) -> None:
@@ -1089,6 +1642,47 @@ async def set_playbooks_dir(request: Request):
         return JSONResponse({"error": "path must be an existing folder"}, status_code=400)
     playbooks.PLAYBOOKS_DIR = path
     return {"ok": True, "playbooks_dir": path}
+
+
+# ── Redline reviews (written by redline/, read here) ─────────────────────────
+
+_REVIEWS_DIR = Path(cadagent_config.folder("review_dir", "reviews", str(UPLOAD_DIR / "reviews")))
+
+
+def _review_report(review_id: str) -> dict | None:
+    safe = "".join(ch for ch in str(review_id) if ch.isalnum() or ch in "-_")
+    if not safe:
+        return None
+    try:
+        with (_REVIEWS_DIR / safe / "report.json").open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+@app.get("/reviews")
+async def list_reviews(limit: int = 50):
+    """The redline reviews on disk, newest first: id, when, PDFs, counts."""
+    out = []
+    try:
+        folders = sorted((d for d in _REVIEWS_DIR.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True)
+    except OSError:
+        folders = []
+    for d in folders[:limit]:
+        rep = _review_report(d.name)
+        if rep:
+            out.append({"review_id": rep.get("review_id", d.name), "created": rep.get("created"),
+                        "pdfs": rep.get("pdfs"), "counts": rep.get("counts"),
+                        "unmatched_pages": len(rep.get("unmatched_pages") or []), "errors": len(rep.get("errors") or [])})
+    return {"reviews": out, "dir": str(_REVIEWS_DIR)}
+
+
+@app.get("/reviews/{review_id}")
+async def get_review(review_id: str):
+    rep = _review_report(review_id)
+    if rep is None:
+        return JSONResponse({"error": f"No review '{review_id}' under {_REVIEWS_DIR}."}, status_code=404)
+    return rep
 
 
 @app.get("/attention")

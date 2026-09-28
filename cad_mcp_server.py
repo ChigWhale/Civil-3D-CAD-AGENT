@@ -10,6 +10,8 @@ import dashboard_events
 import driveways
 import exemplars
 import playbooks
+import pressure_run
+import profiles
 import sheets
 import spatial
 import spatial_cache
@@ -1584,7 +1586,7 @@ def _compact_block(spec: dict, with_help: bool) -> dict:
             c["default"] = f["default"]
         elif f.get("optional"):
             c["optional"] = True
-        for k in ("choices", "min_items", "help"):
+        for k in ("options", "min_items", "help"):    # specs say "options"; "choices" never existed
             if k in f and f[k] not in (None, "", []):
                 c[k] = f[k]
         fields.append(c)
@@ -1598,13 +1600,17 @@ def _compact_block(spec: dict, with_help: bool) -> dict:
 @mcp.tool()
 @observed
 def list_blocks(dashboard: str, group: str = "", block_type: str = "", with_help: bool = False) -> str:
-    """The blocks a dashboard run can be built from, with their parameters --
-    the same palette the dashboard UI shows. A block is {"type": ..., "params":
+    """The blocks a dashboard run can be built from, with their parameters.
+    This is the full set; the dashboard UI's "Add block" menu offers only the
+    Generated group (the primitive draw / modify / layer blocks are quicker by
+    hand), but every block listed here runs through run_on_dashboard and shows
+    up in the lane once queued. A block is {"type": ..., "params":
     {...}, "repeat": n}; params use the field names listed here (a "points"
     field takes [[x,y],...], "handles" a list of handle strings, "multichoice"
     a list of names). Generated blocks (draw_driveways, draw_rear_swales,
-    label_grading, space_labels) read the drawing when they run, so they need
-    no coordinates. group narrows the list (Geometry, Generated, Layers, Draw,
+    label_grading, space_labels, cut_sheets, read_key_map, cut_grading_sheets,
+    the profile blocks) read the drawing when they run, so they need no
+    coordinates. group narrows the list (Geometry, Generated, Layers, Draw,
     Modify, Annotate, Query ...); block_type returns one block with its full
     help. Read spatial_map for the dashboard first, then compose, then call
     run_on_dashboard."""
@@ -2053,18 +2059,640 @@ def cut_sheets(dashboard: str, plan_type: str, scale: float = 0, max_sheets: int
                             label=f"cut {plan_type} sheets", checks=checks)
 
 
+# ── Grading sheets from a key map ─────────────────────────────────────────────
+#
+# A grading set's sheet windows are drawn in a separate key map drawing (a
+# rectangle per sheet with its number inside, in the same coordinates as the
+# plan). read_key_map keeps its cells for the dashboard; plan_grading_sheets
+# and cut_grading_sheets pick cells by key, label each cell's window with the
+# grading label commands and cut one sheet per cell.
+
+
+def _trim_cells(record: dict) -> list:
+    return [{k: c.get(k) for k in ("key", "center", "width", "height", "twist_deg", "row", "col", "corners")}
+            for c in record.get("cells") or []]
+
+
 @mcp.tool()
 @observed
-def list_sheets(dashboard: str) -> str:
+def read_key_map(dashboard: str, key_map_file: str = "", plan_type: str = "grading", cell_layers: str = "",
+                 key_layers: str = "", snap: float = 0, key_pattern: str = "") -> str:
+    """Reads the grading key map -- ANOTHER drawing, in the same coordinates as
+    the dashboard's, whose model space holds a rectangle per sheet with the
+    sheet's number written inside -- and keeps its cells for this dashboard, so
+    plan_grading_sheets / cut_grading_sheets can pick them by key. A cell is a
+    closed area of the linework (lines need not be closed polylines: endpoints
+    are snapped, crossings split, open tails ignored) holding a key text; a key
+    names the smallest area it sits in. Writes nothing; Civil 3D opens the key
+    map drawing if it is not already open.
+
+    key_map_file blank = key_map.file in playbooks/<plan_type>/sheets.json.
+    cell_layers / key_layers: comma-separated layer name suffixes (blank = the
+    spec's, else every layer). snap: feet of gap closed between lines (0 = the
+    spec's, 0.5). key_pattern: regex the key text must match (blank = the
+    spec's). Read the words: closed areas with no key and keys in no closed
+    area mean a layer or the snap needs adjusting until every sheet has a cell."""
+    body = {"plan_type": plan_type}
+    for k, v in (("key_map_file", key_map_file), ("cell_layers", cell_layers), ("key_layers", key_layers),
+                 ("key_pattern", key_pattern)):
+        if str(v or "").strip():
+            body[k] = str(v).strip()
+    if snap:
+        body["snap"] = snap
+    out = _dash_post(f"/dashboards/{dashboard}/keymap", body, timeout=300)
+    if "error" in out:
+        return json.dumps(out)
+    return json.dumps({"file": out.get("file"), "count": len(out.get("cells") or []), "cells": _trim_cells(out),
+                       "faces_without_key": out.get("faces_without_key"), "keys_without_cell": out.get("keys_without_cell"),
+                       "counts": out.get("counts"), "warnings": out.get("warnings"), "words": out.get("words"),
+                       "next": "plan_grading_sheets(dashboard, cells=\"1,2\") to see the sheets, "
+                               "cut_grading_sheets to make them"})
+
+
+@mcp.tool()
+@observed
+def list_key_map(dashboard: str) -> str:
+    """The key map cells read for this dashboard (see read_key_map): key, centre,
+    size and twist of each, plus the areas with no key and keys with no area."""
+    out = _dash_get(f"/dashboards/{dashboard}/keymap")
+    if "error" in out:
+        return json.dumps(out)
+    if not out.get("cells"):
+        return json.dumps({"count": 0, "cells": [], "why": out.get("why") or "no key map read yet"})
+    return json.dumps({"file": out.get("file"), "read_at": out.get("read_at"), "count": len(out["cells"]),
+                       "cells": _trim_cells(out), "faces_without_key": out.get("faces_without_key"),
+                       "keys_without_cell": out.get("keys_without_cell"), "warnings": out.get("warnings"),
+                       "words": out.get("words")})
+
+
+def _cell_keys(cells) -> list:
+    if isinstance(cells, (list, tuple)):
+        return [str(k).strip() for k in cells if str(k).strip()]
+    return [k.strip() for k in str(cells or "").split(",") if k.strip()]
+
+
+@mcp.tool()
+@observed
+def plan_grading_sheets(dashboard: str, plan_type: str = "grading", cells: str = "", scale: float = 0,
+                        title: str = "") -> str:
+    """Dry run of cut_grading_sheets: the sheets the chosen key-map cells make
+    in the dashboard's drawing -- layout name (GR-<key>), scale (from the
+    cell's size over the viewport, or `scale` in feet per inch), twist, the
+    cell window, what each holds, the furniture -- plus the label_grading /
+    space_labels parameters the cut runs first (once over the whole drawing).
+    Nothing is written. cells: comma-separated keys, blank = every cell. Needs
+    read_key_map first."""
+    try:
+        spec = sheets.load_spec(plan_type)
+    except (sheets.SheetError, playbooks.PlaybookError) as e:
+        return _err(e)
+    rec = _dash_get(f"/dashboards/{dashboard}/keymap")
+    if "error" in rec:
+        return json.dumps(rec)
+    if not rec.get("cells"):
+        return json.dumps({"error": rec.get("why") or "no key map read for this dashboard yet: call read_key_map first"})
+    try:
+        file = _file_for(dashboard)
+        entry = spatial_cache.get(file)
+        plan = sheets.plan_from_cells(entry.index, spec, rec["cells"], plan_type, scale=scale or None,
+                                      keys=_cell_keys(cells) or None)
+        payloads = sheets.sheet_payloads(plan, spec, entry.index, entry.data, plan_type, drawing=file, title=title)
+    except (sheets.SheetError, spatial_cache.PluginError, DashboardError) as e:
+        return _err(e)
+    per_sheet = []
+    for p, sh in zip(payloads, plan["sheets"]):
+        steps = p["steps"]
+        per_sheet.append({"key": sh["key"], "layout": sh["layout"], "scale": sh["scale"], "scale_text": sh["scale_text"],
+                          "twist_deg": sh["twist_deg"], "window": sh["window"], "size_ft": [sh["width"], sh["height"]],
+                          "holds": sh["tags"], "entities": len(sh["handles"]),
+                          "furniture": [st.get("name") or "mtext" for st in steps
+                                        if st["intent"] in ("insert_block", "draw_mtext", "attach_xref")],
+                          "tables": [st.get("title") or "table" for st in steps if st["intent"] == "create_table"],
+                          "steps": len(steps)})
+    vp = next((st for st in payloads[0]["steps"] if st["intent"] == "create_viewport"), {}) if payloads else {}
+    return json.dumps({**_sheet_plan_summary(plan), "key_map": rec.get("file"),
+                       "template": (spec.get("template") or {}).get("file") or "(plain layouts)",
+                       "frozen_in_viewports": len(vp.get("freeze_layers") or []),
+                       "words": sheets.describe_plan(entry.index, plan), "sheets": per_sheet,
+                       "label_params": spec.get("grading") or {}, "spec_warnings": sheets.spec_warnings(spec),
+                       "next": "cut_grading_sheets(dashboard, cells=...) runs this on the dashboard"})
+
+
+@mcp.tool()
+@observed
+def cut_grading_sheets(dashboard: str, plan_type: str = "grading", cells: str = "", scale: float = 0,
+                       title: str = "", labels: bool = True, label_scope: str = "drawing",
+                       on_conflict: str = "pause") -> str:
+    """Makes the grading sheets on the dashboard, in the background: label_grading
+    then space_labels once over the whole drawing (the spec's grading.labels /
+    grading.spacing parameters, each gated by a compute pass), then one
+    all-or-nothing sequence per chosen key-map cell (template layout cloned as
+    GR-<key>, viewport cut on the cell at its scale and twist, title block
+    filled with the key, furniture placed). cells: comma-separated keys, blank =
+    every cell; labels=False cuts the sheets only; label_scope "cells" runs the
+    label pair inside each cell's window instead of once over the drawing
+    (slower). Needs read_key_map first; call plan_grading_sheets to see the
+    plan. A layout that already exists makes that sheet fail rather than
+    overwrite it."""
+    scope = str(label_scope or "drawing").strip().lower()
+    if scope not in ("drawing", "cells"):
+        return json.dumps({"error": "label_scope must be drawing or cells"})
+    params = {"plan_type": plan_type, "cells": _cell_keys(cells), "title": title, "labels": bool(labels),
+              "label_scope": scope}
+    if scale:
+        params["scale"] = scale
+    checks = ""
+    try:
+        if any(p["plan_type"] == plan_type and p["checks"] for p in playbooks.list_playbooks()):
+            checks = plan_type
+    except Exception:
+        pass
+    return run_on_dashboard(dashboard, [{"type": "cut_grading_sheets", "params": params}], on_conflict=on_conflict,
+                            label=f"cut {plan_type} sheets", checks=checks)
+
+
+@mcp.tool()
+@observed
+def list_sheets(dashboard: str, verify: bool = False) -> str:
     """The sheets the dashboard's drawing already has: every layout with its
     viewports (scale, twist, model window, what the window holds in the index's
     words, frozen layer count), the blocks on the paper with their attributes,
-    and the tables. Read-only."""
+    and the tables. Read-only. verify=True adds, per viewport, the index's
+    sentence for the cell under the window's centre and its SW / NE corners
+    plus the raw view numbers: open that layout tab and compare -- a match on
+    one twisted and one untwisted sheet proves the window transform."""
     try:
         entry = spatial_cache.get(_file_for(dashboard))
     except (spatial_cache.PluginError, DashboardError) as e:
         return _err(e)
-    return json.dumps({"layouts": sheets.list_layouts(entry.data, entry.index)})
+    return json.dumps({"layouts": sheets.list_layouts(entry.data, entry.index, verify=verify)})
+
+
+# ── Redline reviews: scanned reviewer comments -> block chains ──────────────
+#
+# redline/ reads the handwriting on plotted sheets with a local vision model,
+# opens the drawing printed in each sheet's title block, maps every comment
+# through the viewport into model space, asks a local language model for a
+# chain of dashboard blocks and runs it. It is the one path that assigns a
+# drawing to a dashboard without the user doing it: the drawing is the one
+# printed on the PDF the user handed over. This tool takes a PDF path only.
+
+
+@mcp.tool()
+@observed
+def review_redlines(pdf_path: str, dry_run: bool = False, pages: str = "") -> str:
+    """Starts a redline review of a scanned, redlined plan-sheet PDF in the
+    background and returns at once. The pipeline reads each comment (local
+    vision model), finds the drawing and layout the sheet came from, locates
+    the comment in model space, composes a block chain per comment (local
+    language model) and runs the chains it can on a dashboard named
+    "Redline: <drawing>", skipping the rest with a reason. dry_run plans
+    without running. pages is "1,3" to limit the pages. Read the outcome
+    with review_status(review_id); runs also appear in dashboard_status.
+    Needs Ollama (or another OpenAI-compatible model server) running with
+    the configured models; `python -m redline doctor` says what is missing."""
+    import subprocess
+    import time as _time
+    path = str(pdf_path or "").strip().strip('"')
+    if not os.path.isfile(path) or not path.lower().endswith(".pdf"):
+        return json.dumps({"error": f"pdf_path must be an existing .pdf file, got {path!r}"})
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from redline import config as redline_config
+    settings = redline_config.load()
+    review_id = _time.strftime("%Y%m%d-%H%M%S")
+    out_dir = os.path.join(settings.review_dir, review_id)
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = [sys.executable, "-m", "redline", "review", path, "--review-id", review_id]
+    if dry_run:
+        cmd.append("--dry-run")
+    for p in str(pages or "").split(","):
+        if p.strip().isdigit():
+            cmd += ["--page", p.strip()]
+    log_path = os.path.join(out_dir, "review.log")
+    log = open(log_path, "w", encoding="utf-8")
+    subprocess.Popen(cmd, cwd=os.path.dirname(os.path.abspath(__file__)), stdout=log, stderr=subprocess.STDOUT,
+                     env=os.environ.copy())
+    return json.dumps({"review_id": review_id, "background": True, "report_path": os.path.join(out_dir, "report.json"),
+                       "log": log_path, "dry_run": dry_run,
+                       "note": "Started; this call does not wait. Reading the pages and planning take minutes on a "
+                               "local model. Call review_status(review_id) later; the report lists every comment as "
+                               "done, skipped (with the reason), failed or needing a person."})
+
+
+@mcp.tool()
+@observed
+def review_status(review_id: str = "") -> str:
+    """The report of a redline review: per page the drawing and layout matched
+    (or why not), per comment the transcription, where it landed, the chain
+    or the skip reason and the run's outcome. With review_id blank, lists
+    the reviews on disk. A review still running has a review.log but no
+    report.json yet."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from redline import config as redline_config
+    settings = redline_config.load()
+    root = settings.review_dir
+    if not review_id:
+        out = []
+        try:
+            names = sorted(os.listdir(root), reverse=True)
+        except OSError:
+            names = []
+        for n in names[:30]:
+            rp = os.path.join(root, n, "report.json")
+            if os.path.isfile(rp):
+                try:
+                    with open(rp, "r", encoding="utf-8") as f:
+                        rep = json.load(f)
+                    out.append({"review_id": n, "counts": rep.get("counts"), "pdfs": rep.get("pdfs"),
+                                "unmatched_pages": len(rep.get("unmatched_pages") or [])})
+                except (OSError, ValueError):
+                    continue
+            elif os.path.isfile(os.path.join(root, n, "review.log")):
+                out.append({"review_id": n, "status": "running or failed before the report; see review.log"})
+        return json.dumps({"reviews": out, "dir": root})
+    safe = "".join(ch for ch in str(review_id) if ch.isalnum() or ch in "-_")
+    rp = os.path.join(root, safe, "report.json")
+    if not os.path.isfile(rp):
+        lp = os.path.join(root, safe, "review.log")
+        tail = ""
+        if os.path.isfile(lp):
+            with open(lp, "r", encoding="utf-8", errors="replace") as f:
+                tail = f.read()[-1500:]
+        return json.dumps({"review_id": safe, "status": "no report yet", "log_tail": tail})
+    with open(rp, "r", encoding="utf-8") as f:
+        rep = json.load(f)
+    # compact: the markdown is easier to read than the full JSON
+    md = os.path.join(root, safe, "report.md")
+    summary = ""
+    if os.path.isfile(md):
+        with open(md, "r", encoding="utf-8") as f:
+            summary = f.read()[:6000]
+    return json.dumps({"review_id": safe, "counts": rep.get("counts"), "sheets": [
+        {k: s.get(k) for k in ("page_no", "dwg_path", "layout_name", "how", "reason")} for s in rep.get("sheets") or []],
+        "unmatched_pages": rep.get("unmatched_pages"), "errors": rep.get("errors"), "report_md": summary,
+        "report_path": rp})
+
+
+# ── Pressure networks: real water parts ──────────────────────────────────────
+
+
+@mcp.tool()
+@observed
+def list_pressure_parts(dashboard: str, parts_list: str = "", full: bool = False) -> str:
+    """The drawing's pressure networks (name, parts list, reference surface and
+    alignment, part counts) and every pressure parts list with its pipes,
+    fittings and appurtenances (description, type, family, nominal diameter,
+    material; elbow angle). Read this before lay_pressure_run to pick the
+    parts_list, pipe_size and hydrant/valve part names. Read-only."""
+    payload = {"intent": "list_pressure_parts", "full": bool(full)}
+    if parts_list:
+        payload["parts_list"] = parts_list
+    return _post(payload, _file_for(dashboard))
+
+
+@mcp.tool()
+@observed
+def lay_pressure_run(dashboard: str, alignment: str = "", offset: float = 10.0, side: str = "right",
+                     from_station: float | None = None, to_station: float | None = None,
+                     pipe_size: str = "", hydrant_every: float = 0.0, hydrant_part: str = "Hydrant",
+                     hydrant_size: str = "", network: str = "", parts_list: str = "", layer: str = "",
+                     apply: bool = False, background: bool = True) -> str:
+    """Lays a run of REAL Civil 3D pressure network parts (a water main): pipes
+    along `alignment` offset `offset` ft to `side` (right/left looking
+    up-station) between from_station and to_station (blank = the whole
+    alignment), bend fittings where the path turns, and a hydrant every
+    hydrant_every ft (0 = none). Parts come from the drawing's pressure parts
+    list: pipe_size and hydrant_part/hydrant_size match a part description or
+    nominal diameter (see list_pressure_parts). The network is created when it
+    does not exist.
+
+    apply=False (default) is the compute stage: the plugin resolves every part
+    and reports the geometry it would draw under `proposed`, plus the spatial
+    gate's verdict on it (crossings, pads) -- nothing is drawn. apply=True
+    draws it in one all-or-nothing transaction; with background=True that
+    happens as a dashboard run (paused on conflicts until resume_dashboard),
+    which is the right way for anything longer than a few pipes."""
+    try:
+        file = _file_for(dashboard)
+        entry = spatial_cache.get(file)
+        request, summary = pressure_run.plan(
+            entry.data, alignment, offset=offset, side=side, from_station=from_station, to_station=to_station,
+            hydrant_every=hydrant_every, hydrant_part=hydrant_part, hydrant_size=hydrant_size, pipe_size=pipe_size,
+            network=network, parts_list=parts_list, layer=layer)
+    except (pressure_run.PressureRunError, spatial_cache.PluginError, DashboardError) as e:
+        return _err(e)
+    if apply and background:
+        params = {"alignment": alignment, "offset": offset, "side": side, "pipe_size": pipe_size,
+                  "hydrant_every": hydrant_every, "hydrant_part": hydrant_part, "network": network,
+                  "parts_list": parts_list, "layer": layer}
+        if from_station is not None:
+            params["from_station"] = from_station
+        if to_station is not None:
+            params["to_station"] = to_station
+        return _run_in_background(dashboard, "lay_pressure_run", params, f"water run along {summary['alignment']}")
+    request["apply"] = bool(apply)
+    if apply:
+        return _post(request, file)             # gated on the path, verified afterwards
+    text = _post_raw(request, file)
+    try:
+        report = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(report, dict):
+        return text
+    report["plan"] = summary
+    try:
+        conflicts = entry.index.conflicts([request]) if _GATE_ON else []
+    except Exception:
+        conflicts = []
+    if conflicts:
+        report["spatial_conflicts"] = conflicts[:60]
+        report["spatial_conflict_count"] = len(conflicts)
+        report["spatial_note"] = ("The path crosses or lands on things in the drawing (see spatial_conflicts). "
+                                  "apply=True on the dashboard pauses on them; move the run or resume_dashboard "
+                                  "after reading them.")
+    return json.dumps(report)
+
+
+# ── Sanitary sewer profile views and sheets ──────────────────────────────────
+#
+# profile_context (plugin, read-only) -> profiles.plan (Python) -> draw_profile_views
+# (plugin, one transaction) -> cut_profile_sheets (sheets.profile_sheet_payloads,
+# two viewports per sheet). The rules are in profiles.py's docstring.
+
+
+def _post_long(payload: dict, file: str | None = None) -> str:
+    """A plain post with the handler timeout: whole-drawing Civil 3D work."""
+    try:
+        if file:
+            payload = {**payload, "file": file}
+        return requests.post(f"{BASE}/execute", json=payload, timeout=HANDLER_TIMEOUT).text
+    except requests.exceptions.ConnectionError:
+        return _NO_CONNECTION
+
+
+def _alignment_list(alignments) -> list:
+    if isinstance(alignments, str):
+        alignments = alignments.split(",")
+    return [str(a).strip() for a in alignments or [] if str(a).strip()]
+
+
+def _profile_context_dict(file: str, alignments="", network: str = "", surface: str = "") -> dict:
+    payload = {"intent": "profile_context"}
+    names = _alignment_list(alignments)
+    if names:
+        payload["alignments"] = names
+    if network:
+        payload["network"] = network
+    if surface:
+        payload["surface"] = surface
+    text = _post_long(payload, file)
+    try:
+        context = json.loads(text)
+    except ValueError:
+        raise profiles.ProfileError(f"profile_context did not answer with JSON: {text[:200]}")
+    if not isinstance(context, dict) or context.get("error") or context.get("ok") is False:
+        raise profiles.ProfileError(str((context or {}).get("error") or (context or {}).get("message") or text[:200]))
+    return context
+
+
+def _profile_spec(plan_type: str) -> dict:
+    try:
+        return sheets.load_spec(plan_type)
+    except (sheets.SheetError, playbooks.PlaybookError):
+        return sheets.default_spec(plan_type)
+
+
+def _profile_plan(dashboard: str, plan_type: str, alignments, span, station_host: str, surface: str,
+                  structure_label: str, styles_json: str):
+    file = _file_for(dashboard)
+    context = _profile_context_dict(file, alignments, surface=surface)
+    spec = _profile_spec(plan_type)
+    entry = spatial_cache.get(file)
+    styles = {}
+    if styles_json:
+        try:
+            styles = dict(json.loads(styles_json))
+        except (ValueError, TypeError) as e:
+            raise profiles.ProfileError(f"styles_json is not a JSON object: {e}")
+    if structure_label:
+        styles["structure_label"] = structure_label
+    request, summary = profiles.plan(
+        context, span=span or None, alignments=_alignment_list(alignments) or None, styles=styles, spec=spec,
+        data=entry.data, station_host=station_host or "", surface=surface or "")
+    return file, entry, context, request, summary
+
+
+@mcp.tool()
+@observed
+def profile_context(dashboard: str, alignments: str = "", network: str = "", surface: str = "") -> str:
+    """What the drawing offers for sanitary profile views, read-only: per
+    alignment its station range (and whether it starts at 1+00), the EG surface
+    elevations sampled along it, the pipes (station, invert, diameter, slope)
+    and manholes (station, rim, sump) of the pipe networks that sit on it,
+    existing profiles and profile views; every profile view style (with its
+    vertical exaggeration), band set, profile style, pipe / structure profile
+    label style and major station label style, with the drawing's defaults; the
+    drawing extent. Read this to confirm exact style names before drawing.
+    alignments: comma separated names (blank = all); network: one network name."""
+    try:
+        return _post_long({**{"intent": "profile_context"},
+                           **({"alignments": _alignment_list(alignments)} if _alignment_list(alignments) else {}),
+                           **({"network": network} if network else {}), **({"surface": surface} if surface else {})},
+                          _file_for(dashboard))
+    except DashboardError as e:
+        return _err(e)
+
+
+@mcp.tool()
+@observed
+def block_dynamic_properties(dashboard: str, name: str, source_file: str = "") -> str:
+    """What a block's grips control: its dynamic properties (name, value, units,
+    allowed values, read-only) read from a reference in the drawing, or from a
+    temporary reference that is discarded, plus the definition's X extents.
+    Read this for the profile dimension-line block (Ano-ProfDimLine) to see
+    which property stretches it. Read-only."""
+    try:
+        payload = {"intent": "block_dynamic_properties", "name": name}
+        if source_file:
+            payload["source_file"] = source_file
+        return _post_long(payload, _file_for(dashboard))
+    except DashboardError as e:
+        return _err(e)
+
+
+@mcp.tool()
+@observed
+def plan_profile_views(dashboard: str, plan_type: str = "sanitary", alignments: str = "", span: float = 0,
+                       station_host: str = "", surface: str = "", structure_label: str = "",
+                       styles_json: str = "") -> str:
+    """Dry run of draw_profile_views: the profile views the drawing's alignments
+    get -- 1000 ft windows from 1+00 (the whole length when shorter), a datum
+    per view (lowest invert / surface rounded down to an even foot) with the
+    36 or 40 ft span, windows split to 500 ft where the span cannot hold the
+    elevations, where each view goes in model space (east of the drawing), and
+    the gate's verdict on those boxes. Nothing is written. span 0 = the spec's
+    (40); station_host flowline|eg; styles_json = {"pipe_label": ..., ...}
+    overrides the spec's profile.styles."""
+    try:
+        file, entry, context, request, summary = _profile_plan(
+            dashboard, plan_type, alignments, span, station_host, surface, structure_label, styles_json)
+    except (profiles.ProfileError, sheets.SheetError, spatial_cache.PluginError, DashboardError) as e:
+        return _err(e)
+    try:
+        conflicts = entry.index.conflicts([request]) if _GATE_ON else []
+    except Exception:
+        conflicts = []
+    return json.dumps({"plan": summary, "words": profiles.describe(summary),
+                       "surface": (context.get("surface_pick") or {}).get("name"),
+                       "surface_error": context.get("surface_error"),
+                       "style_catalogue": context.get("styles"), "drawing_defaults": context.get("defaults"),
+                       "conflicts": conflicts[:60], "conflict_count": len(conflicts),
+                       "next": "draw_profile_views(dashboard, plan_type, ..., apply=True) draws this on the dashboard"})
+
+
+@mcp.tool()
+@observed
+def draw_profile_views(dashboard: str, plan_type: str = "sanitary", alignments: str = "", span: float = 0,
+                       station_host: str = "", surface: str = "", structure_label: str = "",
+                       styles_json: str = "", apply: bool = False, background: bool = True) -> str:
+    """Draws the sanitary profile views plan_profile_views describes, as REAL
+    Civil 3D objects in one all-or-nothing transaction: each alignment
+    restationed to 1+00, an EG surface profile (reused when one exists), a
+    flowline profile through the pipe inverts (station_host flowline), a profile
+    view per window with its station and elevation range, the network's pipes
+    and manholes added to it, a pipe label ("Prop -> Pipe Size -> slope") per
+    pipe dragged to just above the datum, two labels per manhole (the MH style
+    and "MH --> Alignment"), and "Flowline --> Major" station labels every 1+00
+    along the bottom. Style names are exact; a missing one falls back to the
+    drawing default with a warning.
+
+    apply=False (default): the plugin validates the plan (alignments, surface,
+    styles, free names) and reports without writing. apply=True with
+    background=True (default) runs it on the dashboard (paused on conflicts
+    until resume_dashboard); background=False posts it now, gated. Then
+    cut_profile_sheets, or produce_profile_sheets for both in one run."""
+    try:
+        file, entry, context, request, summary = _profile_plan(
+            dashboard, plan_type, alignments, span, station_host, surface, structure_label, styles_json)
+    except (profiles.ProfileError, sheets.SheetError, spatial_cache.PluginError, DashboardError) as e:
+        return _err(e)
+    if apply and background:
+        params = {"plan_type": plan_type, "alignment": _alignment_list(alignments),
+                  "span": f"{int(round(summary['span']))}", "station_host": summary["station_host"]}
+        if surface:
+            params["surface"] = surface
+        if structure_label:
+            params["structure_label"] = structure_label
+        return _run_in_background(dashboard, "draw_profile_views", params,
+                                  f"profile views ({summary['count']}) along " + ", ".join(a["alignment"] for a in summary["alignments"]))
+    request["apply"] = bool(apply)
+    if apply:
+        return _post(request, file)             # gated on the planned boxes, verified afterwards
+    text = _post_long(request, file)
+    try:
+        report = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(report, dict):
+        return text
+    report["plan"] = summary
+    report["words"] = profiles.describe(summary)
+    try:
+        conflicts = entry.index.conflicts([request]) if _GATE_ON else []
+    except Exception:
+        conflicts = []
+    if conflicts:
+        report["spatial_conflicts"] = conflicts[:60]
+        report["spatial_conflict_count"] = len(conflicts)
+        report["spatial_note"] = ("The planned view boxes land on things in the drawing (see spatial_conflicts); "
+                                  "move them with profile.placement in the sheet spec, or resume_dashboard after reading them.")
+    return json.dumps(report)
+
+
+@mcp.tool()
+@observed
+def cut_profile_sheets(dashboard: str, plan_type: str = "sanitary", alignments: str = "", title: str = "",
+                       on_conflict: str = "pause") -> str:
+    """Puts the drawing's profile views on sheets, on the dashboard: two stacked
+    viewports per sheet (the spec's profile.slots) at 1" = 40' (profile.scale),
+    the template layout cloned, the title block filled ({alignment} {stations}
+    {views} as well as the usual words), furniture placed. One all-or-nothing
+    sequence per sheet; layouts that already exist make the sheet fail rather
+    than overwrite. Needs playbooks/<type>/sheets.json (get_sheet_spec /
+    save_sheet_spec). alignments: comma separated (blank = every view)."""
+    params = {"plan_type": plan_type, "alignment": _alignment_list(alignments), "title": title}
+    checks = ""
+    try:
+        if any(p["plan_type"] == plan_type and p["checks"] for p in playbooks.list_playbooks()):
+            checks = plan_type
+    except Exception:
+        pass
+    return run_on_dashboard(dashboard, [{"type": "cut_profile_sheets", "params": params}], on_conflict=on_conflict,
+                            label=f"cut {plan_type} profile sheets", checks=checks)
+
+
+@mcp.tool()
+@observed
+def produce_profile_sheets(dashboard: str, plan_type: str = "sanitary", alignments: str = "", span: float = 0,
+                           station_host: str = "", surface: str = "", structure_label: str = "", title: str = "",
+                           on_conflict: str = "pause") -> str:
+    """The whole sanitary profile sheet production as one dashboard run: draw
+    the profile views (draw_profile_views), then cut the sheets over them
+    (cut_profile_sheets, planned at its turn so it sees the new views). Call
+    plan_profile_views first to read the plan. span 0 = the spec's."""
+    draw = {"plan_type": plan_type, "alignment": _alignment_list(alignments)}
+    if span:
+        draw["span"] = f"{int(round(float(span)))}"
+    if station_host:
+        draw["station_host"] = station_host
+    if surface:
+        draw["surface"] = surface
+    if structure_label:
+        draw["structure_label"] = structure_label
+    cut = {"plan_type": plan_type, "alignment": _alignment_list(alignments), "title": title}
+    checks = ""
+    try:
+        if any(p["plan_type"] == plan_type and p["checks"] for p in playbooks.list_playbooks()):
+            checks = plan_type
+    except Exception:
+        pass
+    return run_on_dashboard(dashboard, [{"type": "draw_profile_views", "params": draw},
+                                        {"type": "cut_profile_sheets", "params": cut}],
+                            on_conflict=on_conflict, label=f"{plan_type} profile sheets", checks=checks)
+
+
+@mcp.tool()
+@observed
+def create_sanitary_profile(dashboard: str, plan_type: str = "sanitary", alignments: str = "", span: float = 0,
+                            station_host: str = "", surface: str = "", structure_label: str = "", title: str = "",
+                            on_conflict: str = "pause") -> str:
+    """The whole sanitary profile production as ONE dashboard run in a set order:
+    1. draw just the profile views (no labels, no blocks), alphabetical by
+    alignment, one transaction per alignment so an alignment that fails is
+    skipped and reported; 2. arrange the views two to a sheet window, centred,
+    and cut the sheets (template layout by span, border xref, one full-sheet
+    viewport); 3. LAST, the labels and the dimension line on every view (pipe
+    and 1+00 station labels anchored to the view bottom, the MH and
+    MH -> Alignment labels where their styles put them). Alignments whose
+    views already exist are left alone. span 0 = the spec's."""
+    params = {"plan_type": plan_type, "alignment": _alignment_list(alignments), "title": title}
+    if span:
+        params["span"] = f"{int(round(float(span)))}"
+    if station_host:
+        params["station_host"] = station_host
+    if surface:
+        params["surface"] = surface
+    if structure_label:
+        params["structure_label"] = structure_label
+    checks = ""
+    try:
+        if any(p["plan_type"] == plan_type and p["checks"] for p in playbooks.list_playbooks()):
+            checks = plan_type
+    except Exception:
+        pass
+    return run_on_dashboard(dashboard, [{"type": "create_sanitary_profile", "params": params}],
+                            on_conflict=on_conflict, label=f"{plan_type} profile", checks=checks)
 
 
 @mcp.tool()
@@ -2093,7 +2721,12 @@ def check_drawing(dashboard: str, plan_type: str = "", checks_json: str = "", sc
         handles = set((run.get("verification") or {}).get("new_handles") or [])
         if not handles:
             return json.dumps({"error": "the latest run has no new handles to scope to; use scope='all'"})
-    results = checks_mod.evaluate(index, check_list, handles)
+    entry = spatial_cache.peek(_file_for(dashboard))
+    results = checks_mod.evaluate(index, check_list, handles, entry.data if entry else None)
+    if not getattr(index, "windows", None):
+        for r in results:
+            if r["kind"] == "covered" and not r["ok"]:
+                r["detail"]["note"] = "no sheets cut yet: expected to fail until cut_sheets has run"
     return json.dumps({"scope": scope, **checks_mod.summarize(results), "results": results})
 
 
@@ -2341,7 +2974,7 @@ _DASHBOARD_URL  = f"http://localhost:{_DASHBOARD_PORT}"
 # Point _HEALTH_PATH at a route the CURRENT server has and older ones don't, and
 # require the version stamp to match so a server running older code is replaced.
 _HEALTH_PATH = "/version"
-_DASHBOARD_VERSION = "2026-09-14.2"   # must equal dashboard/server.py DASHBOARD_VERSION
+_DASHBOARD_VERSION = "2026-09-28.2"   # must equal dashboard/server.py DASHBOARD_VERSION
 
 # How long a server gets to answer before it counts as failed or stale. Covers
 # uvicorn's own startup plus the sibling-process case described in _launch.

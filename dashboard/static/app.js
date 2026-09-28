@@ -11,8 +11,13 @@ const lanes = new Map();
 
 // Filled from GET /blocks before any lane is built: every palette button and
 // every parameter input is generated from these specs, so a block added to
-// blocks.py shows up here without touching this file.
+// blocks.py shows up here without touching this file. blockSpecs holds every
+// block the server can run, so a sequence composed by an LLM or restored from
+// storage always renders; paletteSpecs is the subset the "Add block" menu
+// offers (the Generated group -- the one-line, one-layer blocks are quicker by
+// hand and stay in the background for LLM-built chains).
 let blockSpecs = [];
+let paletteSpecs = [];
 let specsByType = new Map();
 let maxRepeat = 500;
 
@@ -157,7 +162,7 @@ function buildPalette(lane) {
   const search = lane.paletteSearch;
   const groups = new Map(); // group name -> [{spec, button}]
 
-  for (const spec of blockSpecs) {
+  for (const spec of paletteSpecs) {
     const group = spec.group || "Other";
     if (!groups.has(group)) groups.set(group, []);
     const btn = document.createElement("button");
@@ -193,7 +198,7 @@ function buildPalette(lane) {
     menu.appendChild(section);
     lane.paletteGroups.push({ section, items });
   }
-  lane.paletteCount.textContent = `${blockSpecs.length} commands`;
+  lane.paletteCount.textContent = `${paletteSpecs.length} commands`;
 
   search.addEventListener("focus", () => openPalette(lane));
   search.addEventListener("input", () => {
@@ -239,8 +244,8 @@ function filterPalette(lane, query) {
     shown += visible;
   }
   lane.paletteCount.textContent = terms.length
-    ? `${shown} of ${blockSpecs.length} commands`
-    : `${blockSpecs.length} commands`;
+    ? `${shown} of ${paletteSpecs.length} commands`
+    : `${paletteSpecs.length} commands`;
 }
 
 /** A block's starting parameters: whatever the spec calls a default, as a
@@ -791,6 +796,15 @@ function handleEvent(event) {
     setRunStatus(lane, `failed after ${event.completed}: ${event.error}`, "err");
     return;
   }
+  if (event.type === "keymap_read") {
+    // The Grading Key Map block read its cells: the Cut Grading Sheets picker
+    // lists them, so the lane's cached options are dropped and the forms redrawn.
+    addLogEntry(lane, { tool: "key map", _ts: event._ts, result: event.message,
+                        duration_ms: event.duration_ms || 0 }, "ok");
+    forgetOptions(lane);
+    renderSequence(lane);
+    return;
+  }
   if (event.type === "run_warning") {
     // The dry-run gate: a generated block checked its own output against the
     // drawing before posting. A crossing is worth a look, not a refusal, so it
@@ -894,6 +908,8 @@ async function loadBlockSpecs() {
   try {
     const data = await (await fetch("/blocks")).json();
     blockSpecs = data.blocks || [];
+    // An older server that doesn't send the flag shows everything, as before.
+    paletteSpecs = blockSpecs.filter((spec) => spec.palette !== false);
     specsByType = new Map(blockSpecs.map((spec) => [spec.type, spec]));
     if (data.max_repeat) maxRepeat = data.max_repeat;
   } catch (e) {

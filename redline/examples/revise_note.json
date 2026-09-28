@@ -1,0 +1,7 @@
+{
+  "comment": "CHANGE TO DR14",
+  "kind": "circle",
+  "context": {"paper_texts": [{"handle": "NT4", "text": "4. ALL WATER PIPE SHALL BE PVC C900 DR18.", "distance_in": 0.4}]},
+  "answer": {"blocks": [{"type": "edit_text", "params": {"handle": "NT4", "text": "4. ALL WATER PIPE SHALL BE PVC C900 DR14."}}]},
+  "why": "The comment sits on a paper-space note; edit that note's text in place, keeping the rest of the sentence."
+}

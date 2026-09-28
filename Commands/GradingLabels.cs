@@ -837,7 +837,7 @@ namespace CADAgent
         /// and FindElevationAtXY / label creation work on it like any other. The flags say whether the
         /// reference still resolves, so a stale or broken one can be seen before labels go on it.
         /// </summary>
-        private static List<(string name, CivilSurface s)> Surfaces(Transaction tr, CivilDocument civil)
+        internal static List<(string name, CivilSurface s)> Surfaces(Transaction tr, CivilDocument civil)
         {
             var found = new List<(string name, CivilSurface s)>();
             foreach (ObjectId id in civil.GetSurfaceIds())
@@ -886,7 +886,7 @@ namespace CADAgent
         /// name given the key is "fg". Nothing is guessed between several matches -- the message lists
         /// them (with their reference state) so the caller can pass the exact one.
         /// </summary>
-        private static CivilSurface ResolveSurface(Transaction tr, CivilDocument civil, string wanted, out List<string> names)
+        internal static CivilSurface ResolveSurface(Transaction tr, CivilDocument civil, string wanted, out List<string> names)
         {
             var found = Surfaces(tr, civil);
             names = found.Select(f => Describe(f.s)).ToList();
@@ -902,7 +902,7 @@ namespace CADAgent
             throw new ArgumentException($"'{key}' matches several surfaces ({string.Join(", ", partial.Select(p => Describe(p.s)))}); pass the exact 'surface' name.");
         }
 
-        private static List<(string name, ObjectId id)> StyleNames(Transaction tr, IEnumerable<ObjectId> ids)
+        internal static List<(string name, ObjectId id)> StyleNames(Transaction tr, IEnumerable<ObjectId> ids)
         {
             var list = new List<(string, ObjectId)>();
             foreach (ObjectId id in ids)
@@ -913,7 +913,7 @@ namespace CADAgent
         }
 
         /// <summary>Exact match first, then a unique case-insensitive substring match ("TC" finds "Top Curb (TC)").</summary>
-        private static ObjectId ResolveStyle(List<(string name, ObjectId id)> styles, string wanted, string what)
+        internal static ObjectId ResolveStyle(List<(string name, ObjectId id)> styles, string wanted, string what)
         {
             if (styles.Count == 0) throw new ArgumentException($"the drawing has no {what} styles.");
             if (string.IsNullOrWhiteSpace(wanted)) throw new ArgumentException($"no {what} style name was given.");
@@ -928,7 +928,7 @@ namespace CADAgent
         }
 
         /// <summary>A style choice: what was asked for, what will be used, and whether that is the drawing default.</summary>
-        private sealed class StylePick
+        internal sealed class StylePick
         {
             public string Requested, Name;
             public ObjectId Id;          // Null = let Civil 3D apply its own default at creation
@@ -962,7 +962,7 @@ namespace CADAgent
 
         /// <summary>Nothing requested → the default. Requested but missing → the default plus a warning.
         /// Never throws: a style name is a preference, not a precondition.</summary>
-        private static StylePick PickStyle(List<(string name, ObjectId id)> styles, string wanted, string what,
+        internal static StylePick PickStyle(List<(string name, ObjectId id)> styles, string wanted, string what,
                                            ObjectId defaultId, string defaultName, List<string> warnings)
         {
             var pick = new StylePick

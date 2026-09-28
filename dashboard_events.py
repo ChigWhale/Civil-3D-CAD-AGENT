@@ -19,7 +19,8 @@ import requests
 # 127.0.0.1, not "localhost": localhost resolves to IPv6 ::1 first on this machine
 # and stalls ~2s per request before falling back to IPv4 (measured 2.06s vs 0.015s).
 # Every tool call emits twice, so this overhead would be paid three times per call.
-DASHBOARD_BASE = os.environ.get("CAD_DASHBOARD_BASE", "http://127.0.0.1:8765")
+import cadagent_config
+DASHBOARD_BASE = cadagent_config.get("dashboard_base")
 SESSION_ID = os.getpid()
 _TIMEOUT = 1.5
 _FILE_TTL = 2.0

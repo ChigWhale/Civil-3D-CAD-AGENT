@@ -20,7 +20,10 @@ import time
 
 import checks as checks_mod
 
-PLAYBOOKS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playbooks")
+import cadagent_config
+# save_playbook writes here, so a packaged install seeds a copy in the data dir
+PLAYBOOKS_DIR = cadagent_config.folder("playbooks_dir", "playbooks",
+                                       os.path.join(os.path.dirname(os.path.abspath(__file__)), "playbooks"), seed=True)
 
 REQUIRED_SECTIONS = ["Scope", "Base", "Steps", "Rules of thumb", "Checks", "Vocabulary", "Open questions"]
 
@@ -274,7 +277,10 @@ def playbook_output_contract() -> str:
         "  ## Base             what the designer starts from (restate the base spec in words)",
         "  ## Steps            the ordered block sequence that produces the delta, with the",
         "                      parameters that mattered in the exemplars (use block names",
-        "                      from the palette; say where judgement is needed)",
+        "                      from the palette; say where judgement is needed). State the run",
+        "                      policy: on_conflict pause for production unless a step says why",
+        "                      warn is safe; and which checks are expected to fail mid-design",
+        "                      (covered fails until cut_sheets has run)",
         "  ## Rules of thumb   distances, offsets, spacings, sides, in the index's words",
         "  ## Checks           the same checks as the JSON, one line each, with the reason",
         "  ## Vocabulary       the tags this plan type needs and any layers still unnamed",

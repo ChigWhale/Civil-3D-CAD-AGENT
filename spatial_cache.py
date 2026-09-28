@@ -27,7 +27,8 @@ import requests
 
 import spatial
 
-PLUGIN_BASE = os.environ.get("CAD_PLUGIN_BASE", "http://127.0.0.1:5199")
+import cadagent_config
+PLUGIN_BASE = cadagent_config.get("plugin_base")
 TIMEOUT = 30
 REVISION_TIMEOUT = 5
 

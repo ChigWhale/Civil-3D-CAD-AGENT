@@ -1,7 +1,7 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <AssemblyName>CADAgent</AssemblyName>
     <RootNamespace>CADAgent</RootNamespace>
     <Nullable>enable</Nullable>
@@ -43,6 +43,11 @@
       <HintPath>$(AutoCADPath)\accoremgd.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <!-- Ribbon (Autodesk.Windows): the CAD-AGENT tab in Ribbon.cs -->
+    <Reference Include="AdWindows">
+      <HintPath>$(AutoCADPath)\AdWindows.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
 
     <!-- Civil3D database API -->
     <Reference Include="AeccDbMgd">
@@ -76,11 +81,29 @@
     <Compile Remove="Gambol\**" />
     <None Remove="Gambol\**" />
     <EmbeddedResource Remove="Gambol\**" />
+    <Compile Remove="MathDrill\**" />
+    <None Remove="MathDrill\**" />
+    <EmbeddedResource Remove="MathDrill\**" />
   </ItemGroup>
 
   <!-- Pipe elevation solver (ICadObjectHandler) exposed through /handler -->
   <ItemGroup>
     <ProjectReference Include="PipeInvertSetter\PipeInvertSetter.csproj" />
   </ItemGroup>
+
+  <!-- Developer autoload: once package\install-dev-bundle.ps1 has created the
+       Autodesk bundle, every build copies its output there, so the next Civil 3D
+       start loads the newest DLL and its ribbon tab without NETLOAD. A copy that
+       fails because Civil 3D holds the old DLL is a warning, never a build error. -->
+  <PropertyGroup>
+    <DevBundleDir>$(APPDATA)\Autodesk\ApplicationPlugins\CAD-Agent.bundle\Contents</DevBundleDir>
+  </PropertyGroup>
+  <Target Name="SyncDevBundle" AfterTargets="Build" Condition="Exists('$(DevBundleDir)')">
+    <ItemGroup>
+      <DevBundleFiles Include="$(OutDir)*.dll;$(OutDir)*.deps.json;$(OutDir)*.pdb" />
+    </ItemGroup>
+    <Copy SourceFiles="@(DevBundleFiles)" DestinationFolder="$(DevBundleDir)" ContinueOnError="WarnAndContinue" Retries="0" />
+    <Message Importance="high" Text="CAD-Agent: bundle synced to $(DevBundleDir) (restart Civil 3D to load it)" />
+  </Target>
 
 </Project>

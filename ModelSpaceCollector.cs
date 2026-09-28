@@ -487,6 +487,15 @@ namespace CADAgent
                         if (boundsJson != null) j["bounds"] = boundsJson;
                         if (kind != null) j["kind"] = kind;
                         if (pad != null) j["pad"] = pad;
+                        // The labelled object (a pipe, structure, pressure part, surface,
+                        // alignment ...): FeatureId on every Civil 3D label; general notes
+                        // have none. Read by name so a release without it costs one field.
+                        try
+                        {
+                            var fid = lbl.GetType().GetProperty("FeatureId")?.GetValue(lbl);
+                            if (fid is ObjectId oid && !oid.IsNull && !oid.IsErased) j["target"] = oid.Handle.ToString();
+                        }
+                        catch { }
                         labelArray.Add(j);
                     }
                     catch { }

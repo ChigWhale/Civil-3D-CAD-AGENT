@@ -37,8 +37,8 @@ namespace CADAgent
             Add("attach_pdf",             AttachPdf);
             Add("group_entities",         GroupEntities);
             Add("manage_layouts",         ManageLayouts, appThread: true);
-            Add("create_viewport",        CreateViewport);
-            Add("set_viewport",           SetViewport);
+            Add("create_viewport",        CreateViewport, appThread: true);   // LayoutManager
+            Add("set_viewport",           SetViewport,    appThread: true);
             Add("zoom_view",              ZoomView, appThread: true);
             Add("save_drawing",           SaveDrawing, appThread: true);
         }
@@ -391,42 +391,92 @@ namespace CADAgent
             return n;
         }
 
+        /// <summary>The block definition called `name`: already in the drawing, else imported
+        /// from `sourceFile` (the whole drawing as the block, or `sourceBlock` out of it).</summary>
+        internal static ObjectId ResolveBlockDefinition(Transaction tr, Database db, string name, string sourceFile, string sourceBlock)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("block name is required");
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            if (bt.Has(name)) return bt[name];
+            // a block library drawing may carry it under its own name too
+            if (!string.IsNullOrWhiteSpace(sourceBlock) && bt.Has(sourceBlock)) return bt[sourceBlock];
+            string source = sourceFile ?? throw new ArgumentException($"block '{name}' is not defined here; pass source_file (a .dwg) to import it");
+            if (!File.Exists(source)) throw new FileNotFoundException($"source_file not found: {source}");
+            ObjectId btrId;
+            using (var src = new Database(false, true))
+            {
+                src.ReadDwgFile(source, FileOpenMode.OpenForReadAndAllShare, true, null);
+                src.CloseInput(true);
+                // a library drawing that defines the block: take that definition; else the
+                // whole drawing becomes the block
+                string pick = sourceBlock;
+                if (pick == null)
+                {
+                    using (var str = src.TransactionManager.StartTransaction())
+                    {
+                        var srcBt = (BlockTable)str.GetObject(src.BlockTableId, OpenMode.ForRead);
+                        if (srcBt.Has(name)) pick = name;
+                        str.Commit();
+                    }
+                }
+                if (pick == null)
+                    btrId = db.Insert(name, src, true);
+                else
+                {
+                    using (var str = src.TransactionManager.StartTransaction())
+                    {
+                        var srcBt = (BlockTable)str.GetObject(src.BlockTableId, OpenMode.ForRead);
+                        if (!srcBt.Has(pick)) throw new ArgumentException($"'{source}' has no block named '{pick}'");
+                        var ids = new ObjectIdCollection { srcBt[pick] };
+                        var map = new IdMapping();
+                        src.WblockCloneObjects(ids, db.BlockTableId, map, DuplicateRecordCloning.Ignore, false);
+                        str.Commit();
+                    }
+                    bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    if (!bt.Has(pick)) throw new ArgumentException($"importing '{pick}' failed");
+                    btrId = bt[pick];
+                    if (!pick.Equals(name, StringComparison.OrdinalIgnoreCase))
+                        ((BlockTableRecord)tr.GetObject(btrId, OpenMode.ForWrite)).Name = name;
+                }
+            }
+            return btrId;
+        }
+
+        /// <summary>The X extent of a block definition's geometry relative to its base point
+        /// (minX..maxX); false when it has none. A dimension-line block's arrow tips are at
+        /// these extents, not at the base point, so a stretch must be measured from them.</summary>
+        internal static bool BlockDefinitionSpanX(Transaction tr, ObjectId btrId, out double minX, out double maxX)
+        {
+            minX = maxX = 0;
+            try
+            {
+                var btr = (BlockTableRecord)tr.GetObject(btrId, OpenMode.ForRead);
+                bool any = false; var ext = new Extents3d();
+                foreach (ObjectId id in btr)
+                {
+                    try
+                    {
+                        var e = tr.GetObject(id, OpenMode.ForRead) as AcadEntity;
+                        if (e == null) continue;
+                        var ge = e.GeometricExtents;
+                        if (!any) { ext = ge; any = true; } else ext.AddExtents(ge);
+                    }
+                    catch { }
+                }
+                if (!any) return false;
+                minX = ext.MinPoint.X; maxX = ext.MaxPoint.X;
+                return maxX - minX > 1e-6;
+            }
+            catch { return false; }
+        }
+
+        internal static double BlockDefinitionWidth(Transaction tr, ObjectId btrId) =>
+            BlockDefinitionSpanX(tr, btrId, out double a, out double b) ? b - a : 0.0;
+
         private static string InsertBlock(JObject req, Document doc) => InTransaction(doc, (tr, db) =>
         {
             string name = S(req["name"]) ?? throw new ArgumentException("name is required");
-            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
-            ObjectId btrId;
-            if (bt.Has(name)) btrId = bt[name];
-            else
-            {
-                string source = S(req["source_file"]) ?? throw new ArgumentException($"block '{name}' is not defined here; pass source_file (a .dwg) to import it");
-                if (!File.Exists(source)) throw new FileNotFoundException($"source_file not found: {source}");
-                using (var src = new Database(false, true))
-                {
-                    src.ReadDwgFile(source, FileOpenMode.OpenForReadAndAllShare, true, null);
-                    src.CloseInput(true);
-                    string sourceBlock = S(req["source_block"]);
-                    if (sourceBlock == null)
-                        btrId = db.Insert(name, src, true);        // the whole drawing becomes the block
-                    else
-                    {
-                        using (var str = src.TransactionManager.StartTransaction())
-                        {
-                            var srcBt = (BlockTable)str.GetObject(src.BlockTableId, OpenMode.ForRead);
-                            if (!srcBt.Has(sourceBlock)) throw new ArgumentException($"'{source}' has no block named '{sourceBlock}'");
-                            var ids = new ObjectIdCollection { srcBt[sourceBlock] };
-                            var map = new IdMapping();
-                            src.WblockCloneObjects(ids, db.BlockTableId, map, DuplicateRecordCloning.Ignore, false);
-                            str.Commit();
-                        }
-                        bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
-                        if (!bt.Has(sourceBlock)) throw new ArgumentException($"importing '{sourceBlock}' failed");
-                        btrId = bt[sourceBlock];
-                        if (!sourceBlock.Equals(name, StringComparison.OrdinalIgnoreCase))
-                            ((BlockTableRecord)tr.GetObject(btrId, OpenMode.ForWrite)).Name = name;
-                    }
-                }
-            }
+            ObjectId btrId = ResolveBlockDefinition(tr, db, name, S(req["source_file"]), S(req["source_block"]));
 
             var btr = (BlockTableRecord)tr.GetObject(btrId, OpenMode.ForRead);
             var br = new BlockReference(Flat(P3(req["position"])), btrId);
@@ -590,7 +640,8 @@ namespace CADAgent
                 ScaleFactors = new Scale3d(D(req["scale"], 1)),
                 Rotation = Rad(req["rotation_deg"]),
             };
-            ObjectId id = Append(tr, ModelSpace(tr, db), br, S(req["layer"], "0"));
+            // "layout": the xref goes on that sheet (the border / title block xref)
+            ObjectId id = Append(tr, TargetSpace(tr, db, req), br, S(req["layer"], "0"));
             return Created($"Xref '{name}' attached.", new[] { id }, new JObject { ["name"] = name });
         });
 
@@ -710,6 +761,53 @@ namespace CADAgent
 
         // ── layouts / viewports / view / save (application thread) ────────────────
 
+        /// <summary>The layouts of a template file (the choices the "From template" dialog
+        /// offers): name, paper size in inches and mm, plotter, media, entities on the sheet.</summary>
+        private static string ListTemplateLayouts(string path)
+        {
+            if (!File.Exists(path)) throw new FileNotFoundException($"template not found: {path}");
+            var arr = new JArray();
+            using (var src = new Database(false, true))
+            {
+                src.ReadDwgFile(path, FileOpenMode.OpenForReadAndAllShare, true, null);
+                src.CloseInput(true);
+                using (Transaction str = src.TransactionManager.StartTransaction())
+                {
+                    var ld = (DBDictionary)str.GetObject(src.LayoutDictionaryId, OpenMode.ForRead);
+                    foreach (DBDictionaryEntry e in ld)
+                    {
+                        Layout lay;
+                        try { lay = (Layout)str.GetObject(e.Value, OpenMode.ForRead); } catch { continue; }
+                        if (lay.ModelType) continue;
+                        int ents = 0, vps = 0;
+                        try
+                        {
+                            var btr = (BlockTableRecord)str.GetObject(lay.BlockTableRecordId, OpenMode.ForRead);
+                            foreach (ObjectId id in btr)
+                            {
+                                try { if (str.GetObject(id, OpenMode.ForRead) is Viewport) vps++; else ents++; } catch { }
+                            }
+                        }
+                        catch { }
+                        bool landscape = lay.PlotRotation == PlotRotation.Degrees090 || lay.PlotRotation == PlotRotation.Degrees270;
+                        double w = lay.PlotPaperSize.X, h = lay.PlotPaperSize.Y;
+                        if (landscape) { double t = w; w = h; h = t; }
+                        arr.Add(new JObject
+                        {
+                            ["name"] = lay.LayoutName, ["tab_order"] = lay.TabOrder,
+                            ["paper_size_in"] = new JArray(Math.Round(w / 25.4, 2), Math.Round(h / 25.4, 2)),
+                            ["paper_size_mm"] = new JArray(R(w), R(h)),
+                            ["plotter"] = SafeStr(() => lay.PlotConfigurationName), ["media"] = SafeStr(() => lay.CanonicalMediaName),
+                            ["rotation"] = lay.PlotRotation.ToString(),
+                            ["entities"] = ents, ["viewports"] = vps,
+                        });
+                    }
+                    str.Commit();
+                }
+            }
+            return Ok($"{arr.Count} layout(s) in {Path.GetFileName(path)}.", new JObject { ["file"] = path, ["layouts"] = arr });
+        }
+
         private static string ManageLayouts(JObject req, Document doc) => InTransaction(doc, (tr, db) =>
         {
             string action = S(req["action"], "list").ToLowerInvariant();
@@ -718,6 +816,7 @@ namespace CADAgent
             {
                 case "list":
                 {
+                    if (!string.IsNullOrWhiteSpace(S(req["source_file"]))) return ListTemplateLayouts(S(req["source_file"]));
                     var arr = new JArray();
                     var ld = (DBDictionary)tr.GetObject(db.LayoutDictionaryId, OpenMode.ForRead);
                     foreach (DBDictionaryEntry e in ld)
@@ -843,14 +942,56 @@ namespace CADAgent
             if (!ld.Contains(layoutName)) throw new ArgumentException($"layout '{layoutName}' does not exist");
             var layout = (Layout)tr.GetObject(ld.GetAt(layoutName), OpenMode.ForRead);
             if (layout.ModelType) throw new ArgumentException("viewports go in a paper space layout, not Model");
+            // The layout must be current AND initialised before a Viewport entity is added to
+            // it: a freshly created / cloned layout has no paper-space view yet, and when
+            // AutoCAD initialises it (on becoming current) it adopts the first Viewport it
+            // finds as that view -- seen live 2026-09-16: the sheet viewport became the
+            // layout's own view at scale 1, locked, with the frozen layers. LayoutManager:
+            // application thread. Switching the viewport on needs the current layout too
+            // (eNotInPaperspace otherwise).
+            var lm = LayoutManager.Current;
+            if (!string.Equals(lm.CurrentLayout, layoutName, StringComparison.OrdinalIgnoreCase))
+                lm.CurrentLayout = layoutName;
+            layout = (Layout)tr.GetObject(ld.GetAt(layoutName), OpenMode.ForRead);
+            int paperViews = 0;
+            try { paperViews = layout.GetViewports().Count; } catch { }
+            if (paperViews == 0)
+            {
+                try { layout.UpgradeOpen(); layout.Initialize(); } catch (SysException ex) { throw new InvalidOperationException($"layout '{layoutName}' could not be initialised: {ex.Message}"); }
+            }
             var space = (BlockTableRecord)tr.GetObject(layout.BlockTableRecordId, OpenMode.ForWrite);
 
-            Point3d center = Flat(P3(req["center"]));
-            double width = D(req["width"]), height = D(req["height"]);
+            Point3d center; double width, height;
+            string fit = S(req["fit"], "").Trim().ToLowerInvariant();
+            if (fit == "layout" && LayoutContentExtents(tr, space, out Extents3d ext))
+            {
+                // one viewport the size of the sheet: whatever the template layout carries
+                // (border xref, title block) is the sheet; the viewport covers exactly that
+                center = new Point3d((ext.MinPoint.X + ext.MaxPoint.X) / 2, (ext.MinPoint.Y + ext.MaxPoint.Y) / 2, 0);
+                width = ext.MaxPoint.X - ext.MinPoint.X; height = ext.MaxPoint.Y - ext.MinPoint.Y;
+            }
+            else if (fit == "layout" || fit == "paper")
+            {
+                // an empty layout: the plot paper, mm in the API, in paper units here
+                double f = layout.PlotPaperUnits == PlotPaperUnit.Inches ? 1.0 / 25.4 : layout.PlotPaperUnits == PlotPaperUnit.Millimeters ? 1.0 : 1.0 / 25.4;
+                width = layout.PlotPaperSize.X * f; height = layout.PlotPaperSize.Y * f;
+                if (layout.PlotRotation == PlotRotation.Degrees090 || layout.PlotRotation == PlotRotation.Degrees270) { double t = width; width = height; height = t; }
+                center = new Point3d(width / 2, height / 2, 0);
+                if (req["center"] != null) center = Flat(P3(req["center"]));
+            }
+            else
+            {
+                center = Flat(P3(req["center"]));
+                width = D(req["width"]); height = D(req["height"]);
+            }
             if (width <= 0 || height <= 0) throw new ArgumentException("width and height must be > 0 (paper units)");
             var vp = new Viewport { CenterPoint = center, Width = width, Height = height };
             ObjectId id = Append(tr, space, vp, S(req["layer"], "0"));
             vp.On = true;
+            int number = -1;
+            try { number = vp.Number; } catch { }
+            if (number == 1)
+                throw new InvalidOperationException($"layout '{layoutName}' took the new viewport as its own paper-space view; nothing was kept");
             if (req["scale"] != null) vp.CustomScale = D(req["scale"]);           // paper : model, e.g. 0.025 = 1" = 40'
             else if (req["view_height"] != null) vp.ViewHeight = D(req["view_height"]);
             if (req["twist_deg"] != null) vp.TwistAngle = Rad(req["twist_deg"]);
@@ -863,11 +1004,33 @@ namespace CADAgent
             vp.Locked = B(req["locked"], true);
             var extra = ViewportWindow(vp);
             extra["number"] = vp.Number;
+            extra["paper_center"] = Arr(new Point2d(center.X, center.Y));
+            extra["paper_size"] = new JArray(R(width), R(height));
+            extra["fit"] = fit == "" ? null : fit;
             extra["frozen"] = frozen.Item1;
             extra["missing_layers"] = frozen.Item2;
             extra["annotation_scale"] = anno;
             return Created($"Viewport created in '{layoutName}'.", new[] { id }, extra);
         });
+
+        /// <summary>The extents of what a layout carries besides viewports (border, title block).</summary>
+        private static bool LayoutContentExtents(Transaction tr, BlockTableRecord space, out Extents3d ext)
+        {
+            ext = new Extents3d();
+            bool any = false;
+            foreach (ObjectId id in space)
+            {
+                try
+                {
+                    var e = tr.GetObject(id, OpenMode.ForRead) as AcadEntity;
+                    if (e == null || e is Viewport) continue;
+                    var ge = e.GeometricExtents;
+                    if (!any) { ext = ge; any = true; } else ext.AddExtents(ge);
+                }
+                catch { }
+            }
+            return any;
+        }
 
         private static string SetViewport(JObject req, Document doc) => InTransaction(doc, (tr, db) =>
         {
@@ -927,6 +1090,11 @@ namespace CADAgent
             {
                 ["scale"] = vp.CustomScale,
                 ["twist_deg"] = R4(Deg(vp.TwistAngle)),
+                // the raw inputs, so a wrong transform can be diagnosed from the snapshot alone
+                ["view_center_dcs"] = new JArray(R4(vc.X), R4(vc.Y)),
+                ["view_target"] = new JArray(R4(vp.ViewTarget.X), R4(vp.ViewTarget.Y), R4(vp.ViewTarget.Z)),
+                ["view_direction"] = new JArray(R4(vp.ViewDirection.X), R4(vp.ViewDirection.Y), R4(vp.ViewDirection.Z)),
+                ["view_height"] = R4(vp.ViewHeight),
                 ["model_center"] = new JArray(R4(c.X), R4(c.Y)),
                 ["model_window"] = new JArray(
                     new JArray(R4(corners.Min(q => q.X)), R4(corners.Min(q => q.Y))),

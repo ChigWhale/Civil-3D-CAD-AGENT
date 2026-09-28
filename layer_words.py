@@ -25,7 +25,10 @@ import time
 from dataclasses import dataclass, asdict
 
 WORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layer_words.json")
-LEARNED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layer_tags.learned.json")
+import cadagent_config
+# written on first sight of a layer family: in a package it lives in the data dir
+LEARNED_FILE = cadagent_config.writable("layer_tags.learned.json",
+                                        os.path.join(os.path.dirname(os.path.abspath(__file__)), "layer_tags.learned.json"))
 
 STATES = ("proposed", "existing", "future", "demolition", "abandoned", "temporary", "civil3d")
 CONFIDENCE = ("full", "partial", "none")

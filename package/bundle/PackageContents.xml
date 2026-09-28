@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Autodesk application bundle manifest. Civil 3D loads ./Contents/CADAgent.dll at
+     startup when this folder sits in %APPDATA%\Autodesk\ApplicationPlugins\CAD-Agent.bundle.
+     {{VERSION}}, {{SERIESMIN}} and {{SERIESMAX}} are filled in by package/build.ps1
+     (SeriesMin/Max are AutoCAD release codes: 2025 = R25.0, 2026 = R25.1). The DLL is a
+     .NET 10 assembly, so SeriesMin must not go below the release that carries Autodesk's
+     .NET 10 update (R25.0 as of 2026-09-28). -->
+<ApplicationPackage SchemaVersion="1.0" AutodeskProduct="AutoCAD" ProductType="Application"
+                    Name="CAD-Agent" AppVersion="{{VERSION}}"
+                    Description="CAD-Agent: HTTP bridge, drafting commands and handlers for the CAD-Agent dashboard, MCP server and redline pipeline"
+                    Author="Nick Chiglo"
+                    ProductCode="{7D3C2A1E-5B64-4F0A-9C21-CADA6E2026A1}"
+                    UpgradeCode="{A0B1C2D3-E4F5-4617-8899-CADA6E2026B2}">
+  <CompanyDetails Name="Nick Chiglo" />
+  <Components Description="Civil 3D / AutoCAD 64-bit">
+    <RuntimeRequirements OS="Win64" Platform="AutoCAD*|Civil 3D*" SeriesMin="{{SERIESMIN}}" SeriesMax="{{SERIESMAX}}" />
+    <ComponentEntry AppName="CADAgent" ModuleName="./Contents/CADAgent.dll"
+                    AppDescription="CAD-Agent plugin" Version="{{VERSION}}"
+                    LoadOnAutoCADStartup="True" LoadOnCommandInvocation="False" />
+  </Components>
+</ApplicationPackage>

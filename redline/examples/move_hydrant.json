@@ -1,0 +1,9 @@
+{
+  "comment": "MOVE HYD 20' N",
+  "kind": "arrow",
+  "context": {"nearest": [{"tag": "appurtenance", "handle": "A1E2", "distance": 1.2, "at": [500.0, 31.0]},
+                          {"tag": "water_main", "handle": "0B01", "distance": 1.0}],
+              "within": {"appurtenance": {"count": 1, "handles": ["A1E2"]}, "water_main": {"count": 2, "handles": ["0B01", "0B02"]}}},
+  "answer": {"blocks": [{"type": "move_entities", "params": {"handles": ["A1E2"], "offset": [0, 20]}}]},
+  "why": "North is +y; the hydrant is the nearest appurtenance; move it, nothing else."
+}

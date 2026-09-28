@@ -1,0 +1,7 @@
+{
+  "comment": "ADD INLET AT LOW POINT",
+  "kind": "note",
+  "context": {"nearest": [{"tag": "curb", "handle": "N1", "distance": 4.0}]},
+  "answer": {"skip": true, "reason": "needs_surface: the low point comes from the surface or profile, which the context does not hold"},
+  "why": "Elevations are not in the context; declining is the right answer."
+}
