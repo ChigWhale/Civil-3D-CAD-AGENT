@@ -286,4 +286,14 @@ def ocr_only(pdf: str, settings=None, ocr=None, log=_log, pages: list | None = N
         log(f"page {page.page_no}: {len(comments)} comment(s); sheet {title.sheet_no} file {title.printed_file}")
         for c in comments:
             log(f"  {c.id} [{c.kind} {c.confidence:.2f}] {c.text}")
+    # Every failed read carries its error, but eight "unknown" comments in a row
+    # read like bad handwriting when the truth is that no model answered. Say so.
+    failed = [c for pg in out["pages"] for c in pg["comments"] if str(c.get("raw_model_reply", "")).startswith("error")]
+    total = sum(len(pg["comments"]) for pg in out["pages"])
+    if failed:
+        first = str(failed[0]["raw_model_reply"]).split(" | reply:", 1)[0]
+        out["model_errors"] = len(failed)
+        log(f"MODEL ERRORS: {len(failed)} of {total} comment(s) were not read; {first}")
+        if len(failed) == total:
+            log("Nothing was transcribed. Run `python -m redline doctor` and fix what it reports, then run this again.")
     return out

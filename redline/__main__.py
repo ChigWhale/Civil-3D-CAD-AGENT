@@ -88,6 +88,7 @@ def main(argv=None) -> int:
         return 0
 
     settings = _apply_flags(args)
+    _isolate_learned_file(settings)
 
     if args.cmd == "doctor":
         return _doctor(settings)
@@ -110,7 +111,7 @@ def main(argv=None) -> int:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=2, default=str)
         print(f"written {path}")
-        return 0
+        return 1 if out.get("model_errors") else 0
     if args.cmd == "annotate":
         from . import report
         row = report.annotate(settings.review_dir, args.review_id, args.comment_id, args.chain, args.verdict)
@@ -118,6 +119,22 @@ def main(argv=None) -> int:
                           "human_chain": row.get("human_chain")}, default=str))
         return 0
     return 2
+
+
+def _isolate_learned_file(settings) -> None:
+    """A run aimed at the stub plugin (CAD_PLUGIN_BASE set) must not write the
+    stub's made-up layer families into the repo's layer_tags.learned.json;
+    the dashboard server keeps the same rule. The file goes beside the reviews."""
+    if not os.environ.get("CAD_PLUGIN_BASE"):
+        return
+    try:
+        import layer_words
+        import spatial
+        os.makedirs(settings.review_dir, exist_ok=True)
+        spatial.TAGS.learned = layer_words.Learned(os.path.join(settings.review_dir, "layer_tags.learned.json"))
+        spatial.TAGS._bump()
+    except Exception:
+        pass
 
 
 def _doctor(settings) -> int:
