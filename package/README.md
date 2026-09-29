@@ -49,6 +49,13 @@ The plugin targets `net10.0-windows` (both `CADAgent.csproj` and
 
 ## Building
 
+With the models included the payload is far above the 4.2 GB a single Setup.exe
+may hold, so the script enables disk spanning: the output is `CAD-Agent-Setup-<version>.exe`
+(a few MB) plus `CAD-Agent-Setup-<version>-1.bin` (the payload). Both files must sit in the
+same folder when the user runs Setup. Inno Setup 6 or 7 both work; `build.ps1` finds either.
+The plugin is built against whichever `AutoCAD 20xx` folder is first under Program Files;
+pass `-SeriesMin` to match it (2025 = R25.0, 2026 = R25.1).
+
 Prerequisites on the build machine only: .NET 10 SDK (the plugin), Civil 3D
 with the .NET 10 update (reference assemblies), internet access (Python
 embeddable zip, PyPI, llama.cpp and llama-swap releases), and Inno Setup 6

@@ -30,7 +30,10 @@ OutputBaseFilename=CAD-Agent-Setup-{#Version}
 Compression=lzma2/ultra64
 SolidCompression=yes
 LZMAUseSeparateProcess=yes
-DiskSpanning=no
+; Windows caps a single Setup.exe near 4.2 GB and the two models alone are 7.6 GB,
+; so the payload is split into Setup-N.bin files that must ship beside the .exe.
+DiskSpanning=yes
+DiskSliceSize=max
 UninstallDisplayName=CAD-Agent {#Version}
 WizardStyle=modern
 CloseApplications=no
@@ -41,7 +44,9 @@ Name: "fetchmodels"; Description: "Download the language and vision models now (
 [Files]
 Source: "{#Stage}\python\*"; DestDir: "{app}\python"; Flags: recursesubdirs ignoreversion
 Source: "{#Stage}\app\*"; DestDir: "{app}\app"; Flags: recursesubdirs ignoreversion
-Source: "{#Stage}\models\*"; DestDir: "{app}\models"; Flags: recursesubdirs ignoreversion skipifsourcedoesntexist
+; model weights are already compressed; packing them with LZMA would take an hour for nothing
+Source: "{#Stage}\models\*.gguf"; DestDir: "{app}\models"; Flags: ignoreversion skipifsourcedoesntexist nocompression
+Source: "{#Stage}\models\*"; Excludes: "*.gguf"; DestDir: "{app}\models"; Flags: recursesubdirs ignoreversion skipifsourcedoesntexist
 Source: "{#Stage}\version.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Stage}\cad-agent.template.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Stage}\bundle\CAD-Agent.bundle\*"; DestDir: "{userappdata}\Autodesk\ApplicationPlugins\CAD-Agent.bundle"; Flags: recursesubdirs ignoreversion

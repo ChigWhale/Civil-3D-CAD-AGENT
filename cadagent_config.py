@@ -41,7 +41,7 @@ KEYS = {
     "project_roots": ("CAD_PROJECT_ROOT", None),
     "review_dir": ("CAD_REDLINE_DIR", None),
     "model_base": ("CAD_REDLINE_MODEL_BASE", "http://127.0.0.1:11434/v1"),
-    "vlm": ("CAD_REDLINE_VLM", "qwen3-vl:4b"),
+    "vlm": ("CAD_REDLINE_VLM", "qwen3-vl:4b-instruct"),
     "llm": ("CAD_REDLINE_LLM", "qwen2.5-coder:7b"),
     "models_dir": ("CAD_MODELS_DIR", None),
     "python": ("CAD_PYTHON", None),

@@ -71,22 +71,91 @@ def parse_title_text(text: str) -> TitleBlockRead:
     return read
 
 
+TITLE_HINT = ("engineering plan title block: transcribe every printed word and number exactly, including any "
+              "file path ending in .dwg, the sheet number, project number and sheet title")
+
+
+def _tiles(img, max_px: int, overlap: float = 0.08) -> list:
+    """The image cut along its long axis into pieces no longer than max_px,
+    overlapping a little so a line of text on a seam is whole in one piece."""
+    if not max_px or max(img.width, img.height) <= max_px:
+        return [img]
+    vertical = img.height >= img.width
+    long = img.height if vertical else img.width
+    n = -(-long // max_px)
+    step = long / n
+    pad = int(step * overlap)
+    out = []
+    for k in range(n):
+        a = max(0, int(k * step) - pad)
+        b = min(long, int((k + 1) * step) + pad)
+        out.append(img.crop((0, a, img.width, b)) if vertical else img.crop((a, 0, b, img.height)))
+    return out
+
+
+def _has_print(tile, min_fraction: float = 0.0005) -> bool:
+    """Is there anything printed here beyond border lines? Rows and columns
+    that are mostly dark (the border) are discounted before counting."""
+    try:
+        import numpy as np
+        from . import marks
+        dark = marks.dark_mask(np.asarray(tile.convert("RGB"), dtype=np.int16))
+    except Exception:
+        return True
+    if dark.size == 0:
+        return False
+    rows = dark.mean(axis=1) >= 0.5
+    cols = dark.mean(axis=0) >= 0.5
+    dark[rows, :] = False
+    dark[:, cols] = False
+    return float(dark.mean()) >= min_fraction
+
+
 def read_title_block(page, ocr, settings, out_dir: str | None = None) -> TitleBlockRead:
-    """OCR the title strips (page fractions in settings.title_rects) and parse."""
+    """OCR the title strips (page fractions in settings.title_rects) and parse.
+
+    Each strip is rendered at settings.title_dpi and read in tiles no longer
+    than settings.max_image_px, since one call with a whole 24 in strip does
+    not fit a small model's context. Reading stops early once a drawing file
+    name and a sheet number have both been seen."""
     texts, crops = [], []
-    for i, (fx0, fy0, fx1, fy1) in enumerate(settings.title_rects, start=1):
+    dpi = getattr(settings, "title_dpi", None) or settings.crop_dpi
+    max_px = getattr(settings, "max_image_px", 0)
+    done = False
+    # title_rects describe an unrotated plot. A sheet plotted at 90, 270 or
+    # 180 degrees (or scanned upside down) carries the same strips on other
+    # edges; those are tried, in that order, only while the configured ones
+    # have yielded neither a file name nor a sheet number. Blank strips cost
+    # no model calls, so a miss is cheap.
+    base = list(settings.title_rects)
+    rects = base[:]
+    rects += [(fy0, 1 - fx1, fy1, 1 - fx0) for (fx0, fy0, fx1, fy1) in base]      # plot rotation 90
+    rects += [(1 - fy1, fx0, 1 - fy0, fx1) for (fx0, fy0, fx1, fy1) in base]      # 270
+    rects += [(1 - fx1, 1 - fy1, 1 - fx0, 1 - fy0) for (fx0, fy0, fx1, fy1) in base]  # 180
+    for i, (fx0, fy0, fx1, fy1) in enumerate(rects, start=1):
+        if done:
+            break
+        if i > len(base) and (i - 1) % len(base) == 0:
+            so_far = parse_title_text("\n".join(texts))
+            if so_far.printed_file or so_far.sheet_no:
+                break
         box = [int(fx0 * page.width_px), int(fy0 * page.height_px), int(fx1 * page.width_px), int(fy1 * page.height_px)]
         if box[2] - box[0] < 4 or box[3] - box[1] < 4:
             continue
-        img = pdf_mod.crop(page, box, dpi=settings.crop_dpi)
+        img = pdf_mod.crop(page, box, dpi=dpi)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"{page.id}_title{i}.png")
             img.save(path)
             crops.append(path)
-        texts.append(ocr.read_text(img, hint=("engineering plan title block: transcribe every printed word and "
-                                              "number exactly, including any file path ending in .dwg, the "
-                                              "sheet number, project number and sheet title")))
+        for tile in _tiles(img, max_px):
+            if not _has_print(tile):
+                continue                      # blank paper: no model call
+            texts.append(ocr.read_text(tile, hint=TITLE_HINT))
+            so_far = parse_title_text("\n".join(texts))
+            if so_far.printed_file and so_far.sheet_no:
+                done = True
+                break
     read = parse_title_text("\n".join(texts))
     read.crops = crops
     return read

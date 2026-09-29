@@ -32,9 +32,10 @@ READ_SCHEMA = {
         "kind": {"type": "string", "enum": list(KINDS)},
         "targets_geometry": {"type": "boolean"},
         "target_offset": {"type": "string", "enum": ["on", "above", "below", "left", "right", "none"]},
+        "mark_center": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
         "confidence": {"type": "number"},
     },
-    "required": ["text", "kind", "targets_geometry", "confidence"],
+    "required": ["text", "kind", "targets_geometry", "mark_center", "confidence"],
 }
 
 MARKS_SCHEMA = {
@@ -111,12 +112,15 @@ class FakeOcr:
 class OpenAICompatVlm:
     name = "vlm"
 
-    def __init__(self, base: str, model: str, crop_dpi: int = 300, margin_in: float = 0.75, timeout: float = 600.0):
+    def __init__(self, base: str, model: str, crop_dpi: int = 300, margin_in: float = 0.75, timeout: float = 600.0,
+                 max_image_px: int = 1280):
         self.base, self.model, self.crop_dpi, self.margin_in, self.timeout = base, model, crop_dpi, margin_in, timeout
+        self.max_image_px = max_image_px
         self.name = model
 
     def _ask(self, image, prompt: str, schema: dict | None, max_tokens: int = 600) -> str:
-        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, openai_compat.image_part(image)]}]
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt},
+                                                 openai_compat.image_part(image, self.max_image_px)]}]
         return openai_compat.chat(self.base, self.model, messages, schema=schema, temperature=0.0,
                                   timeout=self.timeout, max_tokens=max_tokens)
 
@@ -137,16 +141,21 @@ class OpenAICompatVlm:
                       "(rings something), strike (crosses something out), dimension (a measured distance). "
                       "targets_geometry is true when the mark points at, rings or crosses out a drawn thing; "
                       "target_offset says where that thing sits relative to the handwriting (on, above, below, "
-                      "left, right, none). confidence is 0 to 1 for the transcription. " + GLOSSARY +
+                      "left, right, none). mark_center is where the mark itself sits (the circle, the arrow's tip, "
+                      "the X, the cloud; for a note with no mark, the middle of the words) as fractions of this "
+                      "image, [x, y] from the top-left corner, 0 to 1. confidence is 0 to 1 for the transcription. "
+                      + GLOSSARY +
                       ' Answer as JSON: {"text": "...", "kind": "...", "targets_geometry": true/false, '
-                      '"target_offset": "...", "confidence": 0.0}')
+                      '"target_offset": "...", "mark_center": [0.5, 0.5], "confidence": 0.0}')
+            raw = ""
             try:
                 raw = self._ask(img, prompt, READ_SCHEMA)
                 rep = openai_compat.parse_json(raw)
             except (openai_compat.ModelError, ValueError) as e:
+                # keep what the model actually said: it is the only clue when tuning
                 out.append(Comment(id=f"{page.id}-c{i}", page_no=page.page_no, bbox_px=list(region.bbox_px),
                                    text="", kind="unknown", confidence=0.0, crop_path=crop_path,
-                                   raw_model_reply=f"error: {e}"))
+                                   raw_model_reply=f"error: {e}" + (f" | reply: {str(raw)[:600]}" if raw else "")))
                 continue
             kind = str(rep.get("kind") or "unknown").lower()
             target_offset = str(rep.get("target_offset") or "none").lower()
@@ -156,17 +165,29 @@ class OpenAICompatVlm:
                         target_offset=None if target_offset == "none" else target_offset,
                         confidence=max(0.0, min(1.0, float(rep.get("confidence") or 0.0))),
                         crop_path=crop_path, raw_model_reply=str(raw)[:2000])
-            c.target_bbox_px = _target_box(c, page)
+            # The mark's own position beats the ink box centre: a comment's
+            # words usually sit beside the thing they are about, not on it.
+            c.target_bbox_px = _mark_box(rep.get("mark_center"), box, page) or _target_box(c, page)
             out.append(c)
         return out
 
     def read_text(self, image, hint=""):
-        prompt = ("Transcribe all printed text in this image exactly, one item per line, including file paths, "
-                  "numbers and codes. " + (hint or "") + " Answer with the text only.")
+        # Phrased as a reading task with an explicit "nothing here" answer: on a
+        # blank tile a small model otherwise echoes the instructions back.
+        prompt = ("Read every piece of printed text in this image and write it out exactly, one line per item, "
+                  "keeping file paths, numbers and codes verbatim. " + (hint or "") +
+                  " If the image has no text, answer exactly: NONE")
         try:
-            return self._ask(image, prompt, None, max_tokens=800)
+            raw = self._ask(image, prompt, None, max_tokens=800)
         except openai_compat.ModelError as e:
             return f"(read_text failed: {e})"
+        lines = []
+        for ln in str(raw).splitlines():
+            t = ln.strip()
+            if not t or t.upper() == "NONE" or t in prompt or (hint and t in hint):
+                continue
+            lines.append(t)
+        return "\n".join(lines)
 
     def find_marks(self, page, tiles=(3, 2), overlap: float = 0.1):
         """Coarse boxes from the model on page tiles; used only when the
@@ -204,6 +225,21 @@ class OpenAICompatVlm:
         return out
 
 
+def _mark_box(center, crop_box_px: list, page: Page, half_in: float = 0.1) -> list | None:
+    """The model's mark_center (fractions of the crop) as a small page-pixel
+    box, or None when the answer is missing or not sensible."""
+    try:
+        fx, fy = float(center[0]), float(center[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+        return None
+    x0, y0, x1, y1 = crop_box_px
+    px, py = x0 + fx * (x1 - x0), y0 + fy * (y1 - y0)
+    h = half_in * page.dpi
+    return [max(0, px - h), max(0, py - h), min(page.width_px, px + h), min(page.height_px, py + h)]
+
+
 def _target_box(c: Comment, page: Page) -> list | None:
     """Where the thing a mark points at sits: the ink box shifted one box
     width/height in target_offset's direction, clipped to the page."""
@@ -237,5 +273,5 @@ def backend(settings, fixture=None):
         return FakeOcr(fixture if fixture is not None else (settings.fixture or {}))
     if kind in ("openai", "ollama", "vlm"):
         return OpenAICompatVlm(settings.model_base, settings.vlm, crop_dpi=settings.crop_dpi,
-                               timeout=settings.model_timeout)
+                               timeout=settings.model_timeout, max_image_px=settings.max_image_px)
     raise ValueError(f"unknown OCR backend {kind!r} (openai | fake)")

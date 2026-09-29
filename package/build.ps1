@@ -135,17 +135,23 @@ if ($CudartUrl) {
     Get-ChildItem (Join-Path $Downloads "cudart") -Recurse -Filter "*.dll" | ForEach-Object { Copy-Item $_.FullName $ModelsStage -Force }
 }
 if ($ModelsDir -and (Test-Path $ModelsDir)) {
-    Step "copying model files from $ModelsDir"
-    Get-ChildItem $ModelsDir -Filter "*.gguf" | ForEach-Object { Copy-Item $_.FullName $ModelsStage }
+    Step "linking model files from $ModelsDir"
+    # gigabytes each: hard-link when the stage is on the same volume, copy otherwise
+    Get-ChildItem $ModelsDir -Filter "*.gguf" | ForEach-Object {
+        $dest = Join-Path $ModelsStage $_.Name
+        try { New-Item -ItemType HardLink -Path $dest -Target $_.FullName -ErrorAction Stop | Out-Null }
+        catch { Copy-Item $_.FullName $dest }
+    }
 }
 
 # ── 5. installer ────────────────────────────────────────────────────────────
 $size = (Get-ChildItem $Stage -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB
 Step ("staged {0:N0} MB" -f $size)
 if ($Installer) {
-    $iscc = @("$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe", "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") |
+    $iscc = @("$env:ProgramFiles\Inno Setup 7\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe", "$env:LOCALAPPDATA\Programs\Inno Setup 7\ISCC.exe",
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe", "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") |
         Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $iscc) { throw "Inno Setup 6 not found; install it from https://jrsoftware.org/isinfo.php or drop -Installer" }
+    if (-not $iscc) { throw "Inno Setup 6 or 7 not found; install it from https://jrsoftware.org/isinfo.php or drop -Installer" }
     New-Item -ItemType Directory -Force (Join-Path $Pkg "dist") | Out-Null
     Step "compiling the installer"
     & $iscc "/DVersion=$Version" "/DStage=$Stage" "/DDist=$(Join-Path $Pkg 'dist')" (Join-Path $Pkg "CAD-Agent.iss")

@@ -3,4 +3,6 @@
 requests
 pillow
 numpy
-pymupdf
+# PDF rendering. pypdfium2 (BSD/Apache) is preferred and redistributable;
+# pdf.py falls back to PyMuPDF (AGPL) if that is what is installed.
+pypdfium2

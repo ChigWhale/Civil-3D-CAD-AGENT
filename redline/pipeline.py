@@ -147,8 +147,12 @@ def review(pdfs: list, settings=None, dry_run: bool = False, ocr=None, planner=N
     outcomes = {}
     if dry_run:
         for cid, prop in proposals.items():
-            outcomes[cid] = CommentOutcome(comment_id=cid, status="dry_run" if prop.blocks else "skipped",
-                                           reason=None if prop.blocks else prop.reason)
+            if prop.blocks:
+                outcomes[cid] = CommentOutcome(comment_id=cid, status="dry_run")
+            else:
+                reason = prop.reason or "no chain"
+                status = "needs_human" if str(reason).startswith("needs_human") else "skipped"
+                outcomes[cid] = CommentOutcome(comment_id=cid, status=status, reason=reason)
     else:
         client = DashboardClient(settings.dashboard_base)
         by_drawing = {}

@@ -47,8 +47,9 @@ def markdown(report: Report) -> str:
         if sheet.get("dwg_path"):
             lines.append(f"- drawing: `{sheet['dwg_path']}` ({sheet.get('how')}, score {sheet.get('score')})"
                          + (" opened by the pipeline" if sheet.get("opened_by_pipeline") else ""))
-            lines.append(f"- layout: {sheet.get('layout_name')}; page->paper {sheet.get('page_to_paper', {}).get('method')}"
-                         f" rmse {sheet.get('page_to_paper', {}).get('rmse_in')} in; viewports {len(sheet.get('viewports') or [])}")
+            p2p = sheet.get("page_to_paper") or {}
+            lines.append(f"- layout: {sheet.get('layout_name')}; page->paper {p2p.get('method')}"
+                         f" rmse {p2p.get('rmse_in')} in; viewports {len(sheet.get('viewports') or [])}")
         tb = sheet.get("title_block") or {}
         lines.append(f"- title block read: sheet {tb.get('sheet_no')} project {tb.get('project_no')} "
                      f"file {tb.get('printed_file')}")

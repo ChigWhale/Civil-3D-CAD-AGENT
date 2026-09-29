@@ -27,18 +27,46 @@ Rules:
 3. Distances in the comment are feet unless marked otherwise (' = feet, " = inches).
 4. If the comment needs anything CONTEXT does not hold (surface or profile elevations, hydraulics, a person's judgement, text you cannot read, an entity that is not listed), answer {"skip": true, "reason": "..."} with a specific reason.
 5. Prefer one to four blocks. Read-only Query blocks may come first. Do not add labels or layers the comment did not ask for.
-6. Answer with JSON only, in the ANSWER SCHEMA. No prose."""
+6. EXAMPLES are other reviewers' comments on other drawings. They show the format only. Never reuse an example's reason, handles or coordinates; every answer must come from THIS comment and THIS context.
+7. Answer with JSON only, in the ANSWER SCHEMA. Start with "rationale": one sentence saying what this comment asks for and which listed handle(s), if any, it concerns. Then either "blocks" or "skip" with a specific "reason"."""
 
 ANSWER_SCHEMA = {
     "title": "chain",
     "type": "object",
     "properties": {
+        "rationale": {"type": "string"},
         "blocks": {"type": "array", "items": {"type": "object", "properties": {
             "type": {"type": "string"}, "params": {"type": "object"}}, "required": ["type", "params"]}},
         "skip": {"type": "boolean"},
         "reason": {"type": "string"},
     },
+    "required": ["rationale"],
 }
+
+
+def _example_handles(examples: list) -> set:
+    """Every handle-looking string in the examples' contexts and answers."""
+    out = set()
+    for ex in examples or []:
+        for m in re.finditer(r'"handle[s]?":\s*(\[[^\]]*\]|"[^"]*")', json.dumps(ex, default=str)):
+            out.update(re.findall(r'"([0-9A-Za-z]{1,8})"', m.group(1)))
+    return out
+
+
+def relevant_examples(examples: list, comment, limit: int = 4) -> list:
+    """The examples most like this comment (word overlap, same kind), least
+    relevant first so the closest one sits nearest the comment in the prompt.
+    Fewer, closer examples give a small model less to copy blindly."""
+    words = set(re.findall(r"[a-z0-9']+", str(comment.text).lower()))
+    scored = []
+    for ex in examples or []:
+        ew = set(re.findall(r"[a-z0-9']+", str(ex.get("comment", "")).lower()))
+        score = len(words & ew) / float(len(words | ew) or 1)
+        if ex.get("kind") == getattr(comment, "kind", None):
+            score += 0.15
+        scored.append((score, ex))
+    scored.sort(key=lambda s: s[0])
+    return [ex for _, ex in scored[-limit:]]
 
 
 class PlannerBackend(Protocol):
@@ -100,12 +128,20 @@ def build_user_prompt(comment, located, match, palette_text: str, steps: str = "
     if recipe:
         parts += [f"RECIPE ({plan_type}), reference values only:", _j(recipe, 1500), ""]
     if examples:
-        parts.append("EXAMPLES:")
-        for ex in examples:
+        parts.append("EXAMPLES: other comments on other drawings, shown for the format only; do not copy them")
+        chosen = relevant_examples(examples, comment)
+        for ex in chosen:
             parts.append(f'comment: text="{ex["comment"]}" kind={ex.get("kind", "note")}')
             if ex.get("context"):
                 parts.append("context: " + _j(ex["context"], 800))
             parts.append("answer: " + json.dumps(ex["answer"]))
+            parts.append("")
+        # A small model will lift a handle straight out of an example. Say
+        # outright which of those handles this drawing does not have.
+        foreign = sorted(_example_handles(chosen) - known_handles(located.context))
+        if foreign:
+            parts.append("The example handles " + ", ".join(foreign) + " do not exist on this drawing. "
+                         "Use only handles that appear under CONTEXT below.")
             parts.append("")
     sheet = f"sheet={match.layout_name}" if match and match.layout_name else "sheet=?"
     vp = (located.context or {}).get("viewport") or {}
@@ -116,6 +152,12 @@ def build_user_prompt(comment, located, match, palette_text: str, steps: str = "
     if located.space == "model":
         ctx = located.context or {}
         parts.append(f"LOCATION: model ({located.model_xy[0]:.1f}, {located.model_xy[1]:.1f}) ft; {ctx.get('cell', '')}")
+        nearest = ctx.get("nearest") or []
+        if nearest and comment.kind in ("arrow", "circle", "cloud", "strike"):
+            n = min(nearest, key=lambda n: n.get("distance", 1e9))
+            parts.append(f"MARK TARGET: the {comment.kind} sits closest to {n.get('tag')} handle {n.get('handle')} "
+                         f"({n.get('distance')} ft away); a mark that rings, points at or crosses out something "
+                         f"is about that thing unless the words say otherwise")
         parts.append("CONTEXT:")
         parts.append("nearest: " + _j(ctx.get("nearest", []), 1500))
         parts.append("within radius, by tag: " + _j(ctx.get("within", {}), 1500))
@@ -141,7 +183,8 @@ def build_user_prompt(comment, located, match, palette_text: str, steps: str = "
     if retry_error:
         parts.append(f"Your previous chain failed validation: {retry_error}\nReturn a corrected chain, or skip with a reason.")
         parts.append("")
-    parts.append('ANSWER SCHEMA: {"blocks":[{"type":"<block type>","params":{...}}, ...]}  or  {"skip":true,"reason":"..."}')
+    parts.append('ANSWER SCHEMA: {"rationale":"...","blocks":[{"type":"<block type>","params":{...}}, ...]}  or  '
+                 '{"rationale":"...","skip":true,"reason":"..."}')
     return "\n".join(parts)
 
 

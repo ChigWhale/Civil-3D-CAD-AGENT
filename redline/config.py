@@ -27,10 +27,15 @@ _ENV = {
     "ocr_backend": ("CAD_REDLINE_OCR", "openai"),
     "planner_backend": ("CAD_REDLINE_PLANNER", "openai"),
     "model_base": ("CAD_REDLINE_MODEL_BASE", "http://127.0.0.1:11434/v1"),
-    "vlm": ("CAD_REDLINE_VLM", "qwen3-vl:4b"),
+    "vlm": ("CAD_REDLINE_VLM", "qwen3-vl:4b-instruct"),
     "llm": ("CAD_REDLINE_LLM", "qwen2.5-coder:7b"),
     "dpi": ("CAD_REDLINE_DPI", "150"),
     "crop_dpi": ("CAD_REDLINE_CROP_DPI", "300"),
+    # the title strips are long and thin; they are read at this DPI in tiles
+    # no longer than max_image_px on a side, so printed 9 pt text stays legible
+    # without a single crop swallowing the model's context window.
+    "title_dpi": ("CAD_REDLINE_TITLE_DPI", "150"),
+    "max_image_px": ("CAD_REDLINE_MAX_IMAGE_PX", "1280"),
     # fractions of the page (origin top-left) that hold the title block text;
     # several rectangles separated by ';'. Fractions, not inches, so a scan
     # that was shrunk to fit a smaller page still crops the right strip.
@@ -82,6 +87,8 @@ class Settings:
     llm: str
     dpi: int
     crop_dpi: int
+    title_dpi: int
+    max_image_px: int
     title_rects: list
     border_rect: tuple | None
     min_confidence: float
@@ -129,6 +136,8 @@ def load() -> Settings:
         llm=str(raw["llm"]),
         dpi=int(float(raw["dpi"])),
         crop_dpi=int(float(raw["crop_dpi"])),
+        title_dpi=int(float(raw["title_dpi"])),
+        max_image_px=int(float(raw["max_image_px"])),
         title_rects=_rects(raw["title_rects"]) or [(0.84, 0, 1, 1), (0, 0.9, 1, 1)],
         border_rect=border[0] if border else None,
         min_confidence=float(raw["min_confidence"]),

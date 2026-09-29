@@ -138,7 +138,11 @@ def _doctor(settings) -> int:
         line("plugin", False, f"{settings.plugin_base} ({e.__class__.__name__}); open Civil 3D with the CADAgent plugin loaded")
     try:
         r = requests.get(f"{settings.dashboard_base}/version", timeout=3)
-        line("dashboard", r.status_code < 500, f"{settings.dashboard_base} {r.json()}")
+        if r.status_code == 200:
+            line("dashboard", True, f"{settings.dashboard_base} {r.json()}")
+        else:
+            line("dashboard", False, f"{settings.dashboard_base} answers but has no /version route: an old "
+                                     f"server is running on that port; stop it and start the current one")
     except Exception as e:
         line("dashboard", False, f"{settings.dashboard_base} ({e.__class__.__name__}); start it: python -m uvicorn dashboard.server:app --port 8765")
     if settings.ocr_backend == "fake" and settings.planner_backend == "fake":
@@ -148,13 +152,27 @@ def _doctor(settings) -> int:
         have = openai_compat.models(settings.model_base) if up else []
         line("model server", up, f"{settings.model_base}" + ("" if up else "; install Ollama and run `ollama serve`"))
         for label, name in (("vision model", settings.vlm), ("planner model", settings.llm)):
-            found = any(h == name or h.startswith(name.split(":")[0]) for h in have)
+            found = name in have or (name + ":latest") in have
             line(label, found, name + ("" if found else f"; pull it: ollama pull {name}"))
+        # Ollama reports the context window of whatever is loaded right now.
+        # 4096 (its default) is too small for a crop plus the prompt.
+        try:
+            r = requests.get(settings.model_base.removesuffix("/v1") + "/api/ps", timeout=3)
+            loaded = [(m.get("name"), int(m.get("context_length") or 0)) for m in r.json().get("models") or []]
+        except Exception:
+            loaded = []
+        if loaded:
+            small = [n for n, c in loaded if c and c < 8192]
+            line("context window", not small,
+                 ", ".join(f"{n} {c}" for n, c in loaded)
+                 + ("" if not small else "; set OLLAMA_CONTEXT_LENGTH=16384 (user variable) and restart Ollama"))
+        else:
+            print("     context window: no model loaded yet (checked after the first run)")
     try:
-        import pymupdf  # noqa: F401
-        line("pymupdf", True, "installed")
-    except ImportError:
-        line("pymupdf", False, "pip install pymupdf")
+        from . import pdf as pdf_mod
+        line("pdf renderer", True, pdf_mod.backend().name)
+    except RuntimeError as e:
+        line("pdf renderer", False, str(e))
     line("project roots", bool(settings.project_roots), "; ".join(settings.project_roots) or "CAD_PROJECT_ROOT unset (only open drawings and printed paths are searched)")
     line("review dir", True, settings.review_dir)
     return 0 if ok else 1

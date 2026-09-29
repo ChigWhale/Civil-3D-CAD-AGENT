@@ -35,11 +35,15 @@ if HERE not in sys.path:
 import cadagent_config as cfg  # noqa: E402
 
 DEFAULT_MODELS = {
-    "qwen3-vl:4b": {
-        "file": "Qwen3-VL-4B-Instruct-Q4_K_M.gguf",
-        "mmproj": "mmproj-Qwen3-VL-4B-Instruct-Q8_0.gguf",
-        "url": "https://huggingface.co/ggml-org/Qwen3-VL-4B-Instruct-GGUF/resolve/main/Qwen3-VL-4B-Instruct-Q4_K_M.gguf",
-        "mmproj_url": "https://huggingface.co/ggml-org/Qwen3-VL-4B-Instruct-GGUF/resolve/main/mmproj-Qwen3-VL-4B-Instruct-Q8_0.gguf",
+    # Named as Ollama names them, so the pipeline asks for the same model on
+    # either server. The plain qwen3-vl:4b tag is a thinking build that spends
+    # its whole output budget reasoning; the -instruct build answers directly.
+    "qwen3-vl:4b-instruct": {
+        # Qwen's own GGUF repo; the ggml-org mirror is gated (HTTP 401 without a token)
+        "file": "Qwen3VL-4B-Instruct-Q4_K_M.gguf",
+        "mmproj": "mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf",
+        "url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF/resolve/main/Qwen3VL-4B-Instruct-Q4_K_M.gguf",
+        "mmproj_url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf",
         "context": 8192,
     },
     "qwen2.5-coder:7b": {
@@ -178,7 +182,9 @@ def write_swap_config() -> str | None:
         cmd = f'"{server}" --port ${{PORT}} -m "{path}" -ngl 99 -c {int(spec.get("context", 8192))} --jinja'
         mm = spec.get("mmproj")
         if mm and os.path.isfile(os.path.join(models_dir(), mm)):
-            cmd += f' --mmproj "{os.path.join(models_dir(), mm)}"'
+            # llama.cpp asks for at least 1024 image tokens on Qwen-VL for grounding
+            # (the redline pipeline asks where a mark sits inside a crop)
+            cmd += f' --mmproj "{os.path.join(models_dir(), mm)}" --image-min-tokens 1024'
         lines += [f'  "{name}":', f"    cmd: '{cmd}'", f"    ttl: {int(spec.get('ttl', 600))}"]
         count += 1
     if count == 0:

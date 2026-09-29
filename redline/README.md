@@ -13,12 +13,18 @@ the same OpenAI-compatible endpoint, so the code does not change.
 
 ## Install (once, on the machine running Civil 3D)
 
-1. `pip install -r redline/requirements.txt` (PyMuPDF, Pillow, numpy, requests).
+1. `pip install -r redline/requirements.txt` (pypdfium2, Pillow, numpy, requests).
 2. Install Ollama for Windows from https://ollama.com/download, then pull the
    two models. Both are Apache-2.0; no Hugging Face account is needed.
 
-       ollama pull qwen3-vl:4b          # reads the handwriting (about 3.5 GB)
+       ollama pull qwen3-vl:4b-instruct # reads the handwriting (about 3.5 GB)
        ollama pull qwen2.5-coder:7b     # writes the block chains (about 4.7 GB)
+
+   Ollama's default context window is 4096 tokens, which is too small for a
+   crop plus the prompt, and far too small for the planner's palette. Set the
+   user environment variable `OLLAMA_CONTEXT_LENGTH=16384` (then quit and
+   restart Ollama from the tray) before the first run; `doctor` reports the
+   window once a model has been loaded.
 
    Alternatives: `qwen2.5vl:7b` for the vision model, `qwen3:8b` for the
    planner. Any Hugging Face GGUF works too: `ollama pull hf.co/<user>/<repo>:<quant>`.
@@ -137,7 +143,7 @@ the digest; both are free and reversible.
 | `CAD_PROJECT_ROOT` | unset | folders searched for `.dwg` files, `;` separated |
 | `CAD_REDLINE_DIR` | `dashboard/uploads/reviews` | reports and training rows |
 | `CAD_REDLINE_MODEL_BASE` | `http://127.0.0.1:11434/v1` | OpenAI-compatible endpoint |
-| `CAD_REDLINE_VLM` | `qwen3-vl:4b` | vision model |
+| `CAD_REDLINE_VLM` | `qwen3-vl:4b-instruct` | vision model (the plain `qwen3-vl:4b` tag thinks by default and returns empty answers) |
 | `CAD_REDLINE_LLM` | `qwen2.5-coder:7b` | planner model |
 | `CAD_REDLINE_OCR` / `CAD_REDLINE_PLANNER` | `openai` | or `fake` for tests |
 | `CAD_REDLINE_DPI` / `CAD_REDLINE_CROP_DPI` | 150 / 300 | page render, crop render |

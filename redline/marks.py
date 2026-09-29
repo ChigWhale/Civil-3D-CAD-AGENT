@@ -72,11 +72,13 @@ def _components(active: np.ndarray) -> list:
     return out
 
 
-def find_regions(page: Page, color: str = "red", min_area_in2: float = 0.15, merge_in: float = 0.3,
+def find_regions(page: Page, color: str = "red", min_area_in2: float = 0.15, merge_in: float = 0.5,
                  min_ink: float = 0.002, rgb: np.ndarray | None = None) -> list:
     """Regions of the reviewer's ink on a page, as page-pixel boxes.
 
-    merge_in    strokes closer than this are one comment (cell size is half of it)
+    merge_in    strokes closer than this are one comment (cell size is half of it);
+                0.5 in keeps the words of one handwritten line together, since a
+                word gap in half-inch handwriting is about 0.2 to 0.4 in
     min_area_in2 boxes smaller than this are specks, dropped
     min_ink     fraction of ink a cell needs to count as marked
     """
