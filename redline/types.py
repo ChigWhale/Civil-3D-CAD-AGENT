@@ -42,9 +42,12 @@ class Page(Record):
 @dataclass
 class Region(Record):
     id: str
-    bbox_px: list                # [x0, y0, x1, y1] on the page image
+    bbox_px: list                # [x0, y0, x1, y1] on the page image: the writing, not its arrows
     ink_fraction: float = 0.0
     color: str = "red"
+    kind_hint: str = "text"      # text | arrow | ring: what the ink detector saw
+    targets_px: list = field(default_factory=list)      # arrow tips / ring centres, page px
+    connector_boxes: list = field(default_factory=list)  # the arrows and rings that belong to it
 
 
 @dataclass
@@ -60,10 +63,36 @@ class Comment(Record):
     confidence: float = 0.0
     crop_path: str = ""
     raw_model_reply: str = ""
+    targets_px: list = field(default_factory=list)   # arrow tips / ring centres from the ink detector
+    starred: bool = False                             # begins with a drawn star / asterisk
+    is_directive: bool = False                        # the model read it as a general instruction
+    scope: str = "point"                              # point | multi | sheet
 
     def anchor_px(self) -> tuple:
+        """Where this comment is about, for a single-spot comment."""
+        if self.targets_px:
+            return (float(self.targets_px[0][0]), float(self.targets_px[0][1]))
         b = self.target_bbox_px or self.bbox_px
         return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+
+    def anchors_px(self) -> list:
+        """Every spot this comment is about: one per arrow tip for a
+        multi-target comment, one otherwise, none for a sheet-wide note."""
+        if self.scope == "sheet":
+            return []
+        if self.scope == "multi":
+            return [(float(t[0]), float(t[1])) for t in self.targets_px]
+        return [self.anchor_px()]
+
+
+def scope_of(targets_px: list, is_directive: bool, starred: bool = False, in_top_band: bool = False) -> str:
+    """A star makes a note sheet-wide outright. Without one, the model's
+    opinion that a note is a general instruction counts only for a note in
+    the top margin that points at nothing: reviewers write imperatives
+    beside things all the time ("connect to existing"), and those are spots."""
+    if starred or (is_directive and in_top_band and not targets_px):
+        return "sheet"
+    return "multi" if len(targets_px or []) >= 2 else "point"
 
 
 @dataclass
@@ -119,6 +148,37 @@ class Located(Record):
     model_xy: Optional[list] = None
     context: dict = field(default_factory=dict)
     reason: Optional[str] = None
+    target_index: int = 0                    # which of the comment's targets this is
+    target_count: int = 1
+    target_px: Optional[list] = None         # the page pixel that was located
+
+    @property
+    def key(self) -> str:
+        """What proposals and outcomes are filed under: the comment id, with
+        `#n` appended for the n-th target of a multi-target comment."""
+        return self.comment_id if self.target_count <= 1 else f"{self.comment_id}#{self.target_index + 1}"
+
+    def to_dict(self) -> dict:
+        d = super().to_dict()
+        d["key"] = self.key
+        return d
+
+
+@dataclass
+class Directive(Record):
+    """A sheet-wide reviewer note (starred, or general): stored per drawing
+    and shown to a person and to the planner, never acted on by itself."""
+    id: str
+    text: str
+    review_id: str
+    page_no: int
+    created: float
+    dwg_path: Optional[str] = None
+    layout_name: Optional[str] = None
+    sheet_no: Optional[str] = None
+    comment_id: Optional[str] = None
+    status: str = "open"                     # open | done
+    done_at: Optional[float] = None
 
 
 @dataclass
@@ -163,3 +223,5 @@ class Report(Record):
     counts: dict = field(default_factory=dict)
     settings: dict = field(default_factory=dict)
     errors: list = field(default_factory=list)
+    directives: list = field(default_factory=list)        # sheet-wide notes found in this review
+    recall_warnings: list = field(default_factory=list)   # hints that a comment may have been missed

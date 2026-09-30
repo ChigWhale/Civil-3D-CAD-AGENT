@@ -146,12 +146,14 @@ def guess_plan_type(ctx: dict) -> str | None:
     return max(votes.items(), key=lambda kv: kv[1])[0]
 
 
-def locate(comment, page_to_paper, viewports, index, data, paper_index, frozen_by_handle: dict | None = None,
-           radius: float = 100.0, layers: dict | None = None, layout_name: str = "") -> Located:
-    ax, ay = comment.anchor_px()
+def locate_point(comment, anchor_px, page_to_paper, viewports, index, data, paper_index,
+                 frozen_by_handle: dict | None = None, radius: float = 100.0, layers: dict | None = None,
+                 layout_name: str = "", target_index: int = 0, target_count: int = 1) -> Located:
+    ax, ay = anchor_px
     px, py = page_to_paper.to_paper(ax, ay)
     vp = viewport_at(viewports, px, py)
-    out = Located(comment_id=comment.id, space="none", paper_xy=[round(px, 3), round(py, 3)])
+    out = Located(comment_id=comment.id, space="none", paper_xy=[round(px, 3), round(py, 3)],
+                  target_index=target_index, target_count=target_count, target_px=[round(ax, 1), round(ay, 1)])
     if vp is None:
         out.space = "paper"
         out.context = paper_context(paper_index, (px, py), layout_name) if paper_index else {}
@@ -166,3 +168,14 @@ def locate(comment, page_to_paper, viewports, index, data, paper_index, frozen_b
     out.context["viewport"] = {"handle": vp.handle, "scale_text": f"1\"={1.0 / vp.scale:.0f}'",
                                "twist_deg": vp.twist_deg}
     return out
+
+
+def locate(comment, page_to_paper, viewports, index, data, paper_index, frozen_by_handle: dict | None = None,
+           radius: float = 100.0, layers: dict | None = None, layout_name: str = "") -> list:
+    """One Located per spot the comment is about: one for an ordinary
+    comment, one per arrow tip for a multi-target comment, none for a
+    sheet-wide note (which is stored as a directive instead)."""
+    anchors = comment.anchors_px()
+    return [locate_point(comment, a, page_to_paper, viewports, index, data, paper_index, frozen_by_handle=frozen_by_handle,
+                         radius=radius, layers=layers, layout_name=layout_name, target_index=i, target_count=len(anchors))
+            for i, a in enumerate(anchors)]

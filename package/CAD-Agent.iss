@@ -13,6 +13,13 @@
 #ifndef Dist
   #define Dist "dist"
 #endif
+; /DLite: the dashboard, the plugin and the drafting scripts only. No models, no
+; model runtime, no GPU needed, and one small Setup.exe with no companion .bin.
+#ifdef Lite
+  #define Name "CAD-Agent-Lite"
+#else
+  #define Name "CAD-Agent"
+#endif
 
 [Setup]
 AppId={{B7E1C4A2-9D3F-4C6B-8E5A-CADA6E2026C3}
@@ -26,27 +33,34 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#Dist}
-OutputBaseFilename=CAD-Agent-Setup-{#Version}
+OutputBaseFilename={#Name}-Setup-{#Version}
 Compression=lzma2/ultra64
 SolidCompression=yes
-LZMAUseSeparateProcess=yes
+#ifdef Lite
+DiskSpanning=no
+#else
 ; Windows caps a single Setup.exe near 4.2 GB and the two models alone are 7.6 GB,
 ; so the payload is split into Setup-N.bin files that must ship beside the .exe.
 DiskSpanning=yes
 DiskSliceSize=max
-UninstallDisplayName=CAD-Agent {#Version}
+#endif
+UninstallDisplayName={#Name} {#Version}
 WizardStyle=modern
 CloseApplications=no
 
+#ifndef Lite
 [Tasks]
 Name: "fetchmodels"; Description: "Download the language and vision models now (about 9 GB; can be done later from the dashboard)"; Flags: unchecked
+#endif
 
 [Files]
 Source: "{#Stage}\python\*"; DestDir: "{app}\python"; Flags: recursesubdirs ignoreversion
 Source: "{#Stage}\app\*"; DestDir: "{app}\app"; Flags: recursesubdirs ignoreversion
+#ifndef Lite
 ; model weights are already compressed; packing them with LZMA would take an hour for nothing
 Source: "{#Stage}\models\*.gguf"; DestDir: "{app}\models"; Flags: ignoreversion skipifsourcedoesntexist nocompression
 Source: "{#Stage}\models\*"; Excludes: "*.gguf"; DestDir: "{app}\models"; Flags: recursesubdirs ignoreversion skipifsourcedoesntexist
+#endif
 Source: "{#Stage}\version.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Stage}\cad-agent.template.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Stage}\bundle\CAD-Agent.bundle\*"; DestDir: "{userappdata}\Autodesk\ApplicationPlugins\CAD-Agent.bundle"; Flags: recursesubdirs ignoreversion
@@ -58,7 +72,9 @@ Name: "{autoprograms}\CAD-Agent Stop Services"; Filename: "{app}\python\pythonw.
 [Run]
 ; writes cad-agent.json and the bundle's install.json with this machine's paths
 Filename: "{app}\python\python.exe"; Parameters: """{app}\app\launcher.py"" install --bundle ""{userappdata}\Autodesk\ApplicationPlugins\CAD-Agent.bundle"""; WorkingDir: "{app}\app"; Flags: runhidden waituntilterminated; StatusMsg: "Writing the configuration..."
+#ifndef Lite
 Filename: "{app}\python\python.exe"; Parameters: """{app}\app\launcher.py"" fetch-models"; WorkingDir: "{app}\app"; Flags: nowait postinstall skipifsilent; Tasks: fetchmodels; Description: "Download the models"
+#endif
 Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\app\launcher.py"" open"; WorkingDir: "{app}\app"; Flags: nowait postinstall skipifsilent unchecked; Description: "Open the dashboard now"
 
 [UninstallRun]

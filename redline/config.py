@@ -45,6 +45,11 @@ _ENV = {
     # is refined. Unset = trust the page size.
     "border_rect": ("CAD_REDLINE_BORDER_RECT", ""),
     "min_confidence": ("CAD_REDLINE_MIN_CONFIDENCE", "0.5"),
+    # a second look for handwriting by the vision model on page tiles, merged
+    # with the ink detector's regions; "0" turns it off (about a minute a page)
+    "sweep": ("CAD_REDLINE_SWEEP", "1"),
+    # ink boxes smaller than this (square inches) are specks, not comments
+    "min_area_in2": ("CAD_REDLINE_MIN_AREA", "0.04"),
     "context_radius": ("CAD_REDLINE_CONTEXT_RADIUS", "100"),
     "model_timeout": ("CAD_REDLINE_MODEL_TIMEOUT", "600"),
     "on_conflict": ("CAD_REDLINE_ON_CONFLICT", "pause"),
@@ -92,6 +97,8 @@ class Settings:
     title_rects: list
     border_rect: tuple | None
     min_confidence: float
+    sweep: bool
+    min_area_in2: float
     context_radius: float
     model_timeout: float
     on_conflict: str
@@ -141,6 +148,8 @@ def load() -> Settings:
         title_rects=_rects(raw["title_rects"]) or [(0.84, 0, 1, 1), (0, 0.9, 1, 1)],
         border_rect=border[0] if border else None,
         min_confidence=float(raw["min_confidence"]),
+        sweep=str(raw["sweep"]).strip().lower() not in ("0", "false", "no", "off", ""),
+        min_area_in2=float(raw["min_area_in2"]),
         context_radius=float(raw["context_radius"]),
         model_timeout=float(raw["model_timeout"]),
         on_conflict=str(raw["on_conflict"]).strip().lower() or "pause",

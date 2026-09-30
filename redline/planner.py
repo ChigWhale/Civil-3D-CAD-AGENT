@@ -120,8 +120,13 @@ def _j(obj, limit: int = 4000) -> str:
 
 
 def build_user_prompt(comment, located, match, palette_text: str, steps: str = "", recipe: list | None = None,
-                      examples: list | None = None, retry_error: str | None = None) -> str:
+                      examples: list | None = None, retry_error: str | None = None, notes: list | None = None) -> str:
     parts = ["PALETTE (block types and their fields):", palette_text, ""]
+    if notes:
+        parts.append("STANDING NOTES (the reviewer's sheet-wide directives; honour them where they bear on this "
+                     "comment, never act on them by themselves):")
+        parts += [f"- {n}" for n in notes]
+        parts.append("")
     plan_type = (located.context or {}).get("plan_type_guess")
     if steps:
         parts += [f"PLAYBOOK STEPS ({plan_type}):", steps, ""]
@@ -149,6 +154,10 @@ def build_user_prompt(comment, located, match, palette_text: str, steps: str = "
         sheet += f" ({vp.get('scale_text')}, twist {vp.get('twist_deg')})"
     parts.append(f'COMMENT: text="{comment.text}" kind={comment.kind} targets_geometry={comment.targets_geometry} '
                  f'confidence={comment.confidence:.2f} {sheet}')
+    if getattr(located, "target_count", 1) > 1:
+        parts.append(f"TARGET {located.target_index + 1} of {located.target_count}: this comment has "
+                     f"{located.target_count} arrows to {located.target_count} places and the same instruction applies "
+                     f"at each; this answer is for the place below only")
     if located.space == "model":
         ctx = located.context or {}
         parts.append(f"LOCATION: model ({located.model_xy[0]:.1f}, {located.model_xy[1]:.1f}) ft; {ctx.get('cell', '')}")
@@ -255,12 +264,13 @@ def validate(blocks, handles: set, field_types: dict) -> tuple:
 # ── The call ─────────────────────────────────────────────────────────────────
 
 def plan(comment, located, match, backend, palette_text: str, field_types: dict, steps: str = "",
-         recipe: list | None = None, examples: list | None = None, log=None) -> ChainProposal:
+         recipe: list | None = None, examples: list | None = None, log=None, notes: list | None = None) -> ChainProposal:
     handles = known_handles(located.context)
     error = None
-    proposal = ChainProposal(comment_id=comment.id, model=getattr(backend, "name", "?"))
+    proposal = ChainProposal(comment_id=getattr(located, "key", comment.id), model=getattr(backend, "name", "?"))
     for attempt in (1, 2):
-        user = build_user_prompt(comment, located, match, palette_text, steps, recipe, examples, retry_error=error)
+        user = build_user_prompt(comment, located, match, palette_text, steps, recipe, examples, retry_error=error,
+                                 notes=notes)
         proposal.attempt, proposal.prompt_chars = attempt, len(user) + len(SYSTEM_PROMPT)
         t0 = time.time()
         try:

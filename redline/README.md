@@ -43,6 +43,8 @@ the same OpenAI-compatible endpoint, so the code does not change.
     python -m redline phase0 scans.pdf --page 1 --click 2410,1180
     python -m redline annotate <review_id> <comment_id> --chain chain.json --verdict good|bad
     python -m redline palette                      # what the planner is shown
+    python -m redline directives [--dwg X] [--done ID] [--all]   # sheet-wide notes on file
+    python -m redline show <review_id> [--comment p1-c3] [--json] # the actions planned per comment, with parameters
 
 From Claude Desktop: `review_redlines(pdf_path)` starts a review in the
 background; `review_status(review_id)` reads the report. The dashboard serves
@@ -151,6 +153,33 @@ the digest; both are free and reversible.
 | `CAD_REDLINE_BORDER_RECT` | unset | border's paper rectangle, inches, for the fit |
 | `CAD_REDLINE_MIN_CONFIDENCE` | 0.5 | below it, a comment goes to a person |
 | `CAD_REDLINE_ON_CONFLICT` | `pause` | or `warn` |
+| `CAD_REDLINE_SWEEP` | `1` | the model takes a second look for handwriting on page tiles; `0` to skip |
+| `CAD_REDLINE_MIN_AREA` | 0.04 | ink boxes smaller than this (square inches) are specks |
+
+## One note, many places; notes for the whole sheet
+
+The ink detector (`marks.py`) separates writing from connectors before it
+groups anything. Long thin strokes (arrows, leaders) and rings (circles,
+clouds) are traced on a fine grid to their far ends; a connector whose near
+end sits beside a note gives that note one target per far end, and a ring
+gives its centre. So one note with three arrows is located and planned three
+times, filed as `p1-c3#1`, `p1-c3#2`, `p1-c3#3`, each with the context of
+its own spot. The crops the model reads hold the writing only, never the
+arrows, which is what keeps them legible.
+
+A note that begins with a drawn star (or, when it sits in the top margin and
+points at nothing, one the model reads as a rule for the whole sheet) is a
+**directive**. It is not located or planned. It is stored per drawing under
+`<review dir>/directives/<drawing>.jsonl`, listed in the report under
+"Sheet-wide notes (a person must apply these)", and given to the planner as
+a standing note for every other comment on that drawing. `python -m redline
+directives --done <id>` closes one once it has been applied.
+
+`crops/p<N>_regions.png` in every review folder shows what the detector
+found: green boxes are notes, orange are their connectors, blue dots their
+targets, magenta are long connectors with no writing beside them. Those, and
+tiles where the model counts clearly more marks than the detector boxed, are
+listed in the report under "Possible missed comments".
 
 A `redline.json` beside the repo root (or the file `CAD_REDLINE_CONFIG`
 names) supplies the same keys for an install with no environment to set.

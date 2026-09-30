@@ -9,17 +9,23 @@ Order of model use inside review(): every page is read first (vision model),
 then every comment is planned (text model). On an 8 GB card only one of
 the two fits at a time; grouping the calls means the server swaps models
 once per review instead of once per comment.
+
+A comment may be about several places (one note, several arrows): it is
+located and planned once per arrow tip, filed under `p1-c3#1`, `p1-c3#2`...
+A starred or general note for the whole sheet is not located at all; it is
+stored as a directive (redline/directives.py), shown in the report for a
+person, and handed to the planner as a standing note.
 """
 import os
 import sys
 import time
 
-from . import config, locate as locate_mod, marks, ocr as ocr_mod, palette, pdf as pdf_mod, planner as planner_mod
-from . import report as report_mod, sheet as sheet_mod
+from . import config, directives as directives_mod, locate as locate_mod, marks, ocr as ocr_mod, palette
+from . import pdf as pdf_mod, planner as planner_mod, report as report_mod, sheet as sheet_mod
 from .paper_index import PaperIndex
 from .runner import DashboardClient, DashboardError, outcome_of
 from .transform import PageToPaper, PaperToModel
-from .types import CommentOutcome, Report
+from .types import CommentOutcome, Located, Report
 
 if str(config.ROOT) not in sys.path:
     sys.path.insert(0, str(config.ROOT))
@@ -44,6 +50,50 @@ def _review_id() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
 
+def detect(page, rgb, ocr, settings, crops_dir: str, log=_log) -> tuple:
+    """The reviewer's ink on one page: (regions, warnings, used_model).
+
+    The ink detector finds the writing and traces its arrows. When it finds
+    nothing at all (a grey photocopy) the model is asked for boxes instead.
+    Otherwise, with the sweep on, the model takes a second look and any mark
+    it sees that the detector has no region for is added; a tile where it
+    counts clearly more marks than were detected becomes a warning. Long
+    arrows with no writing beside them are warnings too. The overlay PNG
+    shows all of it."""
+    regions, orphans = marks.analyse(page, rgb=rgb, min_area_in2=settings.min_area_in2)
+    warnings = []
+    used_model = False
+    if not regions and not orphans:
+        regions = ocr.find_marks(page)
+        used_model = True
+        log(f"  no red ink; model found {len(regions)} mark(s)")
+    elif settings.sweep:
+        extra, warns = ocr_mod.sweep(page, regions, ocr, rgb=rgb)
+        if extra:
+            for k, r in enumerate(extra, start=len(regions) + 1):
+                r.id = f"{page.id}-r{k}"
+            regions = regions + extra
+            log(f"  sweep added {len(extra)} region(s) the ink detector had not boxed")
+        warnings.extend(warns)
+    for o in orphans:
+        warnings.append({"page_no": page.page_no, "kind": "orphan_connector", "bbox_px": o["bbox_px"],
+                         "detail": f"a {o['length_in']} in {o['kind']} with no writing beside it, at {o['bbox_px']}"})
+    try:
+        os.makedirs(crops_dir, exist_ok=True)
+        marks.debug_image(page, regions, orphans).save(os.path.join(crops_dir, f"{page.id}_regions.png"))
+    except Exception:
+        pass
+    return regions, warnings, used_model
+
+
+def _describe(c) -> str:
+    if c.scope == "sheet":
+        return " (sheet-wide note)"
+    if c.scope == "multi":
+        return f" -> {len(c.targets_px)} targets"
+    return ""
+
+
 def review(pdfs: list, settings=None, dry_run: bool = False, ocr=None, planner=None, on_conflict: str | None = None,
            log=_log, review_id: str | None = None, pages: list | None = None) -> Report:
     settings = settings or config.load()
@@ -54,6 +104,7 @@ def review(pdfs: list, settings=None, dry_run: bool = False, ocr=None, planner=N
                     settings={k: v for k, v in settings.raw.items() if k not in ("fixture",)})
     ocr = ocr or ocr_mod.backend(settings)
     on_conflict = (on_conflict or settings.on_conflict or "pause").lower()
+    crops_dir = os.path.join(out_dir, "crops")
 
     # ── 1. read every page ────────────────────────────────────────────────
     wanted_pages = pages_filter(pages)
@@ -67,13 +118,11 @@ def review(pdfs: list, settings=None, dry_run: bool = False, ocr=None, planner=N
         for page in pgs:
             log(f"page {page.page_no} of {os.path.basename(pdf)}: {page.width_px}x{page.height_px} px")
             rgb = marks._array(page)
-            regions = marks.find_regions(page, rgb=rgb)
-            if not regions:
-                regions = ocr.find_marks(page)
-                log(f"  no red ink; model found {len(regions)} mark(s)")
-            comments = ocr.read_comments(page, regions, out_dir=os.path.join(out_dir, "crops"))
+            regions, warnings, _ = detect(page, rgb, ocr, settings, crops_dir, log=log)
+            report.recall_warnings.extend(warnings)
+            comments = ocr.read_comments(page, regions, out_dir=crops_dir)
             log(f"  {len(regions)} region(s), {len(comments)} comment(s) read")
-            title = sheet_mod.read_title_block(page, ocr, settings, out_dir=os.path.join(out_dir, "crops"))
+            title = sheet_mod.read_title_block(page, ocr, settings, out_dir=crops_dir)
             border = marks.find_border(page, rgb=rgb) if settings.border_rect else None
             per_page[page.page_no] = {"page": page, "comments": comments, "title": title, "border": border}
             report.comments.extend(c.to_dict() for c in comments)
@@ -97,25 +146,38 @@ def review(pdfs: list, settings=None, dry_run: bool = False, ocr=None, planner=N
         else:
             log(f"page {pn}: {m.dwg_path} / {m.layout_name} ({m.how})")
 
-    # ── 3. locate every comment ───────────────────────────────────────────
-    located = {}
+    # ── 3. locate every comment; file the sheet-wide ones ─────────────────
+    located = {}          # key -> Located   (key = comment id, or id#n for the n-th target)
+    comment_of = {}       # key -> Comment
+    found_directives = {} # dwg path (or None) -> [Directive] found in this review
     for pn, rec in per_page.items():
         m = rec.get("match")
-        if m is None or not m.ok or m.reason:
-            for c in rec["comments"]:
-                located[c.id] = locate_mod.Located(comment_id=c.id, space="none", reason=m.reason if m else "unmatched")
-            continue
-        entry = entries[os.path.normcase(os.path.abspath(m.dwg_path))]
-        layout = next((l for l in entry.data.get("layouts") or [] if l.get("name") == m.layout_name), {})
-        pidx = PaperIndex(layout)
-        p2p, vps = sheet_mod.transforms_for(m)
-        frozen = {v["handle"]: v.get("frozen_layers") or [] for v in m.viewports}
-        layers = locate_mod.layer_map(entry.data)
+        matched = m is not None and m.ok and not m.reason
+        dwg = m.dwg_path if m is not None else None
         for c in rec["comments"]:
-            loc = locate_mod.locate(c, p2p, vps, entry.index, entry.data, pidx, frozen_by_handle=frozen,
-                                    radius=settings.context_radius, layers=layers, layout_name=m.layout_name)
-            located[c.id] = loc
-            log(f"  {c.id} '{c.text[:40]}' -> {loc.space} {loc.model_xy or loc.paper_xy}")
+            if c.scope == "sheet":
+                d = directives_mod.add(settings.review_dir, review_id, c, dwg, m.layout_name if m else None,
+                                       sheet_no=rec["title"].sheet_no)
+                found_directives.setdefault(dwg, []).append(d)
+                report.directives.append(d.to_dict())
+                log(f"  {c.id} '{c.text[:40]}' -> sheet-wide note, stored as {d.id}")
+                continue
+            if not matched:
+                loc = Located(comment_id=c.id, space="none", reason=m.reason if m else "unmatched")
+                located[loc.key] = loc
+                comment_of[loc.key] = c
+                continue
+            entry = entries[os.path.normcase(os.path.abspath(m.dwg_path))]
+            layout = next((l for l in entry.data.get("layouts") or [] if l.get("name") == m.layout_name), {})
+            pidx = PaperIndex(layout)
+            p2p, vps = sheet_mod.transforms_for(m)
+            frozen = {v["handle"]: v.get("frozen_layers") or [] for v in m.viewports}
+            layers = locate_mod.layer_map(entry.data)
+            for loc in locate_mod.locate(c, p2p, vps, entry.index, entry.data, pidx, frozen_by_handle=frozen,
+                                         radius=settings.context_radius, layers=layers, layout_name=m.layout_name):
+                located[loc.key] = loc
+                comment_of[loc.key] = c
+                log(f"  {loc.key} '{c.text[:40]}' -> {loc.space} {loc.model_xy or loc.paper_xy}")
     report.located = [l.to_dict() for l in located.values()]
 
     # ── 4. plan ───────────────────────────────────────────────────────────
@@ -123,75 +185,81 @@ def review(pdfs: list, settings=None, dry_run: bool = False, ocr=None, planner=N
     pal_text = palette.palette_text()
     ftypes = palette.field_types()
     examples = palette.load_examples()
+    notes_cache = {}
     proposals = {}
-    for pn, rec in per_page.items():
-        m = rec.get("match")
-        for c in rec["comments"]:
-            loc = located[c.id]
-            if loc.space == "none":
-                proposals[c.id] = planner_mod.ChainProposal(comment_id=c.id, skip=True,
-                                                            reason=f"not_located: {loc.reason or 'no sheet match'}")
-                continue
-            if c.confidence < settings.min_confidence or not c.text.strip():
-                proposals[c.id] = planner_mod.ChainProposal(comment_id=c.id, skip=True,
-                                                            reason=f"needs_human: transcription confidence {c.confidence:.2f}")
-                continue
-            plan_type = (loc.context or {}).get("plan_type_guess")
-            prop = planner_mod.plan(c, loc, m, planner, pal_text, ftypes, steps=palette.playbook_steps(plan_type),
-                                    recipe=palette.recipe_blocks(plan_type), examples=examples, log=log)
-            proposals[c.id] = prop
-            log(f"  {c.id}: " + ("skip: " + str(prop.reason) if prop.skip else "chain " + " -> ".join(b["type"] for b in prop.blocks)))
+    match_of = {pn: rec.get("match") for pn, rec in per_page.items()}
+    for key, loc in located.items():
+        c = comment_of[key]
+        m = match_of.get(c.page_no)
+        if loc.space == "none":
+            proposals[key] = planner_mod.ChainProposal(comment_id=key, skip=True,
+                                                       reason=f"not_located: {loc.reason or 'no sheet match'}")
+            continue
+        if c.confidence < settings.min_confidence or not c.text.strip():
+            proposals[key] = planner_mod.ChainProposal(comment_id=key, skip=True,
+                                                       reason=f"needs_human: transcription confidence {c.confidence:.2f}")
+            continue
+        dwg = m.dwg_path if m is not None else None
+        if dwg not in notes_cache:
+            notes_cache[dwg] = directives_mod.notes_for(settings.review_dir, dwg, extra=found_directives.get(dwg))
+        plan_type = (loc.context or {}).get("plan_type_guess")
+        prop = planner_mod.plan(c, loc, m, planner, pal_text, ftypes, steps=palette.playbook_steps(plan_type),
+                                recipe=palette.recipe_blocks(plan_type), examples=examples, log=log,
+                                notes=notes_cache[dwg])
+        proposals[key] = prop
+        log(f"  {key}: " + ("skip: " + str(prop.reason) if prop.skip else "chain " + " -> ".join(b["type"] for b in prop.blocks)))
     report.proposals = [p.to_dict() for p in proposals.values()]
 
     # ── 5. run ────────────────────────────────────────────────────────────
     outcomes = {}
     if dry_run:
-        for cid, prop in proposals.items():
+        for key, prop in proposals.items():
             if prop.blocks:
-                outcomes[cid] = CommentOutcome(comment_id=cid, status="dry_run")
+                outcomes[key] = CommentOutcome(comment_id=key, status="dry_run")
             else:
                 reason = prop.reason or "no chain"
                 status = "needs_human" if str(reason).startswith("needs_human") else "skipped"
-                outcomes[cid] = CommentOutcome(comment_id=cid, status=status, reason=reason)
+                outcomes[key] = CommentOutcome(comment_id=key, status=status, reason=reason)
     else:
         client = DashboardClient(settings.dashboard_base)
         by_drawing = {}
-        for pn, rec in per_page.items():
-            m = rec.get("match")
-            for c in rec["comments"]:
-                prop = proposals[c.id]
-                if prop.blocks and m is not None and m.dwg_path:
-                    by_drawing.setdefault(m.dwg_path, []).append((c, prop, m))
-                else:
-                    reason = prop.reason or "no chain"
-                    status = "needs_human" if str(reason).startswith("needs_human") else "skipped"
-                    outcomes[c.id] = CommentOutcome(comment_id=c.id, status=status, reason=reason)
+        for key, prop in proposals.items():
+            c = comment_of[key]
+            m = match_of.get(c.page_no)
+            if prop.blocks and m is not None and m.dwg_path:
+                by_drawing.setdefault(m.dwg_path, []).append((key, c, prop, m))
+            else:
+                reason = prop.reason or "no chain"
+                status = "needs_human" if str(reason).startswith("needs_human") else "skipped"
+                outcomes[key] = CommentOutcome(comment_id=key, status=status, reason=reason)
         for dwg, items in by_drawing.items():
             try:
                 dash = client.ensure_dashboard(dwg)
             except DashboardError as e:
-                for c, prop, m in items:
-                    outcomes[c.id] = CommentOutcome(comment_id=c.id, status="failed", reason=f"dashboard: {e}")
+                for key, c, prop, m in items:
+                    outcomes[key] = CommentOutcome(comment_id=key, status="failed", reason=f"dashboard: {e}")
                 report.errors.append(f"{dwg}: {e}")
                 continue
             if client.busy(dash):
-                for c, prop, m in items:
-                    outcomes[c.id] = CommentOutcome(comment_id=c.id, status="failed", reason="dashboard_busy", dashboard=dash)
+                for key, c, prop, m in items:
+                    outcomes[key] = CommentOutcome(comment_id=key, status="failed", reason="dashboard_busy", dashboard=dash)
                 continue
-            for c, prop, m in items:
-                label = f"{m.layout_name} {c.id}: {c.text[:50]}"
+            for key, c, prop, m in items:
+                label = f"{m.layout_name} {key}: {c.text[:50]}"
                 try:
                     started = client.run(dash, prop.blocks, label, on_conflict=on_conflict)
                     digest = client.wait_run(dash, started["run"])
                     results = client.results(dash) if digest.get("status") == "finished" else None
-                    outcomes[c.id] = outcome_of(c.id, dash, digest, results)
+                    outcomes[key] = outcome_of(key, dash, digest, results)
                 except DashboardError as e:
-                    outcomes[c.id] = CommentOutcome(comment_id=c.id, status="failed", reason=str(e)[:400], dashboard=dash)
-                log(f"  {c.id}: {outcomes[c.id].status} {outcomes[c.id].reason or ''}")
+                    outcomes[key] = CommentOutcome(comment_id=key, status="failed", reason=str(e)[:400], dashboard=dash)
+                log(f"  {key}: {outcomes[key].status} {outcomes[key].reason or ''}")
     report.outcomes = [o.to_dict() for o in outcomes.values()]
     counts = {}
     for o in outcomes.values():
         counts[o.status] = counts.get(o.status, 0) + 1
+    if report.directives:
+        counts["directives"] = len(report.directives)
     report.counts = counts
 
     # ── 6. write ──────────────────────────────────────────────────────────
@@ -228,8 +296,9 @@ def phase0(pdf: str, page_no: int, x_px: float, y_px: float, settings=None, ocr=
     rgb = marks._array(page)
     title = sheet_mod.read_title_block(page, ocr, settings, out_dir=os.path.join(out_dir, "crops"))
     border = marks.find_border(page, rgb=rgb)
+    regions, orphans = marks.analyse(page, rgb=rgb, min_area_in2=settings.min_area_in2)
     out = {"page": page.to_dict(), "title_block": title.to_dict(), "border_px": border,
-           "regions": [r.to_dict() for r in marks.find_regions(page, rgb=rgb)]}
+           "regions": [r.to_dict() for r in regions], "orphan_connectors": orphans}
     if border:
         nominal = PageToPaper.nominal(page.width_px, page.height_px, page_in=(page.width_in, page.height_in))
         bl = nominal.to_paper(border[0], border[3])
@@ -270,22 +339,22 @@ def ocr_only(pdf: str, settings=None, ocr=None, log=_log, pages: list | None = N
     settings = settings or config.load()
     ocr = ocr or ocr_mod.backend(settings)
     out_dir = os.path.join(settings.review_dir, "ocr-only", _review_id())
-    out = {"pdf": os.path.abspath(pdf), "out_dir": out_dir, "pages": []}
+    crops_dir = os.path.join(out_dir, "crops")
+    out = {"pdf": os.path.abspath(pdf), "out_dir": out_dir, "pages": [], "recall_warnings": []}
     for page in pdf_mod.rasterise(pdf, dpi=settings.dpi, out_dir=os.path.join(out_dir, "pages"), pages=pages_filter(pages)):
         rgb = marks._array(page)
-        regions = marks.find_regions(page, rgb=rgb)
-        used_model = False
-        if not regions:
-            regions = ocr.find_marks(page)
-            used_model = True
-        comments = ocr.read_comments(page, regions, out_dir=os.path.join(out_dir, "crops"))
-        title = sheet_mod.read_title_block(page, ocr, settings, out_dir=os.path.join(out_dir, "crops"))
+        regions, warnings, used_model = detect(page, rgb, ocr, settings, crops_dir, log=log)
+        out["recall_warnings"].extend(warnings)
+        comments = ocr.read_comments(page, regions, out_dir=crops_dir)
+        title = sheet_mod.read_title_block(page, ocr, settings, out_dir=crops_dir)
         out["pages"].append({"page_no": page.page_no, "regions_from_model": used_model,
                              "regions": [r.to_dict() for r in regions], "comments": [c.to_dict() for c in comments],
                              "title_block": title.to_dict()})
         log(f"page {page.page_no}: {len(comments)} comment(s); sheet {title.sheet_no} file {title.printed_file}")
         for c in comments:
-            log(f"  {c.id} [{c.kind} {c.confidence:.2f}] {c.text}")
+            log(f"  {c.id} [{c.kind} {c.confidence:.2f}] {c.text}{_describe(c)}")
+        for w in warnings:
+            log(f"  POSSIBLE MISS: {w['detail']}")
     # Every failed read carries its error, but eight "unknown" comments in a row
     # read like bad handwriting when the truth is that no model answered. Say so.
     failed = [c for pg in out["pages"] for c in pg["comments"] if str(c.get("raw_model_reply", "")).startswith("error")]

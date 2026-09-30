@@ -15,7 +15,7 @@ from typing import Protocol
 
 from . import marks, openai_compat
 from . import pdf as pdf_mod
-from .types import Comment, Page, Region
+from .types import Comment, Page, Region, scope_of
 
 KINDS = ("note", "arrow", "circle", "cloud", "strike", "dimension", "unknown")
 
@@ -33,10 +33,18 @@ READ_SCHEMA = {
         "targets_geometry": {"type": "boolean"},
         "target_offset": {"type": "string", "enum": ["on", "above", "below", "left", "right", "none"]},
         "mark_center": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+        "starred": {"type": "boolean"},
+        "is_directive": {"type": "boolean"},
         "confidence": {"type": "number"},
     },
-    "required": ["text", "kind", "targets_geometry", "mark_center", "confidence"],
+    "required": ["text", "kind", "targets_geometry", "mark_center", "starred", "is_directive", "confidence"],
 }
+
+TOP_BAND = 0.12   # fraction of the page height that counts as the top margin
+
+
+def in_top_band(bbox_px: list, page: Page) -> bool:
+    return (bbox_px[1] + bbox_px[3]) / 2.0 <= TOP_BAND * page.height_px
 
 MARKS_SCHEMA = {
     "title": "marks",
@@ -46,6 +54,49 @@ MARKS_SCHEMA = {
         "text": {"type": "string"}}, "required": ["x0", "y0", "x1", "y1"]}}},
     "required": ["marks"],
 }
+
+SWEEP_MIN_PX_AT_150 = 40
+
+
+def _boxes_overlap(a, b) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def sweep(page: Page, regions: list, ocr, rgb=None, tiles=(3, 2)) -> tuple:
+    """A second, independent look for handwriting: the model scans the page in
+    tiles and every box it reports that the ink detector has no region or
+    connector for becomes an extra region (when there is red ink in it), and
+    a tile where the model counts clearly more comments than were detected
+    becomes a warning. (extra_regions, warnings)."""
+    rgb = marks._array(page) if rgb is None else rgb
+    mask = marks.red_mask(rgb)
+    min_px = int(SWEEP_MIN_PX_AT_150 * (page.dpi / 150.0) ** 2)
+    covered = [list(r.bbox_px) for r in regions] + [cb for r in regions for cb in r.connector_boxes]
+    found = ocr.find_marks(page, tiles=tiles) if hasattr(ocr, "find_marks") else []
+    extra = []
+    for m in found:
+        if any(_boxes_overlap(m.bbox_px, c) for c in covered):
+            continue
+        x0, y0, x1, y1 = [int(v) for v in m.bbox_px]
+        if int(mask[y0:y1, x0:x1].sum()) < max(1, min_px):
+            continue
+        extra.append(Region(id="", bbox_px=[x0, y0, x1, y1], color="model", kind_hint="model"))
+    warnings = []
+    nx, ny = tiles
+    tw, th = page.width_px / nx, page.height_px / ny
+    for j in range(ny):
+        for i in range(nx):
+            tile = [i * tw, j * th, (i + 1) * tw, (j + 1) * th]
+
+            def inside(b):
+                cx, cy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+                return tile[0] <= cx < tile[2] and tile[1] <= cy < tile[3]
+            detected = sum(1 for r in regions + extra if inside(r.bbox_px))
+            counted = sum(1 for m in found if inside(m.bbox_px))
+            if counted >= detected + 2:
+                warnings.append({"page_no": page.page_no, "kind": "model_count", "tile": [i + 1, j + 1],
+                                 "detail": f"model saw {counted} mark(s) in tile {i + 1},{j + 1}; detector has {detected}"})
+    return extra, warnings
 
 
 class OcrBackend(Protocol):
@@ -83,15 +134,23 @@ class FakeOcr:
         wanted = (self.fixture.get("comments") or {}).get(str(page.page_no)) or []
         out = []
         for i, spec in enumerate(wanted):
-            bbox = spec.get("bbox_px") or (regions[i].bbox_px if i < len(regions) else None)
+            region = regions[i] if i < len(regions) else None
+            bbox = spec.get("bbox_px") or (region.bbox_px if region else None)
             if bbox is None:
                 continue
+            targets = spec.get("targets_px")
+            if targets is None:
+                targets = list(region.targets_px) if region else []
+            is_dir = bool(spec.get("is_directive", False))
+            starred = bool(spec.get("starred", is_dir))
             out.append(Comment(id=f"{page.id}-c{i + 1}", page_no=page.page_no, bbox_px=list(bbox),
                                text=str(spec.get("text", "")), kind=spec.get("kind", "note"),
                                targets_geometry=bool(spec.get("targets_geometry", False)),
                                target_offset=spec.get("target_offset"),
                                target_bbox_px=spec.get("target_bbox_px"),
-                               confidence=float(spec.get("confidence", 0.9)), raw_model_reply="fixture"))
+                               confidence=float(spec.get("confidence", 0.9)), raw_model_reply="fixture",
+                               targets_px=[list(t) for t in targets], starred=starred, is_directive=is_dir,
+                               scope=scope_of(targets, is_dir, starred, in_top_band(list(bbox), page))))
         return out
 
     def read_text(self, image, hint=""):
@@ -101,7 +160,7 @@ class FakeOcr:
             return str(by_page[str(self.current_page)])
         return str(self.fixture.get("title_text") or next(iter(by_page.values()), ""))
 
-    def find_marks(self, page):
+    def find_marks(self, page, **kw):
         self.current_page = page.page_no
         boxes = (self.fixture.get("regions") or {}).get(str(page.page_no)) or []
         return [Region(id=f"{page.id}-r{i + 1}", bbox_px=list(b)) for i, b in enumerate(boxes)]
@@ -143,10 +202,14 @@ class OpenAICompatVlm:
                       "target_offset says where that thing sits relative to the handwriting (on, above, below, "
                       "left, right, none). mark_center is where the mark itself sits (the circle, the arrow's tip, "
                       "the X, the cloud; for a note with no mark, the middle of the words) as fractions of this "
-                      "image, [x, y] from the top-left corner, 0 to 1. confidence is 0 to 1 for the transcription. "
+                      "image, [x, y] from the top-left corner, 0 to 1. starred is true only when a drawn star or "
+                      "asterisk stands right before the first word. is_directive is true only when the words are "
+                      "a rule for the whole sheet (like 'all valves to face the street'), not an instruction about "
+                      "the thing they sit beside. confidence is 0 to 1 for the transcription. "
                       + GLOSSARY +
                       ' Answer as JSON: {"text": "...", "kind": "...", "targets_geometry": true/false, '
-                      '"target_offset": "...", "mark_center": [0.5, 0.5], "confidence": 0.0}')
+                      '"target_offset": "...", "mark_center": [0.5, 0.5], "starred": false, "is_directive": false, '
+                      '"confidence": 0.0}')
             raw = ""
             try:
                 raw = self._ask(img, prompt, READ_SCHEMA)
@@ -164,10 +227,16 @@ class OpenAICompatVlm:
                         targets_geometry=bool(rep.get("targets_geometry")),
                         target_offset=None if target_offset == "none" else target_offset,
                         confidence=max(0.0, min(1.0, float(rep.get("confidence") or 0.0))),
-                        crop_path=crop_path, raw_model_reply=str(raw)[:2000])
-            # The mark's own position beats the ink box centre: a comment's
-            # words usually sit beside the thing they are about, not on it.
-            c.target_bbox_px = _mark_box(rep.get("mark_center"), box, page) or _target_box(c, page)
+                        crop_path=crop_path, raw_model_reply=str(raw)[:2000],
+                        targets_px=[list(t) for t in region.targets_px], starred=bool(rep.get("starred")),
+                        is_directive=bool(rep.get("is_directive")))
+            c.scope = scope_of(c.targets_px, c.is_directive, c.starred, in_top_band(region.bbox_px, page))
+            # Where the comment is about, best evidence first: an arrow tip or
+            # ring centre traced by the ink detector; else the mark's own spot
+            # as the model saw it in the crop; else the ink box shifted the way
+            # the model said the target lies.
+            if not c.targets_px:
+                c.target_bbox_px = _mark_box(rep.get("mark_center"), box, page) or _target_box(c, page)
             out.append(c)
         return out
 

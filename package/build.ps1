@@ -31,8 +31,12 @@ param(
     [string]$SeriesMax = "R26.0",
     [switch]$SkipPlugin,
     [switch]$SkipPython,
-    [switch]$Installer
+    [switch]$Installer,
+    # dashboard + plugin + drafting scripts only: no models, no model runtime, no GPU
+    # needed, one small Setup.exe (the redline pipeline stays installed but idle)
+    [switch]$Lite
 )
+if ($Lite) { $LlamaSwapUrl = ""; $LlamaServerUrl = ""; $CudartUrl = ""; $ModelsDir = "" }
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
@@ -105,13 +109,15 @@ $AppDir = Join-Path $Stage "app"
 $exclude = @(".git", ".vs", ".claude", "bin", "obj", "tests", "package", "__pycache__", "MathDrill", "Gambol",
              "uploads", "uploads-test", "downloads", "stage", "dist", "PipeInvertSetter", "PipeInvertSetter.Tests",
              "ReeseOclock", "Commands", ".run", "observations")
+if ($Lite) { $exclude += "redline" }      # the comment addresser stays out of the lite package
 $excludeFiles = @("*.cs", "*.csproj", "*.sln", "*.slnx", "*.pyc", "*.user", "*.xaml", "*.pt", "layer_tags.learned.json",
                   "ollama_agent.py", "GNN_*.py", "LabelGNN*.py", "Testing.py", "*.bak", "redline.json", "cad-agent.json",
                   "build-test.log")
 $rc = & robocopy $Root $AppDir /E /NFL /NDL /NJH /NJS /XD $exclude /XF $excludeFiles
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
 $global:LASTEXITCODE = 0
-& (Join-Path $PyDir "python.exe") -c "import sys; sys.path.insert(0, r'$AppDir'); import cad_mcp_server, dashboard.server, redline.pipeline, launcher; print('app imports ok')"
+$mods = if ($Lite) { "cad_mcp_server, dashboard.server, launcher" } else { "cad_mcp_server, dashboard.server, redline.pipeline, launcher" }
+& (Join-Path $PyDir "python.exe") -c "import sys; sys.path.insert(0, r'$AppDir'); import $mods; print('app imports ok')"
 if ($LASTEXITCODE -ne 0) { throw "app import check failed" }
 Get-ChildItem $AppDir -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force    # left by the check
 
@@ -154,8 +160,16 @@ if ($Installer) {
     if (-not $iscc) { throw "Inno Setup 6 or 7 not found; install it from https://jrsoftware.org/isinfo.php or drop -Installer" }
     New-Item -ItemType Directory -Force (Join-Path $Pkg "dist") | Out-Null
     Step "compiling the installer"
-    & $iscc "/DVersion=$Version" "/DStage=$Stage" "/DDist=$(Join-Path $Pkg 'dist')" (Join-Path $Pkg "CAD-Agent.iss")
-    if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+    # ISCC prints warnings on stderr; under $ErrorActionPreference = "Stop" PowerShell
+    # would abort on the first one, so judge the compile by its exit code alone.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $defs = @("/DVersion=$Version", "/DStage=$Stage", "/DDist=$(Join-Path $Pkg 'dist')")
+    if ($Lite) { $defs += "/DLite" }
+    & $iscc @defs (Join-Path $Pkg "CAD-Agent.iss") 2>&1 | ForEach-Object { "$_" }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    if ($code -ne 0) { throw "ISCC failed ($code)" }
     Get-ChildItem (Join-Path $Pkg "dist") -Filter "*.exe" | ForEach-Object { Step ("installer: {0} ({1:N0} MB)" -f $_.FullName, ($_.Length / 1MB)) }
 }
 Step "done"

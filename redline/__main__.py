@@ -73,6 +73,17 @@ def main(argv=None) -> int:
     _common(p)
 
     p = sub.add_parser("palette", help="the block palette text the planner is shown")
+    p = sub.add_parser("directives", help="list the sheet-wide reviewer notes on file, or close one")
+    p.add_argument("--dwg", help="only this drawing (path or file name)")
+    p.add_argument("--done", help="mark this directive id done")
+    p.add_argument("--reopen", help="mark this directive id open again")
+    p.add_argument("--all", action="store_true", help="include closed ones")
+    _common(p)
+    p = sub.add_parser("show", help="the actions planned for every comment of a review, with their parameters")
+    p.add_argument("review", help="review id (folder under the review dir) or a path to its report.json")
+    p.add_argument("--comment", help="only this comment id, e.g. p1-c3 (all of its targets)")
+    p.add_argument("--json", action="store_true", help="print the chains as JSON instead of text")
+    _common(p)
     p = sub.add_parser("doctor", help="check the plugin, dashboard and model server")
     _common(p)
 
@@ -92,6 +103,10 @@ def main(argv=None) -> int:
 
     if args.cmd == "doctor":
         return _doctor(settings)
+    if args.cmd == "directives":
+        return _directives(settings, args)
+    if args.cmd == "show":
+        return _show(settings, args)
 
     from . import pipeline
     if args.cmd == "review":
@@ -119,6 +134,96 @@ def main(argv=None) -> int:
                           "human_chain": row.get("human_chain")}, default=str))
         return 0
     return 2
+
+
+def _show(settings, args) -> int:
+    """What was planned for each comment, in order, readable by a person."""
+    path = args.review
+    if not path.lower().endswith(".json"):
+        path = os.path.join(settings.review_dir, args.review, "report.json")
+    if not os.path.isfile(path):
+        print(f"no report at {path}")
+        return 1
+    with open(path, "r", encoding="utf-8") as f:
+        r = json.load(f)
+    located = {l.get("key", l.get("comment_id")): l for l in r.get("located") or []}
+    proposals = {p["comment_id"]: p for p in r.get("proposals") or []}
+    outcomes = {o["comment_id"]: o for o in r.get("outcomes") or []}
+    sheets = {s["page_no"]: s for s in r.get("sheets") or []}
+    want = args.comment
+    out = []
+    for c in r.get("comments") or []:
+        cid = c["id"]
+        if want and cid != want:
+            continue
+        if c.get("scope") == "sheet":
+            out.append({"key": cid, "text": c.get("text"), "scope": "sheet", "status": "directive", "blocks": []})
+            continue
+        keys = sorted((k for k in located if k == cid or k.startswith(cid + "#")),
+                      key=lambda k: int(k.split("#")[1]) if "#" in k else 0) or [cid]
+        for key in keys:
+            loc = located.get(key) or {}
+            prop = proposals.get(key) or {}
+            outc = outcomes.get(key) or {}
+            rationale = None
+            try:
+                from . import openai_compat
+                rationale = openai_compat.parse_json(prop.get("raw_reply") or "").get("rationale")
+            except (ValueError, AttributeError):
+                pass
+            out.append({"key": key, "text": c.get("text"), "kind": c.get("kind"), "scope": c.get("scope"),
+                        "page": c.get("page_no"), "layout": (sheets.get(c.get("page_no")) or {}).get("layout_name"),
+                        "space": loc.get("space"), "model_xy": loc.get("model_xy"), "paper_xy": loc.get("paper_xy"),
+                        "status": outc.get("status") or ("skipped" if prop.get("skip") else "planned"),
+                        "reason": outc.get("reason") or prop.get("reason"), "rationale": rationale,
+                        "blocks": prop.get("blocks") or [], "run_id": outc.get("run_id"),
+                        "results_preview": outc.get("results_preview")})
+    if args.json:
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+    print(f"review {r.get('review_id')}  ({len(out)} item(s))")
+    for it in out:
+        where = ""
+        if it.get("model_xy"):
+            where = f"model ({it['model_xy'][0]:.1f}, {it['model_xy'][1]:.1f}) ft"
+        elif it.get("paper_xy"):
+            where = f"paper ({it['paper_xy'][0]:.2f}, {it['paper_xy'][1]:.2f}) in"
+        head = f"\n{it['key']}  \"{it.get('text')}\""
+        if it.get("scope") == "sheet":
+            print(head + "\n   sheet-wide note: stored as a directive, nothing planned")
+            continue
+        print(head + f"  [{it.get('kind')}] {it.get('layout') or ''} {where}  -> {it['status']}")
+        if it.get("rationale"):
+            print(f"   why: {it['rationale']}")
+        if it.get("reason"):
+            print(f"   reason: {it['reason']}")
+        for i, b in enumerate(it["blocks"], start=1):
+            params = ", ".join(f"{k}={json.dumps(v, default=str)}" for k, v in (b.get("params") or {}).items())
+            print(f"   {i}. {b.get('type')}  {params}")
+        if it.get("results_preview"):
+            print(f"   result: {str(it['results_preview'])[:200]}")
+    return 0
+
+
+def _directives(settings, args) -> int:
+    from . import directives as directives_mod
+    if args.done or args.reopen:
+        hit = directives_mod.mark_done(settings.review_dir, args.done or args.reopen, done=bool(args.done))
+        if hit is None:
+            print(f"no directive {args.done or args.reopen!r} under {settings.review_dir}")
+            return 1
+        print(json.dumps(hit.to_dict(), default=str))
+        return 0
+    rows = directives_mod.load(settings.review_dir, None, include_done=args.all)
+    if args.dwg:
+        want = os.path.normcase(os.path.basename(args.dwg))
+        rows = [d for d in rows if d.dwg_path and os.path.normcase(os.path.basename(d.dwg_path)) == want]
+    if not rows:
+        print("no open sheet-wide notes" + (f" for {args.dwg}" if args.dwg else ""))
+        return 0
+    for d in rows:
+        print(f"{d.status:5s} {d.id:28s} {os.path.basename(d.dwg_path or '(unmatched)')} p{d.page_no}: {d.text}")
+    return 0
 
 
 def _isolate_learned_file(settings) -> None:
