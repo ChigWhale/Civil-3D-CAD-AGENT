@@ -29,3 +29,4 @@ package/dist/
 .run/
 cad-agent.json
 install.json
+package/*.log

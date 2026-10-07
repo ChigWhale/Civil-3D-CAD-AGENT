@@ -5,8 +5,8 @@ not about one spot; it is an instruction for the whole sheet. The pipeline
 does not act on it. It records it here, shows it in the report as work for
 a person, and hands it to the planner as a standing note for every located
 comment on the same drawing, so a chain drawn for "move hydrant" can respect
-"all hydrants to face the street". `python -m redline directives` lists and
-closes them.
+"all hydrants to face the street". A person applies them and marks them
+done (status "done" in the file below, or `mark_done()` here).
 
 Storage: <review_dir>/directives/<drawing stem>.jsonl, one JSON object per
 line, appended; the same wording on the same drawing is recorded once.

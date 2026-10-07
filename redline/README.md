@@ -1,11 +1,18 @@
-# redline: scanned reviewer comments to dashboard block chains
+# redline: scanned reviewer comments to tool-name sequences
 
 A reviewer marks up plotted plan sheets by hand. The scans come back as a
-PDF, one page per sheet, with the drawing's file path printed in the title
-block. This package reads the handwriting with a local vision model, opens
-the drawing the sheet names, maps each comment through the sheet's viewport
-into model space, asks a local language model for a chain of existing
-dashboard blocks, runs the chains it can and reports the rest with a reason.
+PDF, one page per sheet. This package reads the handwriting with a local
+vision model, then asks a local language model, one comment at a time, for
+the ordered list of **tool names** that would address it: the MCP tools
+Claude Desktop sees (`find_entities`, `move_entities`, `draw_leader`,
+`delete_objects` ...). Names only. No parameters, nothing opened or drawn,
+and no comment is skipped: every comment gets a row, and an unusable answer
+is recorded as empty with the model's reply.
+
+That is the current stage. The earlier full run (match the sheet to its
+drawing, open it, locate each comment through the viewport, plan
+parameterised block chains, run them on the dashboard) is parked, not
+deleted; see "Parked for the parameter stage" below.
 
 No paid API is involved. Models are served over HTTP by Ollama during
 development and by a bundled llama-server in a packaged install; both speak
@@ -13,7 +20,7 @@ the same OpenAI-compatible endpoint, so the code does not change.
 
 ## Install (once, on the machine running Civil 3D)
 
-1. `pip install -r redline/requirements.txt` (pypdfium2, Pillow, numpy, requests).
+1. `pip install -r redline/requirements.txt` (pypdfium2, pypdf, Pillow, numpy, requests).
 2. Install Ollama for Windows from https://ollama.com/download, then pull the
    two models. Both are Apache-2.0; no Hugging Face account is needed.
 
@@ -30,30 +37,30 @@ the same OpenAI-compatible endpoint, so the code does not change.
    planner. Any Hugging Face GGUF works too: `ollama pull hf.co/<user>/<repo>:<quant>`.
    On an 8 GB card only one model is resident at a time; the pipeline reads
    every page first, then plans, so the server swaps once per review.
-3. Set `CAD_PROJECT_ROOT` to the folder(s) that hold the project drawings,
-   `;` separated. Claude Desktop strips the user environment, so for the MCP
-   tool put it in the env block of the Claude Desktop config, as
-   `CAD_EXEMPLAR_DIR` is.
-4. `python -m redline doctor` reports what is reachable and what is missing.
+3. Both commands check the model server and the models they need before they
+   start and stop with one line saying what is missing. A `review` of typed
+   comments only needs the language model.
 
 ## Use
 
-    python -m redline review scans.pdf [more.pdf ...] [--dry-run] [--on-conflict pause|warn]
-    python -m redline ocr scans.pdf                # transcriptions only, nothing opened or run
-    python -m redline phase0 scans.pdf --page 1 --click 2410,1180
-    python -m redline annotate <review_id> <comment_id> --chain chain.json --verdict good|bad
-    python -m redline palette                      # what the planner is shown
-    python -m redline directives [--dwg X] [--done ID] [--all]   # sheet-wide notes on file
-    python -m redline show <review_id> [--comment p1-c3] [--json] # the actions planned per comment, with parameters
+Three commands:
 
-From Claude Desktop: `review_redlines(pdf_path)` starts a review in the
-background; `review_status(review_id)` reads the report. The dashboard serves
-the same reports at `GET /reviews` and `GET /reviews/{id}`.
+    python -m redline transcribe scans.pdf [--page N]      # read the handwriting only; nothing planned
+    python -m redline review scans.pdf [more.pdf ...]       # handwriting: read, then name the tools per comment
+    python -m redline review --text "MOVE HYD 20' N" --text "DELETE THIS LINE"
+                                                            # typed comments, no scan: tries the model alone
+    python -m redline markups marked.pdf [more.pdf ...]     # Bluebeam text boxes: no vision model, same output
 
-Output goes to `dashboard/uploads/reviews/<review_id>/`: `report.md`,
-`report.json`, `training.jsonl`, the page renders and the crops the model
-read. A process aimed at the stub plugin (`CAD_PLUGIN_BASE` set) writes
-under `dashboard/uploads-test/` instead. `CAD_REDLINE_DIR` overrides both.
+`ocr` (optical character recognition, reading text out of an image) is
+accepted as another name for `transcribe`; `bluebeam` for `markups`. The
+command line is the only way to run the comment automation for now.
+
+Output goes to `dashboard/uploads/reviews/<review_id>/`: `report.md` (one
+row per comment with its tool sequence), `report.json`, `training.jsonl`,
+`tools.txt` (the names the model could choose from), the page renders and
+the crops the model read. A process aimed at the stub plugin
+(`CAD_PLUGIN_BASE` set) writes under `dashboard/uploads-test/` instead.
+`CAD_REDLINE_DIR` overrides both.
 
 ## How a comment travels
 
@@ -65,55 +72,67 @@ under `dashboard/uploads-test/` instead. `CAD_REDLINE_DIR` overrides both.
    text, the kind of mark (note, arrow, circle, cloud, strike, dimension),
    whether it points at something and where, and a confidence. It also
    transcribes the title strip.
-4. `sheet.py` parses the sheet number, project number and `.dwg` name, scores
-   candidate drawings (open in Civil 3D, under `CAD_PROJECT_ROOT`, the printed
-   path itself), opens the best by asking the plugin for its snapshot with the
-   file named, and picks the layout whose title block `#` matches. Two
-   candidates within 0.05 of each other is `ambiguous_drawing` and the page
-   is skipped rather than guessed.
-5. `transform.py` maps page pixels to paper inches (from the layout's plot
-   paper size and rotation; refined by a border fit when
-   `CAD_REDLINE_BORDER_RECT` gives the border's paper rectangle) and paper
-   inches to model feet through the viewport:
-   `model = model_center + R(-twist) . ((paper - paper_center) / scale)`,
-   the same arithmetic as the plugin's `ViewportWindow`.
-6. `locate.py` writes the digest the planner reads: the index's sentence for
-   the cell, the alignment station and side, the nearest entity of each
-   useful tag with its handle, everything within 100 ft grouped by tag,
-   closed shapes the point is inside, nearby labels and text. Entities on
-   layers frozen in that viewport are left out. A comment outside every
-   viewport gets the paper-space text around it instead (`paper_index.py`).
-7. `planner.py` prompts the language model with the rules, the palette
-   (from `dashboard.blocks.BLOCK_SPECS`, options included), the plan type's
-   playbook steps and recipe, the worked examples in `examples/`, then
-   the comment and its digest. The reply is `{"blocks": [...]}` or
-   `{"skip": true, "reason": ...}`. A chain is validated by the dashboard's
-   own `compile_blocks` and by a handle guard (every handle must be in the
-   digest). One retry with the error, then a skip.
-8. `runner.py` runs each chain on the dashboard assigned to the drawing
-   (created with source `redline` when none is), one at a time, with
-   `on_conflict=pause`. A pause is stopped and recorded as skipped with the
-   conflict summary; `--on-conflict warn` draws through instead.
-9. `report.py` writes the report and appends one training row per comment.
+4. `tools.py` lists the vocabulary: every MCP tool registered by
+   `cad_mcp_server.py` and `drafting_tools.py`, minus the ones that manage
+   the agent (dashboards, runs, exemplars, playbooks, learning). Each gets its
+   first docstring sentence. The list is written to `tools.txt`, and its
+   hash is the `tools_version` in every training row.
+5. `sequence.py` prompts the language model with the rules, the vocabulary,
+   the worked examples in `examples/sequences.json`, and the comment
+   (`text`, `kind`, `confidence`). The answer is `{"tools": [...]}`; the
+   JSON schema sent with the request enumerates the names, so a model served
+   by Ollama cannot invent one. Names are normalised, unknown ones dropped
+   and recorded, repeats folded, at most 8 kept. An answer with no usable
+   name is retried once with the problem stated, then recorded as empty
+   (`no_valid_tools`). A model error is recorded as `model_error`. Nothing
+   raises and nothing is skipped.
+6. `report.py` writes `report.md` / `report.json` and appends one training
+   row per comment with `human_tools` and `human_verdict` left null.
 
-## Phase 0: prove the two hard links before trusting a review
+## Bluebeam text boxes (`markups`)
 
-1. Offline: `python tests/test_redline_transform.py` reproduces the plugin's
-   viewport ring at 0 and 30 degrees and recovers a dot on a shrunk scan.
-2. Live: `python -m redline phase0 <pdf> --page 1 --click X,Y` on a pixel
-   where the reviewer circled something. The output shows the title block
-   read, the drawing and layout chosen, the paper inches, the viewport, the
-   model feet and the index's sentence there. The sentence should name what
-   the reviewer circled. Repeat on a twisted sheet. The output also lists
-   the layout's paper texts, which is how to confirm which one carries the
-   printed path, and the border's nominal paper rectangle for
-   `CAD_REDLINE_BORDER_RECT`.
-3. Live: `python -m redline ocr <pdf>` and read 10 to 20 transcriptions by
-   eye. `CAD_REDLINE_MIN_CONFIDENCE` (default 0.5) sends anything below it to
-   a person instead of the planner.
+A PDF marked up in Bluebeam carries its markups as PDF annotations, not
+ink. `markups.py` opens the file with pypdf and keeps the **FreeText**
+annotations only: Bluebeam's Text Box, and Callout (a text box with a
+leader). Each gives the comment's exact text (confidence 1.0), its author,
+subject and date, its rectangle, and for a callout the point the leader's
+arrowhead sits on (`targets_px`, kind `arrow`). Everything else (sticky
+notes, clouds, arrows, pen, highlights, their pop-ups) is counted per kind
+and ignored; the count appears in `report.md` under each page as "other
+markups ignored". The pages are rendered into `pages/` so a person can look
+at them, then the same sequencer, report and training rows run as for
+handwriting. The report table has an extra `author` column.
+
+A **flattened** PDF has no annotations left: the command reports zero text
+boxes and says so. Ask reviewers for the unflattened file, or for Bluebeam's
+"allow markup recovery" when they flatten.
+
+## Before trusting a review
+
+1. `python -m redline review --text "..."` with a few comments you know the
+   answer to, and read the sequences the model gives.
+2. `python -m redline transcribe <pdf>` on a real scan and read 10 to 20
+   transcriptions by eye against the crops in the output folder.
+3. `python -m redline review <pdf>` and read `report.md`: every comment with
+   its tool sequence, or `(none: ...)` with the reason, and any names the
+   model offered that were dropped.
+
+## Parked for the parameter stage
+
+`pipeline.review_located()` is the earlier full run and is not reachable from
+the command line. It and its modules are kept, unchanged, for when the
+tool-name stage is good enough to add parameters: `sheet.py` (which drawing
+and layout the sheet is), `transform.py` (page pixels to paper inches to
+model feet through the viewport), `locate.py` and `paper_index.py` (what is
+at the point, with handles), `planner.py` (parameterised block chains
+validated by the dashboard), `runner.py` (running them with the conflict
+policy), `directives.py` (sheet-wide starred notes). `tests/run_redline.py`
+still exercises all of it against the stub plugin, so it does not rot.
 
 ## Tests
 
+    python tests/test_redline_sequence.py   # vocabulary, parsing, retry, fake backend, typed review
+    python tests/test_redline_markups.py    # Bluebeam FreeText reader, rotation mapping, markups review, CLI
     python tests/test_redline_transform.py
     python tests/test_redline_marks.py
     python tests/test_redline_sheet.py
@@ -121,59 +140,52 @@ under `dashboard/uploads-test/` instead. `CAD_REDLINE_DIR` overrides both.
     python tests/run_redline.py        # end to end on the stub plugin and a test dashboard
 
 The end-to-end test starts its own servers on 5399 and 8799, builds a
-two-page PDF from the stub's layouts (one untwisted sheet, one twisted 30
-degrees and plotted rotated 90), and runs with fake OCR and a fake planner.
-The transform, sheet match, digest, validation, dashboard runs and report
-are real. Everything is forced under `%TEMP%`; the live `runs.json` is
-checked untouched.
+two-page PDF from the stub's layouts, runs the current flow with fake OCR
+and a fake sequencer (one row per comment, no skips, dashboard untouched),
+and runs the parked flow too. Everything is forced under `%TEMP%`; the live
+`runs.json` is checked untouched.
 
 ## Fine-tuning
 
-Not yet. `training.jsonl` accumulates prompt context, comment, proposal and
-outcome, and `annotate` adds a person's chain and verdict. Consider a LoRA
-on the planner model once there are ten or more verified examples per
-comment class across two or more projects and few-shot prompting is clearly
-short of that. Until then, add worked examples to `examples/` and improve
-the digest; both are free and reversible.
+Not yet. `training.jsonl` accumulates, per comment, the text, the kind, the
+tool sequence the model gave, its raw reply and the vocabulary version, with
+`human_tools` / `human_verdict` to be filled in by a person. Consider a LoRA
+on the planner model once there are ten or more verified sequences per
+comment class across two or more projects and the few-shot examples in
+`examples/sequences.json` are clearly short of that. Until then, add
+examples there; it is free and reversible.
 
 ## Settings
 
 | variable | default | meaning |
 |---|---|---|
-| `CAD_PLUGIN_BASE` | `http://127.0.0.1:5199` | the Civil 3D plugin |
-| `CAD_DASHBOARD_BASE` | `http://127.0.0.1:8765` | the dashboard server |
-| `CAD_PROJECT_ROOT` | unset | folders searched for `.dwg` files, `;` separated |
 | `CAD_REDLINE_DIR` | `dashboard/uploads/reviews` | reports and training rows |
 | `CAD_REDLINE_MODEL_BASE` | `http://127.0.0.1:11434/v1` | OpenAI-compatible endpoint |
 | `CAD_REDLINE_VLM` | `qwen3-vl:4b-instruct` | vision model (the plain `qwen3-vl:4b` tag thinks by default and returns empty answers) |
-| `CAD_REDLINE_LLM` | `qwen2.5-coder:7b` | planner model |
+| `CAD_REDLINE_LLM` | `qwen2.5-coder:7b` | the model that names the tools |
 | `CAD_REDLINE_OCR` / `CAD_REDLINE_PLANNER` | `openai` | or `fake` for tests |
+| `CAD_REDLINE_MODEL_TIMEOUT` | 600 | seconds to wait for one model answer |
 | `CAD_REDLINE_DPI` / `CAD_REDLINE_CROP_DPI` | 150 / 300 | page render, crop render |
 | `CAD_REDLINE_TITLE_RECT` | `0.84,0,1,1;0,0.9,1,1` | page fractions holding the title text |
-| `CAD_REDLINE_BORDER_RECT` | unset | border's paper rectangle, inches, for the fit |
-| `CAD_REDLINE_MIN_CONFIDENCE` | 0.5 | below it, a comment goes to a person |
-| `CAD_REDLINE_ON_CONFLICT` | `pause` | or `warn` |
 | `CAD_REDLINE_SWEEP` | `1` | the model takes a second look for handwriting on page tiles; `0` to skip |
 | `CAD_REDLINE_MIN_AREA` | 0.04 | ink boxes smaller than this (square inches) are specks |
 
-## One note, many places; notes for the whole sheet
+Read only by the parked flow: `CAD_PLUGIN_BASE`, `CAD_DASHBOARD_BASE`,
+`CAD_PROJECT_ROOT`, `CAD_REDLINE_BORDER_RECT`, `CAD_REDLINE_MIN_CONFIDENCE`,
+`CAD_REDLINE_ON_CONFLICT`, `CAD_REDLINE_CONTEXT_RADIUS`.
+
+## What the ink detector records
 
 The ink detector (`marks.py`) separates writing from connectors before it
 groups anything. Long thin strokes (arrows, leaders) and rings (circles,
 clouds) are traced on a fine grid to their far ends; a connector whose near
 end sits beside a note gives that note one target per far end, and a ring
-gives its centre. So one note with three arrows is located and planned three
-times, filed as `p1-c3#1`, `p1-c3#2`, `p1-c3#3`, each with the context of
-its own spot. The crops the model reads hold the writing only, never the
-arrows, which is what keeps them legible.
-
-A note that begins with a drawn star (or, when it sits in the top margin and
-points at nothing, one the model reads as a rule for the whole sheet) is a
-**directive**. It is not located or planned. It is stored per drawing under
-`<review dir>/directives/<drawing>.jsonl`, listed in the report under
-"Sheet-wide notes (a person must apply these)", and given to the planner as
-a standing note for every other comment on that drawing. `python -m redline
-directives --done <id>` closes one once it has been applied.
+gives its centre. The crops the model reads hold the writing only, never
+the arrows, which is what keeps them legible. In the current stage the
+targets and the star that marks a sheet-wide note are recorded on the
+comment (`targets_px`, `starred`, `scope`) but not acted on: every comment
+is sequenced the same way. The parked flow uses them to locate a
+three-arrow note three times and to file starred notes as directives.
 
 `crops/p<N>_regions.png` in every review folder shows what the detector
 found: green boxes are notes, orange are their connectors, blue dots their

@@ -1,31 +1,38 @@
 """The stages in order, for one or more PDFs.
 
-    review(pdfs)            the whole thing
-    phase0(pdf, page, x, y) one page pixel -> paper -> model, with the index's
-                            words at the point (Phase 0 check of the transform)
-    ocr_only(pdf)           regions and transcriptions, nothing opened or run
+    review(pdfs, texts)     the current full run: transcribe every comment,
+                            then ask the language model for the ordered tool
+                            names that would address each one. Text to text;
+                            nothing is opened, located or run, and no comment
+                            is skipped.
+    review_markups(pdfs)    the same, for Bluebeam text boxes (FreeText
+                            annotations) instead of handwriting: no detector,
+                            no vision model
+    ocr_only(pdf)           regions and transcriptions, nothing planned
 
-Order of model use inside review(): every page is read first (vision model),
-then every comment is planned (text model). On an 8 GB card only one of
-the two fits at a time; grouping the calls means the server swaps models
-once per review instead of once per comment.
+    review_located(pdfs)    PARKED. The earlier full run: match the sheet to a
+                            drawing, open it, locate every comment in model
+                            space, plan parameterised block chains, run them on
+                            the dashboard. Kept, with its modules (sheet,
+                            transform, locate, planner, runner, directives),
+                            for the parameter stage that comes after the
+                            tool-name stage works. tests/run_redline.py still
+                            exercises it against the stub.
 
-A comment may be about several places (one note, several arrows): it is
-located and planned once per arrow tip, filed under `p1-c3#1`, `p1-c3#2`...
-A starred or general note for the whole sheet is not located at all; it is
-stored as a directive (redline/directives.py), shown in the report for a
-person, and handed to the planner as a standing note.
+Order of model use: every page is read first (vision model), then every
+comment is sequenced (text model). On an 8 GB card only one of the two fits
+at a time; grouping the calls means the server swaps models once per review.
 """
 import os
 import sys
 import time
 
-from . import config, directives as directives_mod, locate as locate_mod, marks, ocr as ocr_mod, palette
-from . import pdf as pdf_mod, planner as planner_mod, report as report_mod, sheet as sheet_mod
+from . import config, directives as directives_mod, locate as locate_mod, markups as markups_mod, marks, ocr as ocr_mod, palette
+from . import pdf as pdf_mod, planner as planner_mod, report as report_mod, sequence as sequence_mod, sheet as sheet_mod
+from . import tools as tools_mod
 from .paper_index import PaperIndex
 from .runner import DashboardClient, DashboardError, outcome_of
-from .transform import PageToPaper, PaperToModel
-from .types import CommentOutcome, Located, Report
+from .types import Comment, CommentOutcome, Located, Report
 
 if str(config.ROOT) not in sys.path:
     sys.path.insert(0, str(config.ROOT))
@@ -94,8 +101,151 @@ def _describe(c) -> str:
     return ""
 
 
-def review(pdfs: list, settings=None, dry_run: bool = False, ocr=None, planner=None, on_conflict: str | None = None,
-           log=_log, review_id: str | None = None, pages: list | None = None) -> Report:
+def _read_pages(pdfs, settings, ocr, out_dir: str, crops_dir: str, pages, log=_log, errors: list | None = None) -> dict:
+    """Every page of every PDF read: {page_no: {page, comments, title, border,
+    regions, regions_from_model, warnings}}. The same work for transcribe
+    and for both review flows. A PDF that will not rasterise is recorded in
+    `errors` and skipped."""
+    wanted_pages = pages_filter(pages)
+    per_page = {}
+    for pdf in pdfs:
+        try:
+            pgs = pdf_mod.rasterise(pdf, dpi=settings.dpi, out_dir=os.path.join(out_dir, "pages"), pages=wanted_pages)
+        except Exception as e:
+            if errors is None:
+                raise
+            errors.append(f"{pdf}: could not rasterise ({e})")
+            continue
+        for page in pgs:
+            log(f"page {page.page_no} of {os.path.basename(pdf)}: {page.width_px}x{page.height_px} px")
+            rgb = marks._array(page)
+            regions, warnings, used_model = detect(page, rgb, ocr, settings, crops_dir, log=log)
+            comments = ocr.read_comments(page, regions, out_dir=crops_dir)
+            log(f"  {len(regions)} region(s), {len(comments)} comment(s) read")
+            title = sheet_mod.read_title_block(page, ocr, settings, out_dir=crops_dir)
+            border = marks.find_border(page, rgb=rgb) if settings.border_rect else None
+            per_page[page.page_no] = {"page": page, "comments": comments, "title": title, "border": border,
+                                      "regions": regions, "regions_from_model": used_model, "warnings": warnings}
+    return per_page
+
+
+def _text_comments(texts) -> list:
+    """Comments typed on the command line, so the sequencer can be exercised
+    without a scan. Page 0, full confidence, kind note."""
+    return [Comment(id=f"t{i}", page_no=0, bbox_px=[0, 0, 0, 0], text=str(t).strip(), kind="note", confidence=1.0)
+            for i, t in enumerate(texts or [], start=1) if str(t).strip()]
+
+
+def review(pdfs: list | None = None, texts: list | None = None, settings=None, ocr=None, backend=None, log=_log,
+           review_id: str | None = None, pages: list | None = None) -> Report:
+    """Transcribe, then name the tools. One model call per comment; every
+    comment gets a row."""
+    pdfs = list(pdfs or [])
+    settings = settings or config.load()
+    review_id = review_id or _review_id()
+    out_dir = os.path.join(settings.review_dir, review_id)
+    os.makedirs(out_dir, exist_ok=True)
+    report = Report(review_id=review_id, created=time.time(), pdfs=[os.path.abspath(p) for p in pdfs], out_dir=out_dir,
+                    settings={k: v for k, v in settings.raw.items() if k not in ("fixture",)})
+    crops_dir = os.path.join(out_dir, "crops")
+
+    # ── 1. read every page ────────────────────────────────────────────────
+    comments = _text_comments(texts)
+    sheet_of = {0: {}}
+    if pdfs:
+        ocr = ocr or ocr_mod.backend(settings)
+        per_page = _read_pages(pdfs, settings, ocr, out_dir, crops_dir, pages, log=log, errors=report.errors)
+        for pn, rec in per_page.items():
+            report.recall_warnings.extend(rec["warnings"])
+            report.sheets.append({"page_no": pn, "title_block": rec["title"].to_dict()})
+            sheet_of[pn] = rec["title"].to_dict()
+            comments.extend(rec["comments"])
+    return _sequence_all(report, comments, sheet_of, settings, backend, out_dir, log)
+
+
+def _sequence_all(report: Report, comments: list, sheet_of: dict, settings, backend, out_dir: str, log=_log) -> Report:
+    """The shared tail of every current flow: one sequencer call per comment,
+    counts, tools.txt, the report files and the training rows."""
+    report.comments = [c.to_dict() for c in comments]
+    backend = backend or _backend(settings)
+    names = tools_mod.names()
+    tools_text = tools_mod.text()
+    examples = sequence_mod.load_examples()
+    report.vocabulary = {"version": tools_mod.version(), "count": len(names), "excluded": sorted(tools_mod.EXCLUDE)}
+    with open(os.path.join(out_dir, "tools.txt"), "w", encoding="utf-8") as f:
+        f.write(f"# {len(names)} tools offered to the model (version {report.vocabulary['version']})\n{tools_text}\n")
+    sequences = []
+    for c in comments:
+        seq = sequence_mod.sequence(c, backend, tools_text, names, examples=examples, log=log)
+        sequences.append(seq)
+        shown = " -> ".join(seq.tools) if seq.tools else f"(none: {seq.error})"
+        log(f"  {c.id} '{c.text[:40]}' -> {shown}")
+    report.sequences = [s.to_dict() for s in sequences]
+    report.counts = {"comments": len(sequences), "sequenced": sum(1 for s in sequences if s.tools),
+                     "empty": sum(1 for s in sequences if not s.tools),
+                     "model_errors": sum(1 for s in sequences if str(s.error or "").startswith("model_error"))}
+    md, js = report_mod.write(report, out_dir)
+    rows = report_mod.sequence_rows(report, sheet_of)
+    report_mod.append_training(os.path.join(out_dir, report_mod.TRAINING_FILE), rows)
+    log(f"report: {md}")
+    return report
+
+
+def review_markups(pdfs: list, settings=None, backend=None, log=_log, review_id: str | None = None,
+                   pages: list | None = None) -> Report:
+    """Bluebeam text boxes (FreeText annotations) instead of handwriting: no
+    detector, no vision model. The pages are rendered so a person can look
+    at them; then the same sequencer, report and training rows."""
+    pdfs = list(pdfs or [])
+    settings = settings or config.load()
+    review_id = review_id or _review_id()
+    out_dir = os.path.join(settings.review_dir, review_id)
+    os.makedirs(out_dir, exist_ok=True)
+    report = Report(review_id=review_id, created=time.time(), pdfs=[os.path.abspath(p) for p in pdfs], out_dir=out_dir,
+                    settings=dict({k: v for k, v in settings.raw.items() if k not in ("fixture",)}, source="markups"))
+    comments = []
+    sheet_of = {}
+    for pdf in pdfs:
+        try:
+            found = markups_mod.read(pdf, dpi=settings.dpi, pages=pages_filter(pages))
+        except Exception as e:
+            report.errors.append(f"{pdf}: could not read annotations ({e})")
+            continue
+        total = 0
+        for pn, rec in sorted(found.items()):
+            total += len(rec["comments"])
+            log(f"page {pn} of {os.path.basename(pdf)}: {markups_mod.summary(rec)}")
+            report.sheets.append({"page_no": pn, "pdf": os.path.abspath(pdf),
+                                  "markups": {"textboxes": len(rec["comments"]), "other": rec["annots_other"],
+                                              "rotate": rec["rotate"], "size_pt": list(rec["size_pt"])}})
+            sheet_of[pn] = {}
+            comments.extend(rec["comments"])
+        if total == 0:
+            report.errors.append(f"{pdf}: no Bluebeam text boxes found (flattened PDF, or markups of other kinds only)")
+        try:
+            pdf_mod.rasterise(pdf, dpi=settings.dpi, out_dir=os.path.join(out_dir, "pages"), pages=pages_filter(pages))
+        except Exception as e:
+            log(f"  (pages not rendered: {e})")
+    return _sequence_all(report, comments, sheet_of, settings, backend, out_dir, log)
+
+
+def _backend(settings):
+    kind = (settings.planner_backend or "openai").lower()
+    if kind == "fake":
+        return sequence_mod.FakeSequencer()
+    if kind in ("openai", "ollama", "llm"):
+        return sequence_mod.OpenAICompatPlanner(settings.model_base, settings.llm, timeout=settings.model_timeout)
+    raise ValueError(f"unknown planner backend {kind!r} (openai | fake)")
+
+
+# ── PARKED: the located, parameterised flow ──────────────────────────────────
+
+def review_located(pdfs: list, settings=None, dry_run: bool = False, ocr=None, planner=None, on_conflict: str | None = None,
+                   log=_log, review_id: str | None = None, pages: list | None = None) -> Report:
+    """The earlier full run, kept for the parameter stage: match each sheet
+    to a drawing, open it, locate every comment through the viewport, plan
+    parameterised block chains with handles, run them on the dashboard.
+    Not reachable from the command line for now."""
     settings = settings or config.load()
     review_id = review_id or _review_id()
     out_dir = os.path.join(settings.review_dir, review_id)
@@ -107,25 +257,10 @@ def review(pdfs: list, settings=None, dry_run: bool = False, ocr=None, planner=N
     crops_dir = os.path.join(out_dir, "crops")
 
     # ── 1. read every page ────────────────────────────────────────────────
-    wanted_pages = pages_filter(pages)
-    per_page = {}
-    for pdf in pdfs:
-        try:
-            pgs = pdf_mod.rasterise(pdf, dpi=settings.dpi, out_dir=os.path.join(out_dir, "pages"), pages=wanted_pages)
-        except Exception as e:
-            report.errors.append(f"{pdf}: could not rasterise ({e})")
-            continue
-        for page in pgs:
-            log(f"page {page.page_no} of {os.path.basename(pdf)}: {page.width_px}x{page.height_px} px")
-            rgb = marks._array(page)
-            regions, warnings, _ = detect(page, rgb, ocr, settings, crops_dir, log=log)
-            report.recall_warnings.extend(warnings)
-            comments = ocr.read_comments(page, regions, out_dir=crops_dir)
-            log(f"  {len(regions)} region(s), {len(comments)} comment(s) read")
-            title = sheet_mod.read_title_block(page, ocr, settings, out_dir=crops_dir)
-            border = marks.find_border(page, rgb=rgb) if settings.border_rect else None
-            per_page[page.page_no] = {"page": page, "comments": comments, "title": title, "border": border}
-            report.comments.extend(c.to_dict() for c in comments)
+    per_page = _read_pages(pdfs, settings, ocr, out_dir, crops_dir, pages, log=log, errors=report.errors)
+    for rec in per_page.values():
+        report.recall_warnings.extend(rec["warnings"])
+        report.comments.extend(c.to_dict() for c in rec["comments"])
 
     # ── 2. which drawing, which layout ────────────────────────────────────
     opener = _open_drawing(settings)
@@ -283,74 +418,20 @@ def _planner(settings):
     raise ValueError(f"unknown planner backend {kind!r} (openai | fake)")
 
 
-# ── Phase 0 helpers ──────────────────────────────────────────────────────────
-
-def phase0(pdf: str, page_no: int, x_px: float, y_px: float, settings=None, ocr=None, log=_log) -> dict:
-    """One page pixel through the whole transform, with evidence at every
-    step: the title block read, the drawing and layout chosen, paper inches,
-    the viewport, model feet and the index's sentence there."""
-    settings = settings or config.load()
-    ocr = ocr or ocr_mod.backend(settings)
-    out_dir = os.path.join(settings.review_dir, "phase0")
-    page = pdf_mod.rasterise(pdf, dpi=settings.dpi, out_dir=os.path.join(out_dir, "pages"), pages=[page_no])[0]
-    rgb = marks._array(page)
-    title = sheet_mod.read_title_block(page, ocr, settings, out_dir=os.path.join(out_dir, "crops"))
-    border = marks.find_border(page, rgb=rgb)
-    regions, orphans = marks.analyse(page, rgb=rgb, min_area_in2=settings.min_area_in2)
-    out = {"page": page.to_dict(), "title_block": title.to_dict(), "border_px": border,
-           "regions": [r.to_dict() for r in regions], "orphan_connectors": orphans}
-    if border:
-        nominal = PageToPaper.nominal(page.width_px, page.height_px, page_in=(page.width_in, page.height_in))
-        bl = nominal.to_paper(border[0], border[3])
-        tr = nominal.to_paper(border[2], border[1])
-        out["border_paper_in_nominal"] = [round(bl[0], 3), round(bl[1], 3), round(tr[0], 3), round(tr[1], 3)]
-    opener = _open_drawing(settings)
-    holder = {}
-
-    def open_drawing(path):
-        entry = opener(path)
-        holder["entry"] = entry
-        return entry.data
-    m = sheet_mod.match(page, title, settings, open_drawing, border_rect_px=border)
-    out["match"] = m.to_dict()
-    if not m.ok or m.reason:
-        out["error"] = m.reason
-        return out
-    entry = holder["entry"]
-    layout = next((l for l in entry.data.get("layouts") or [] if l.get("name") == m.layout_name), {})
-    out["layout_texts"] = [t.get("text") for t in (layout.get("texts") or [])][:40]
-    p2p, vps = sheet_mod.transforms_for(m)
-    px, py = p2p.to_paper(x_px, y_px)
-    out["paper_in"] = [round(px, 3), round(py, 3)]
-    from .transform import viewport_at
-    vp = viewport_at(vps, px, py)
-    if vp is None:
-        out["viewport"] = None
-        out["paper_texts_near"] = PaperIndex(layout).texts_near((px, py), 4.0)
-        return out
-    X, Y = vp.to_model(px, py)
-    out["viewport"] = {"handle": vp.handle, "scale": vp.scale, "twist_deg": vp.twist_deg}
-    out["model_ft"] = [round(X, 3), round(Y, 3)]
-    out["context"] = locate_mod.comment_context(entry.index, entry.data, (X, Y), radius=settings.context_radius)
-    return out
-
-
 def ocr_only(pdf: str, settings=None, ocr=None, log=_log, pages: list | None = None) -> dict:
     settings = settings or config.load()
     ocr = ocr or ocr_mod.backend(settings)
     out_dir = os.path.join(settings.review_dir, "ocr-only", _review_id())
     crops_dir = os.path.join(out_dir, "crops")
     out = {"pdf": os.path.abspath(pdf), "out_dir": out_dir, "pages": [], "recall_warnings": []}
-    for page in pdf_mod.rasterise(pdf, dpi=settings.dpi, out_dir=os.path.join(out_dir, "pages"), pages=pages_filter(pages)):
-        rgb = marks._array(page)
-        regions, warnings, used_model = detect(page, rgb, ocr, settings, crops_dir, log=log)
+    per_page = _read_pages([pdf], settings, ocr, out_dir, crops_dir, pages, log=log)
+    for pn, rec in per_page.items():
+        comments, title, warnings = rec["comments"], rec["title"], rec["warnings"]
         out["recall_warnings"].extend(warnings)
-        comments = ocr.read_comments(page, regions, out_dir=crops_dir)
-        title = sheet_mod.read_title_block(page, ocr, settings, out_dir=crops_dir)
-        out["pages"].append({"page_no": page.page_no, "regions_from_model": used_model,
-                             "regions": [r.to_dict() for r in regions], "comments": [c.to_dict() for c in comments],
+        out["pages"].append({"page_no": pn, "regions_from_model": rec["regions_from_model"],
+                             "regions": [r.to_dict() for r in rec["regions"]], "comments": [c.to_dict() for c in comments],
                              "title_block": title.to_dict()})
-        log(f"page {page.page_no}: {len(comments)} comment(s); sheet {title.sheet_no} file {title.printed_file}")
+        log(f"page {pn}: {len(comments)} comment(s); sheet {title.sheet_no} file {title.printed_file}")
         for c in comments:
             log(f"  {c.id} [{c.kind} {c.confidence:.2f}] {c.text}{_describe(c)}")
         for w in warnings:
@@ -364,5 +445,5 @@ def ocr_only(pdf: str, settings=None, ocr=None, log=_log, pages: list | None = N
         out["model_errors"] = len(failed)
         log(f"MODEL ERRORS: {len(failed)} of {total} comment(s) were not read; {first}")
         if len(failed) == total:
-            log("Nothing was transcribed. Run `python -m redline doctor` and fix what it reports, then run this again.")
+            log("Nothing was transcribed. Check that Ollama is running and the vision model is pulled, then run this again.")
     return out

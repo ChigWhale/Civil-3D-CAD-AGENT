@@ -600,7 +600,7 @@ async def list_alignment_names(dashboard_id: str):
 # Bumped whenever the server or its static files change in a way a running
 # instance cannot pick up. cad_mcp_server.py probes /version on startup and
 # treats a server that doesn't answer with this value as stale.
-DASHBOARD_VERSION = "2026-09-28.2"
+DASHBOARD_VERSION = "2026-10-07.1"
 
 
 @app.get("/version")
@@ -1642,47 +1642,6 @@ async def set_playbooks_dir(request: Request):
         return JSONResponse({"error": "path must be an existing folder"}, status_code=400)
     playbooks.PLAYBOOKS_DIR = path
     return {"ok": True, "playbooks_dir": path}
-
-
-# ── Redline reviews (written by redline/, read here) ─────────────────────────
-
-_REVIEWS_DIR = Path(cadagent_config.folder("review_dir", "reviews", str(UPLOAD_DIR / "reviews")))
-
-
-def _review_report(review_id: str) -> dict | None:
-    safe = "".join(ch for ch in str(review_id) if ch.isalnum() or ch in "-_")
-    if not safe:
-        return None
-    try:
-        with (_REVIEWS_DIR / safe / "report.json").open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
-
-
-@app.get("/reviews")
-async def list_reviews(limit: int = 50):
-    """The redline reviews on disk, newest first: id, when, PDFs, counts."""
-    out = []
-    try:
-        folders = sorted((d for d in _REVIEWS_DIR.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True)
-    except OSError:
-        folders = []
-    for d in folders[:limit]:
-        rep = _review_report(d.name)
-        if rep:
-            out.append({"review_id": rep.get("review_id", d.name), "created": rep.get("created"),
-                        "pdfs": rep.get("pdfs"), "counts": rep.get("counts"),
-                        "unmatched_pages": len(rep.get("unmatched_pages") or []), "errors": len(rep.get("errors") or [])})
-    return {"reviews": out, "dir": str(_REVIEWS_DIR)}
-
-
-@app.get("/reviews/{review_id}")
-async def get_review(review_id: str):
-    rep = _review_report(review_id)
-    if rep is None:
-        return JSONResponse({"error": f"No review '{review_id}' under {_REVIEWS_DIR}."}, status_code=404)
-    return rep
 
 
 @app.get("/attention")

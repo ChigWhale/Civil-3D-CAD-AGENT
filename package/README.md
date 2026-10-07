@@ -53,8 +53,11 @@ With the models included the payload is far above the 4.2 GB a single Setup.exe
 may hold, so the script enables disk spanning: the output is `CAD-Agent-Setup-<version>.exe`
 (a few MB) plus `CAD-Agent-Setup-<version>-1.bin` (the payload). Both files must sit in the
 same folder when the user runs Setup. Inno Setup 6 or 7 both work; `build.ps1` finds either.
-The plugin is built against whichever `AutoCAD 20xx` folder is first under Program Files;
-pass `-SeriesMin` to match it (2025 = R25.0, 2026 = R25.1).
+The plugin is built against whichever `AutoCAD 20xx` folder is first under Program Files.
+`-SeriesMin` is a floor, not "the release it was built against": Civil 3D skips, without
+any message, a bundle whose floor is above its own release (2025 = R25.0, 2026 = R25.1).
+Leave it at the default `R25.0` so one package loads on both; `build.ps1` warns otherwise.
+`package\install-dev-bundle.ps1` reads the release from the `acad.exe` on the machine.
 
 Prerequisites on the build machine only: .NET 10 SDK (the plugin), Civil 3D
 with the .NET 10 update (reference assemblies), internet access (Python
@@ -67,7 +70,7 @@ for the `.exe`.
     -LlamaServerUrl https://github.com/ggml-org/llama.cpp/releases/download/<build>/llama-<build>-bin-win-cuda-12.4-x64.zip `
     -CudartUrl      https://github.com/ggml-org/llama.cpp/releases/download/<build>/cudart-llama-bin-win-cuda-12.4-x64.zip `
     -ModelsDir      D:\models `      # optional: .gguf files to include; otherwise fetched on first run
-    -SeriesMin R25.0 -SeriesMax R25.1 `   # the Civil 3D releases the plugin was built against
+    -SeriesMin R25.0 -SeriesMax R26.0 `   # oldest and newest Civil 3D releases allowed to load it (the defaults)
     -Installer
 ```
 

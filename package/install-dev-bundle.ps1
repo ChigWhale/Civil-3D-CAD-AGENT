@@ -41,8 +41,27 @@ $Bin = Join-Path $Root "bin\$Config\net10.0-windows"
 if (-not (Test-Path (Join-Path $Bin "CADAgent.dll"))) { throw "no $Config build at $Bin; build CADAgent.csproj first" }
 
 New-Item -ItemType Directory -Force $Contents | Out-Null
+# SeriesMin is the LOWEST release that may load the bundle. A value above the
+# installed release makes Civil 3D skip the bundle without a word, so it is
+# read from the acad.exe on this machine (2025 = R25.0, 2026 = R25.1) and
+# never set higher than the oldest one found.
+$seriesMin = "R25.0"
+$found = @()
+foreach ($dir in Get-ChildItem "$env:ProgramFiles\Autodesk" -Directory -Filter "AutoCAD 20*" -ErrorAction SilentlyContinue) {
+    $exe = Join-Path $dir.FullName "acad.exe"
+    if (Test-Path $exe) {
+        $v = (Get-Item $exe).VersionInfo.ProductVersion      # e.g. R25.0.189.0.0
+        if ($v -match "^R(\d+)\.(\d+)") { $found += [pscustomobject]@{ Name = $dir.Name; Series = "R$($Matches[1]).$($Matches[2])"; Key = [int]$Matches[1] * 100 + [int]$Matches[2] } }
+    }
+}
+if ($found) {
+    $lowest = $found | Sort-Object Key | Select-Object -First 1
+    if ($lowest.Key -lt 2500) { Write-Warning "$($lowest.Name) ($($lowest.Series)) predates the .NET 10 update; the plugin will not load in it" }
+    else { $seriesMin = $lowest.Series }
+    Write-Host ("installed: " + (($found | ForEach-Object { "$($_.Name) = $($_.Series)" }) -join ", ") + "; SeriesMin = $seriesMin")
+}
 $manifest = Get-Content (Join-Path $PSScriptRoot "bundle\PackageContents.xml") -Raw
-$manifest = $manifest.Replace("{{VERSION}}", "dev").Replace("{{SERIESMIN}}", "R25.0").Replace("{{SERIESMAX}}", "R26.0")
+$manifest = $manifest.Replace("{{VERSION}}", "dev").Replace("{{SERIESMIN}}", $seriesMin).Replace("{{SERIESMAX}}", "R26.0")
 Set-Content -Path (Join-Path $Bundle "PackageContents.xml") -Value $manifest -Encoding utf8
 
 $copied = 0

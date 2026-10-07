@@ -1,10 +1,12 @@
 """What happened, written down: report.md for a person, report.json for a
 program, training.jsonl for the fine-tune that is not being done yet.
 
-Every located target gets a training row, skips and failures included, with
-`human_chain` and `human_verdict` left null. `annotate` fills those in
-later from the command line, which is how the dataset earns its labels.
-Sheet-wide notes get a row of their own with outcome "directive".
+Current stage (report.sequences set): one row per comment with the tool
+names the model gave; `sequence_rows` writes the training rows with
+`human_tools` / `human_verdict` left null for a person to fill in.
+
+Parked stage (review_located): every located target gets a training row,
+skips and failures included; `training_rows` and `annotate` belong to it.
 """
 import json
 import os
@@ -45,8 +47,77 @@ def _label(key: str, n: int) -> str:
     return f"{cid} ({idx}/{n})"
 
 
+def _md_cell(s) -> str:
+    return str(s if s is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
+def _markdown_sequences(r: dict) -> str:
+    """The text-to-text stage: one row per comment with the tool names."""
+    counts = r.get("counts") or {}
+    lines = [f"# Redline review {r['review_id']}", ""]
+    if r.get("pdfs"):
+        lines += [f"PDFs: {', '.join(r['pdfs'])}", ""]
+    lines += ["| comments | sequenced | empty | model errors |", "|---|---|---|---|",
+              "| {comments} | {sequenced} | {empty} | {model_errors} |".format(
+                  **{k: counts.get(k, 0) for k in ("comments", "sequenced", "empty", "model_errors")}), ""]
+    seqs = {s["comment_id"]: s for s in r.get("sequences") or []}
+    sheets = {s["page_no"]: s for s in r.get("sheets") or []}
+    with_author = any(c.get("author") for c in r["comments"])
+    from_markups = (r.get("settings") or {}).get("source") == "markups"
+    pages = sorted({c["page_no"] for c in r["comments"]} | ({s["page_no"] for s in sheets.values()} if from_markups else set()))
+    for pn in pages:
+        lines.append("## Typed comments" if pn == 0 else f"## Page {pn}")
+        sheet = sheets.get(pn) or {}
+        tb = sheet.get("title_block")
+        mk = sheet.get("markups")
+        if mk:
+            other = mk.get("other") or {}
+            n = mk.get("textboxes", 0)
+            line = f"- markups: {n} text box{'es' if n != 1 else ''} read"
+            if other:
+                line += "; other markups ignored: " + ", ".join(f"{k} {v}" for k, v in sorted(other.items()))
+            lines.append(line)
+        elif tb:
+            lines.append(f"- title block read: sheet {tb.get('sheet_no')} project {tb.get('project_no')} "
+                         f"file {tb.get('printed_file')}")
+        lines.append("")
+        page_comments = [c for c in r["comments"] if c["page_no"] == pn]
+        if not page_comments:
+            lines.append("_no text boxes on this page_\n")
+            continue
+        head = "| id | comment | kind |" + (" author |" if with_author else "") + " confidence | tools |"
+        lines.append(head)
+        lines.append("|---|---|---|" + ("---|" if with_author else "") + "---|---|")
+        for c in page_comments:
+            s = seqs.get(c["id"]) or {}
+            shown = " → ".join(s.get("tools") or []) or f"(none: {s.get('error') or 'no answer'})"
+            if s.get("unknown_tools"):
+                shown += f" — dropped: {', '.join(s['unknown_tools'][:4])}"
+            author = f" {_md_cell(c.get('author'))} |" if with_author else ""
+            lines.append(f"| {c['id']} | {_md_cell(c.get('text'))} | {c.get('kind')} |{author} {float(c.get('confidence') or 0):.2f} | {_md_cell(shown)} |")
+        lines.append("")
+    if r.get("recall_warnings"):
+        lines.append("## Possible missed comments")
+        lines.append("")
+        lines.append("Check these spots on the page renders by eye (crops/p<N>_regions.png shows what was found).")
+        lines.append("")
+        for w in r["recall_warnings"]:
+            lines.append(f"- page {w.get('page_no')}: {w.get('detail')}")
+        lines.append("")
+    if r.get("errors"):
+        lines.append("## Errors")
+        lines += [f"- {e}" for e in r["errors"]]
+        lines.append("")
+    voc = r.get("vocabulary") or {}
+    lines.append(f"_tool vocabulary {voc.get('version')} ({voc.get('count')} names; the list offered is in tools.txt). "
+                 f"written {time.strftime('%Y-%m-%d %H:%M:%S')}_")
+    return "\n".join(lines) + "\n"
+
+
 def markdown(report: Report) -> str:
     r = report.to_dict()
+    if r.get("sequences") or r.get("vocabulary"):      # the current text-to-text flows, even with no comments
+        return _markdown_sequences(r)
     counts = r["counts"]
     lines = [f"# Redline review {r['review_id']}", "",
              f"PDFs: {', '.join(r['pdfs'])}", "",
@@ -114,7 +185,8 @@ def markdown(report: Report) -> str:
         for d in r["directives"]:
             lines.append(f"| {d['id']} | {d.get('page_no')} | {str(d['text']).replace('|', '/')} | {d.get('status')} |")
         lines.append("")
-        lines.append("Close one with `python -m redline directives --done <id>` once it has been applied.")
+        lines.append("Once applied, mark it done in the drawing's file under the review dir's `directives` folder "
+                     "(status \"done\"); until then it is shown to the planner as a standing note.")
         lines.append("")
     if r.get("recall_warnings"):
         lines.append("## Possible missed comments")
@@ -151,6 +223,25 @@ def training_rows(report: Report, palette_version: str) -> list:
         for key in _keys_for(cid, located) or [cid]:
             rows.append(dict(base, key=key, located=located.get(key), proposal=proposals.get(key),
                              outcome=outcomes.get(key)))
+    return rows
+
+
+def sequence_rows(report: Report, sheet_of: dict | None = None) -> list:
+    """One training row per comment for the text-to-text stage: the comment,
+    the tool names the model gave, and empty slots for a person's answer."""
+    r = report.to_dict()
+    seqs = {s["comment_id"]: s for s in r.get("sequences") or []}
+    sheet_of = sheet_of or {}
+    rows = []
+    for c in r["comments"]:
+        s = seqs.get(c["id"]) or {}
+        tb = sheet_of.get(c["page_no"]) or {}
+        rows.append({"ts": time.time(), "review_id": r["review_id"], "key": c["id"], "comment": c,
+                     "sheet": {"sheet_no": tb.get("sheet_no"), "printed_file": tb.get("printed_file")},
+                     "tools_version": (r.get("vocabulary") or {}).get("version"),
+                     "tools": s.get("tools") or [], "unknown_tools": s.get("unknown_tools") or [],
+                     "raw_reply": s.get("raw_reply", ""), "model": s.get("model", ""), "error": s.get("error"),
+                     "human_tools": None, "human_verdict": None})
     return rows
 
 

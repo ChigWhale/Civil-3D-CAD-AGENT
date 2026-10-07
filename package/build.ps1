@@ -33,7 +33,7 @@ param(
     [switch]$SkipPython,
     [switch]$Installer,
     # dashboard + plugin + drafting scripts only: no models, no model runtime, no GPU
-    # needed, one small Setup.exe (the redline pipeline stays installed but idle)
+    # needed, one small Setup.exe (the redline comment automation is not included)
     [switch]$Lite
 )
 if ($Lite) { $LlamaSwapUrl = ""; $LlamaServerUrl = ""; $CudartUrl = ""; $ModelsDir = "" }
@@ -78,6 +78,12 @@ if (-not (Test-Path (Join-Path $BinRelease "CADAgent.dll"))) { throw "no Release
 Copy-Item (Join-Path $BinRelease "*.dll") $BundleContents
 Copy-Item (Join-Path $BinRelease "*.deps.json") $BundleContents -ErrorAction SilentlyContinue
 $manifest = Get-Content (Join-Path $Pkg "bundle\PackageContents.xml") -Raw
+if ($SeriesMin -ne "R25.0") {
+    # SeriesMin is a floor, not "the release I built against": a bundle stamped R25.1
+    # is skipped by Civil 3D 2025 (R25.0) without any message. One package loads on
+    # 2025 and 2026 only when the floor is the oldest release it should run in.
+    Write-Warning "SeriesMin is $SeriesMin: Civil 3D releases below it will silently NOT load the plugin (2025 = R25.0, 2026 = R25.1). Use R25.0 unless excluding 2025 is intended."
+}
 $manifest = $manifest.Replace("{{VERSION}}", $Version).Replace("{{SERIESMIN}}", $SeriesMin).Replace("{{SERIESMAX}}", $SeriesMax)
 Set-Content -Path (Join-Path $Stage "bundle\CAD-Agent.bundle\PackageContents.xml") -Value $manifest -Encoding utf8
 

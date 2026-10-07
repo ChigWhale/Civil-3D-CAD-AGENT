@@ -67,6 +67,9 @@ class Comment(Record):
     starred: bool = False                             # begins with a drawn star / asterisk
     is_directive: bool = False                        # the model read it as a general instruction
     scope: str = "point"                              # point | multi | sheet
+    author: Optional[str] = None                      # Bluebeam markups carry these; handwriting does not
+    subject: Optional[str] = None
+    created: Optional[str] = None
 
     def anchor_px(self) -> tuple:
         """Where this comment is about, for a single-spot comment."""
@@ -196,6 +199,21 @@ class ChainProposal(Record):
 
 
 @dataclass
+class ToolSequence(Record):
+    """The sequencer's answer for one comment: tool names only. `tools` may
+    be empty; `error` then says why (model_error / no_valid_tools)."""
+    comment_id: str
+    tools: list = field(default_factory=list)
+    model: str = ""
+    attempt: int = 1
+    latency_s: float = 0.0
+    raw_reply: str = ""
+    unknown_tools: list = field(default_factory=list)   # names the model offered that are not tools
+    error: Optional[str] = None
+    prompt_chars: int = 0
+
+
+@dataclass
 class CommentOutcome(Record):
     comment_id: str
     status: str                              # done | skipped | failed | paused | dry_run | needs_human
@@ -225,3 +243,5 @@ class Report(Record):
     errors: list = field(default_factory=list)
     directives: list = field(default_factory=list)        # sheet-wide notes found in this review
     recall_warnings: list = field(default_factory=list)   # hints that a comment may have been missed
+    sequences: list = field(default_factory=list)         # ToolSequence per comment (the text-to-text stage)
+    vocabulary: dict = field(default_factory=dict)        # {"version", "count", "excluded"} of the tool list offered

@@ -2228,111 +2228,6 @@ def list_sheets(dashboard: str, verify: bool = False) -> str:
     return json.dumps({"layouts": sheets.list_layouts(entry.data, entry.index, verify=verify)})
 
 
-# ── Redline reviews: scanned reviewer comments -> block chains ──────────────
-#
-# redline/ reads the handwriting on plotted sheets with a local vision model,
-# opens the drawing printed in each sheet's title block, maps every comment
-# through the viewport into model space, asks a local language model for a
-# chain of dashboard blocks and runs it. It is the one path that assigns a
-# drawing to a dashboard without the user doing it: the drawing is the one
-# printed on the PDF the user handed over. This tool takes a PDF path only.
-
-
-@mcp.tool()
-@observed
-def review_redlines(pdf_path: str, dry_run: bool = False, pages: str = "") -> str:
-    """Starts a redline review of a scanned, redlined plan-sheet PDF in the
-    background and returns at once. The pipeline reads each comment (local
-    vision model), finds the drawing and layout the sheet came from, locates
-    the comment in model space, composes a block chain per comment (local
-    language model) and runs the chains it can on a dashboard named
-    "Redline: <drawing>", skipping the rest with a reason. dry_run plans
-    without running. pages is "1,3" to limit the pages. Read the outcome
-    with review_status(review_id); runs also appear in dashboard_status.
-    Needs Ollama (or another OpenAI-compatible model server) running with
-    the configured models; `python -m redline doctor` says what is missing."""
-    import subprocess
-    import time as _time
-    path = str(pdf_path or "").strip().strip('"')
-    if not os.path.isfile(path) or not path.lower().endswith(".pdf"):
-        return json.dumps({"error": f"pdf_path must be an existing .pdf file, got {path!r}"})
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from redline import config as redline_config
-    settings = redline_config.load()
-    review_id = _time.strftime("%Y%m%d-%H%M%S")
-    out_dir = os.path.join(settings.review_dir, review_id)
-    os.makedirs(out_dir, exist_ok=True)
-    cmd = [sys.executable, "-m", "redline", "review", path, "--review-id", review_id]
-    if dry_run:
-        cmd.append("--dry-run")
-    for p in str(pages or "").split(","):
-        if p.strip().isdigit():
-            cmd += ["--page", p.strip()]
-    log_path = os.path.join(out_dir, "review.log")
-    log = open(log_path, "w", encoding="utf-8")
-    subprocess.Popen(cmd, cwd=os.path.dirname(os.path.abspath(__file__)), stdout=log, stderr=subprocess.STDOUT,
-                     env=os.environ.copy())
-    return json.dumps({"review_id": review_id, "background": True, "report_path": os.path.join(out_dir, "report.json"),
-                       "log": log_path, "dry_run": dry_run,
-                       "note": "Started; this call does not wait. Reading the pages and planning take minutes on a "
-                               "local model. Call review_status(review_id) later; the report lists every comment as "
-                               "done, skipped (with the reason), failed or needing a person."})
-
-
-@mcp.tool()
-@observed
-def review_status(review_id: str = "") -> str:
-    """The report of a redline review: per page the drawing and layout matched
-    (or why not), per comment the transcription, where it landed, the chain
-    or the skip reason and the run's outcome. With review_id blank, lists
-    the reviews on disk. A review still running has a review.log but no
-    report.json yet."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from redline import config as redline_config
-    settings = redline_config.load()
-    root = settings.review_dir
-    if not review_id:
-        out = []
-        try:
-            names = sorted(os.listdir(root), reverse=True)
-        except OSError:
-            names = []
-        for n in names[:30]:
-            rp = os.path.join(root, n, "report.json")
-            if os.path.isfile(rp):
-                try:
-                    with open(rp, "r", encoding="utf-8") as f:
-                        rep = json.load(f)
-                    out.append({"review_id": n, "counts": rep.get("counts"), "pdfs": rep.get("pdfs"),
-                                "unmatched_pages": len(rep.get("unmatched_pages") or [])})
-                except (OSError, ValueError):
-                    continue
-            elif os.path.isfile(os.path.join(root, n, "review.log")):
-                out.append({"review_id": n, "status": "running or failed before the report; see review.log"})
-        return json.dumps({"reviews": out, "dir": root})
-    safe = "".join(ch for ch in str(review_id) if ch.isalnum() or ch in "-_")
-    rp = os.path.join(root, safe, "report.json")
-    if not os.path.isfile(rp):
-        lp = os.path.join(root, safe, "review.log")
-        tail = ""
-        if os.path.isfile(lp):
-            with open(lp, "r", encoding="utf-8", errors="replace") as f:
-                tail = f.read()[-1500:]
-        return json.dumps({"review_id": safe, "status": "no report yet", "log_tail": tail})
-    with open(rp, "r", encoding="utf-8") as f:
-        rep = json.load(f)
-    # compact: the markdown is easier to read than the full JSON
-    md = os.path.join(root, safe, "report.md")
-    summary = ""
-    if os.path.isfile(md):
-        with open(md, "r", encoding="utf-8") as f:
-            summary = f.read()[:6000]
-    return json.dumps({"review_id": safe, "counts": rep.get("counts"), "sheets": [
-        {k: s.get(k) for k in ("page_no", "dwg_path", "layout_name", "how", "reason")} for s in rep.get("sheets") or []],
-        "unmatched_pages": rep.get("unmatched_pages"), "errors": rep.get("errors"), "report_md": summary,
-        "report_path": rp})
-
-
 # ── Pressure networks: real water parts ──────────────────────────────────────
 
 
@@ -2953,15 +2848,15 @@ import drafting_tools
 drafting_tools.register(mcp, observed, _post, _file_for)
 
 
-# @mcp.tool()
-# def delete_objects(handles: list[str]) -> str:
-#     """Permanently deletes objects from the drawing by their handle strings.
-#     Handles are found in the get_model_space output.
-#     Only call when the user explicitly asks to delete or remove objects."""
-#     return _post({
-#         "intent":  "delete",
-#         "objects": [{"object_handle": h, "object_type": "object"} for h in handles],
-#     })
+@mcp.tool()
+def delete_objects(handles: list[str]) -> str:
+    """Permanently deletes objects from the drawing by their handle strings.
+    Handles are found in the get_model_space output.
+    Only call when the user explicitly asks to delete or remove objects."""
+    return _post({
+        "intent":  "delete",
+        "objects": [{"object_handle": h, "object_type": "object"} for h in handles],
+    })
 
 _DASHBOARD_PORT = 8765
 _DASHBOARD_URL  = f"http://localhost:{_DASHBOARD_PORT}"
@@ -2974,7 +2869,7 @@ _DASHBOARD_URL  = f"http://localhost:{_DASHBOARD_PORT}"
 # Point _HEALTH_PATH at a route the CURRENT server has and older ones don't, and
 # require the version stamp to match so a server running older code is replaced.
 _HEALTH_PATH = "/version"
-_DASHBOARD_VERSION = "2026-09-28.2"   # must equal dashboard/server.py DASHBOARD_VERSION
+_DASHBOARD_VERSION = "2026-10-07.1"   # must equal dashboard/server.py DASHBOARD_VERSION
 
 # How long a server gets to answer before it counts as failed or stale. Covers
 # uvicorn's own startup plus the sibling-process case described in _launch.

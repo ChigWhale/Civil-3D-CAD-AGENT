@@ -1,0 +1,14 @@
+[
+  {"comment": "MOVE HYD 20' N", "kind": "circle", "tools": ["find_entities", "move_entities"]},
+  {"comment": "CHANGE TO DR14", "kind": "circle", "tools": ["find_entities", "edit_text"]},
+  {"comment": "ADD INLET HERE", "kind": "note", "tools": ["describe_location", "draw_shape", "draw_leader"]},
+  {"comment": "DELETE - NOT NEEDED", "kind": "strike", "tools": ["find_entities", "delete_objects"]},
+  {"comment": "LABEL PIPE SIZE", "kind": "arrow", "tools": ["find_entities", "draw_leader"]},
+  {"comment": "SHOW DIMENSION TO ROW", "kind": "dimension", "tools": ["find_entities", "dimension_linear"]},
+  {"comment": "REVISE NOTE: 8\" NOT 6\"", "kind": "note", "tools": ["find_entities", "edit_text"]},
+  {"comment": "CONNECT TO EXISTING", "kind": "arrow", "tools": ["find_entities", "draw_polyline"]},
+  {"comment": "WRONG LAYER - SHOULD BE EXISTING", "kind": "cloud", "tools": ["find_entities", "move_to_layer"]},
+  {"comment": "ROTATE SYMBOL TO FACE STREET", "kind": "circle", "tools": ["find_entities", "rotate_entities"]},
+  {"comment": "LABELS OVERLAP - CLEAN UP", "kind": "cloud", "tools": ["space_labels"]},
+  {"comment": "OFFSET CURB 2' FOR SIDEWALK", "kind": "arrow", "tools": ["find_entities", "offset_entities"]}
+]
