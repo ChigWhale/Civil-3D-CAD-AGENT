@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Redline review</title>
+  <link rel="stylesheet" href="redline.css?v=2026-10-13.2">
+</head>
+<body>
+  <header id="hdr">
+    <h1>Redline review</h1>
+    <select id="reviewSel" aria-label="Review" title="Pick a review"></select>
+    <div id="chips" class="chips"></div>
+    <div class="hdr-right">
+      <label class="lab">Labeller <input id="labeller" type="text" placeholder="your name" spellcheck="false" autocomplete="off"></label>
+      <span id="labelledCount" class="count"></span>
+      <button id="discardBtn" type="button" class="ghost-btn">Discard labels</button>
+      <button id="copyBtn" type="button" class="ghost-btn">Copy folder path</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <div id="top">
+    <nav id="tabs" class="tabs" aria-label="Views">
+      <button type="button" class="tab on" data-tab="run">Run</button>
+      <button type="button" class="tab" data-tab="metrics">Metrics</button>
+      <button type="button" class="tab" data-tab="ocr" hidden>Transcription</button>
+      <span class="keys">j/k select · 1/2/3 verdict · / search</span>
+    </nav>
+    <div id="tiles" class="tiles"></div>
+    <div id="issues" class="issues"></div>
+    <div id="drawer" class="drawer" hidden></div>
+  </div>
+
+  <main id="main">
+    <section id="view-run" class="view split">
+      <div id="sheetPane" class="pane left"></div>
+      <div id="cardsPane" class="pane right">
+        <div id="cards" class="cards"></div>
+        <div id="library" class="library"></div>
+      </div>
+    </section>
+
+    <section id="view-metrics" class="view metrics" hidden></section>
+
+    <section id="view-ocr" class="view split" hidden>
+      <div id="ocrSheet" class="pane left"></div>
+      <div id="ocrPane" class="pane right"></div>
+    </section>
+
+    <div id="message" class="message" hidden></div>
+  </main>
+
+  <div id="chart-tip" hidden></div>
+  <div id="dndLive" class="sr-only" aria-live="polite"></div>
+
+  <script src="redline-charts.js?v=2026-10-13.2"></script>
+  <script src="redline-dnd.js?v=2026-10-13.2"></script>
+  <script src="redline.js?v=2026-10-13.2"></script>
+</body>
+</html>

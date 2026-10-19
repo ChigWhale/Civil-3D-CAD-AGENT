@@ -84,6 +84,15 @@
     <Compile Remove="MathDrill\**" />
     <None Remove="MathDrill\**" />
     <EmbeddedResource Remove="MathDrill\**" />
+    <Compile Remove="FeatureLineSync\**" />
+    <None Remove="FeatureLineSync\**" />
+    <EmbeddedResource Remove="FeatureLineSync\**" />
+    <Compile Remove="FeatureLineSync.Tests\**" />
+    <None Remove="FeatureLineSync.Tests\**" />
+    <EmbeddedResource Remove="FeatureLineSync.Tests\**" />
+    <Compile Remove="FeatureLineGrades\**" />
+    <None Remove="FeatureLineGrades\**" />
+    <EmbeddedResource Remove="FeatureLineGrades\**" />
   </ItemGroup>
 
   <!-- Pipe elevation solver (ICadObjectHandler) exposed through /handler -->

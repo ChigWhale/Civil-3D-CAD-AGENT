@@ -39,7 +39,7 @@ _ENV = {
     # fractions of the page (origin top-left) that hold the title block text;
     # several rectangles separated by ';'. Fractions, not inches, so a scan
     # that was shrunk to fit a smaller page still crops the right strip.
-    "title_rects": ("CAD_REDLINE_TITLE_RECT", "0.84,0,1,1;0,0.9,1,1"),
+    "title_rects": ("CAD_REDLINE_TITLE_RECT", "0,0,0.06,1;0.84,0,1,1;0,0.9,1,1"),
     # paper-inch rectangle of the plotted border [x0,y0,x1,y1]; when set, the
     # border found in the scan is fitted to it and the page->paper transform
     # is refined. Unset = trust the page size.
@@ -48,13 +48,20 @@ _ENV = {
     # a second look for handwriting by the vision model on page tiles, merged
     # with the ink detector's regions; "0" turns it off (about a minute a page)
     "sweep": ("CAD_REDLINE_SWEEP", "1"),
+    # open the results window after a run (the CLI only; tests set it to 0)
+    "view": ("CAD_REDLINE_VIEW", "1"),
     # ink boxes smaller than this (square inches) are specks, not comments
     "min_area_in2": ("CAD_REDLINE_MIN_AREA", "0.04"),
     "context_radius": ("CAD_REDLINE_CONTEXT_RADIUS", "100"),
     "model_timeout": ("CAD_REDLINE_MODEL_TIMEOUT", "600"),
     "on_conflict": ("CAD_REDLINE_ON_CONFLICT", "pause"),
     "fixture": ("CAD_REDLINE_FIXTURE", ""),
+    # what the sequencer prompt carries: "full" = the tool list and the few-shot
+    # examples (a stock model needs them); "short" = the comment line only, for
+    # a model fine-tuned on this task (finetune/), which has learnt the vocabulary
+    "prompt": ("CAD_REDLINE_PROMPT", "full"),
 }
+PROMPT_MODES = ("full", "short")
 
 
 def _file_settings() -> dict:
@@ -98,11 +105,13 @@ class Settings:
     border_rect: tuple | None
     min_confidence: float
     sweep: bool
+    view: bool
     min_area_in2: float
     context_radius: float
     model_timeout: float
     on_conflict: str
     fixture: str
+    prompt: str = "full"
     raw: dict = field(default_factory=dict)
 
 
@@ -145,14 +154,16 @@ def load() -> Settings:
         crop_dpi=int(float(raw["crop_dpi"])),
         title_dpi=int(float(raw["title_dpi"])),
         max_image_px=int(float(raw["max_image_px"])),
-        title_rects=_rects(raw["title_rects"]) or [(0.84, 0, 1, 1), (0, 0.9, 1, 1)],
+        title_rects=_rects(raw["title_rects"]) or [(0, 0, 0.06, 1), (0.84, 0, 1, 1), (0, 0.9, 1, 1)],
         border_rect=border[0] if border else None,
         min_confidence=float(raw["min_confidence"]),
         sweep=str(raw["sweep"]).strip().lower() not in ("0", "false", "no", "off", ""),
+        view=str(raw["view"]).strip().lower() not in ("0", "false", "no", "off", ""),
         min_area_in2=float(raw["min_area_in2"]),
         context_radius=float(raw["context_radius"]),
         model_timeout=float(raw["model_timeout"]),
         on_conflict=str(raw["on_conflict"]).strip().lower() or "pause",
         fixture=str(raw["fixture"] or ""),
+        prompt=(str(raw["prompt"]).strip().lower() if str(raw["prompt"]).strip().lower() in PROMPT_MODES else "full"),
         raw=raw,
     )

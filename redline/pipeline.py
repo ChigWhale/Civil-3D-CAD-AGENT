@@ -137,9 +137,15 @@ def _text_comments(texts) -> list:
 
 
 def review(pdfs: list | None = None, texts: list | None = None, settings=None, ocr=None, backend=None, log=_log,
-           review_id: str | None = None, pages: list | None = None) -> Report:
+           review_id: str | None = None, pages: list | None = None, locate: bool = False, act: str | None = None,
+           on_conflict: str | None = None) -> Report:
     """Transcribe, then name the tools. One model call per comment; every
-    comment gets a row."""
+    comment gets a row. With `locate`, the drawing printed on each sheet is
+    opened in Civil 3D first and every comment is placed in it. With `act`
+    ("dry" or "run", which implies locate), the parameters of every tool in
+    the sequence are filled and the tools run: a dry run fills and runs the
+    read-only steps only; "run" draws."""
+    locate = locate or bool(act)
     pdfs = list(pdfs or [])
     settings = settings or config.load()
     review_id = review_id or _review_id()
@@ -152,31 +158,44 @@ def review(pdfs: list | None = None, texts: list | None = None, settings=None, o
     # ── 1. read every page ────────────────────────────────────────────────
     comments = _text_comments(texts)
     sheet_of = {0: {}}
+    per_page = {}
     if pdfs:
         ocr = ocr or ocr_mod.backend(settings)
         per_page = _read_pages(pdfs, settings, ocr, out_dir, crops_dir, pages, log=log, errors=report.errors)
         for pn, rec in per_page.items():
             report.recall_warnings.extend(rec["warnings"])
-            report.sheets.append({"page_no": pn, "title_block": rec["title"].to_dict()})
             sheet_of[pn] = rec["title"].to_dict()
             comments.extend(rec["comments"])
-    return _sequence_all(report, comments, sheet_of, settings, backend, out_dir, log)
+    located, comment_of, match_of = {}, {}, {}
+    if locate and per_page:
+        located, comment_of, match_of, _ = _locate_all(per_page, settings, report, log=log)   # fills report.sheets / located / unmatched_pages
+    else:
+        for pn, rec in per_page.items():
+            report.sheets.append({"page_no": pn, "title_block": rec["title"].to_dict()})
+    return _sequence_all(report, comments, sheet_of, settings, backend, out_dir, log, act=act, located=located,
+                         comment_of=comment_of, match_of=match_of, on_conflict=on_conflict)
 
 
-def _sequence_all(report: Report, comments: list, sheet_of: dict, settings, backend, out_dir: str, log=_log) -> Report:
+def _sequence_all(report: Report, comments: list, sheet_of: dict, settings, backend, out_dir: str, log=_log,
+                  act: str | None = None, located: dict | None = None, comment_of: dict | None = None,
+                  match_of: dict | None = None, on_conflict: str | None = None) -> Report:
     """The shared tail of every current flow: one sequencer call per comment,
-    counts, tools.txt, the report files and the training rows."""
+    then (with act = "dry" | "run") the parameters filled and the tools run
+    for every located target, then counts, tools.txt, the report files and
+    the training rows."""
     report.comments = [c.to_dict() for c in comments]
     backend = backend or _backend(settings)
     names = tools_mod.names()
     tools_text = tools_mod.text()
     examples = sequence_mod.load_examples()
-    report.vocabulary = {"version": tools_mod.version(), "count": len(names), "excluded": sorted(tools_mod.EXCLUDE)}
+    mode = getattr(settings, "prompt", "full") or "full"
+    report.vocabulary = {"version": tools_mod.version(), "count": len(names), "excluded": sorted(tools_mod.EXCLUDE),
+                         "prompt": mode}
     with open(os.path.join(out_dir, "tools.txt"), "w", encoding="utf-8") as f:
         f.write(f"# {len(names)} tools offered to the model (version {report.vocabulary['version']})\n{tools_text}\n")
     sequences = []
     for c in comments:
-        seq = sequence_mod.sequence(c, backend, tools_text, names, examples=examples, log=log)
+        seq = sequence_mod.sequence(c, backend, tools_text, names, examples=examples, log=log, mode=mode)
         sequences.append(seq)
         shown = " -> ".join(seq.tools) if seq.tools else f"(none: {seq.error})"
         log(f"  {c.id} '{c.text[:40]}' -> {shown}")
@@ -184,6 +203,11 @@ def _sequence_all(report: Report, comments: list, sheet_of: dict, settings, back
     report.counts = {"comments": len(sequences), "sequenced": sum(1 for s in sequences if s.tools),
                      "empty": sum(1 for s in sequences if not s.tools),
                      "model_errors": sum(1 for s in sequences if str(s.error or "").startswith("model_error"))}
+
+    if act:
+        _act_all(report, comments, sequences, settings, backend, act, located or {}, comment_of or {}, match_of or {},
+                 on_conflict=on_conflict, log=log)
+
     md, js = report_mod.write(report, out_dir)
     rows = report_mod.sequence_rows(report, sheet_of)
     report_mod.append_training(os.path.join(out_dir, report_mod.TRAINING_FILE), rows)
@@ -191,11 +215,49 @@ def _sequence_all(report: Report, comments: list, sheet_of: dict, settings, back
     return report
 
 
+def _act_all(report: Report, comments: list, sequences: list, settings, backend, mode: str, located: dict,
+             comment_of: dict, match_of: dict, on_conflict: str | None = None, log=_log) -> None:
+    """Parameters filled and tools run (mode "run") or only filled (mode
+    "dry": read-only steps run for real, writes never) for every located
+    target, in comment order. Fills report.actions and report.mode."""
+    from . import act as act_mod
+    report.mode = mode
+    seq_of = {s.comment_id: s.tools for s in sequences}
+    unk_of = {s.comment_id: s.unknown_tools for s in sequences}
+    ex = act_mod.Executor(settings, mode=mode, on_conflict=on_conflict or settings.on_conflict or "pause",
+                          backend=backend, log=log)
+    actions = []
+    for c in comments:
+        keys = sorted((k for k in located if k == c.id or k.startswith(c.id + "#")),
+                      key=lambda k: int(k.split("#")[1]) if "#" in k else 0)
+        if not keys:
+            reason = "sheet-wide note" if c.scope == "sheet" else "not located (run with --locate against Civil 3D)"
+            actions.append(act_mod.Action(key=c.id, comment_id=c.id, status="not_located", reason=reason))
+            continue
+        for key in keys:
+            loc = located[key]
+            m = match_of.get(c.page_no)
+            log(f"  {key} '{c.text[:40]}': {' -> '.join(seq_of.get(c.id) or []) or '(no sequence)'}")
+            a = ex.act(key, c, loc, m, seq_of.get(c.id) or [], unknown_tools=unk_of.get(c.id) or [])
+            log(f"  {key}: {a.status}" + (f" ({a.reason})" if a.reason else ""))
+            actions.append(a)
+    report.actions = [a.to_dict() for a in actions]
+    counts = {}
+    for a in actions:
+        counts[a.status] = counts.get(a.status, 0) + 1
+    report.counts.update({"acted": len(actions), **{f"act_{k}": v for k, v in sorted(counts.items())}})
+
+
 def review_markups(pdfs: list, settings=None, backend=None, log=_log, review_id: str | None = None,
-                   pages: list | None = None) -> Report:
+                   pages: list | None = None, locate: bool = False, act: str | None = None,
+                   on_conflict: str | None = None) -> Report:
     """Bluebeam text boxes (FreeText annotations) instead of handwriting: no
     detector, no vision model. The pages are rendered so a person can look
-    at them; then the same sequencer, report and training rows."""
+    at them; then the same sequencer, report and training rows. With
+    `locate`, the title block is read from the PDF's text layer, the drawing
+    it names is opened in Civil 3D and every text box is placed in it. With
+    `act` ("dry" | "run") the tools are filled and run, as in review()."""
+    locate = locate or bool(act)
     pdfs = list(pdfs or [])
     settings = settings or config.load()
     review_id = review_id or _review_id()
@@ -205,6 +267,7 @@ def review_markups(pdfs: list, settings=None, backend=None, log=_log, review_id:
                     settings=dict({k: v for k, v in settings.raw.items() if k not in ("fixture",)}, source="markups"))
     comments = []
     sheet_of = {}
+    per_page = {}
     for pdf in pdfs:
         try:
             found = markups_mod.read(pdf, dpi=settings.dpi, pages=pages_filter(pages))
@@ -212,21 +275,105 @@ def review_markups(pdfs: list, settings=None, backend=None, log=_log, review_id:
             report.errors.append(f"{pdf}: could not read annotations ({e})")
             continue
         total = 0
+        summaries = {}
         for pn, rec in sorted(found.items()):
             total += len(rec["comments"])
             log(f"page {pn} of {os.path.basename(pdf)}: {markups_mod.summary(rec)}")
-            report.sheets.append({"page_no": pn, "pdf": os.path.abspath(pdf),
-                                  "markups": {"textboxes": len(rec["comments"]), "other": rec["annots_other"],
-                                              "rotate": rec["rotate"], "size_pt": list(rec["size_pt"])}})
-            sheet_of[pn] = {}
+            summaries[pn] = {"textboxes": len(rec["comments"]), "other": rec["annots_other"],
+                             "rotate": rec["rotate"], "size_pt": list(rec["size_pt"])}
             comments.extend(rec["comments"])
         if total == 0:
             report.errors.append(f"{pdf}: no Bluebeam text boxes found (flattened PDF, or markups of other kinds only)")
+        pages_rendered = {}
         try:
-            pdf_mod.rasterise(pdf, dpi=settings.dpi, out_dir=os.path.join(out_dir, "pages"), pages=pages_filter(pages))
+            for page in pdf_mod.rasterise(pdf, dpi=settings.dpi, out_dir=os.path.join(out_dir, "pages"), pages=pages_filter(pages)):
+                pages_rendered[page.page_no] = page
         except Exception as e:
             log(f"  (pages not rendered: {e})")
-    return _sequence_all(report, comments, sheet_of, settings, backend, out_dir, log)
+        for pn, rec in sorted(found.items()):
+            title = sheet_mod.title_from_text_layer(pdf, pn)
+            sheet_of[pn] = title.to_dict()
+            if locate and pn in pages_rendered:
+                per_page[pn] = {"page": pages_rendered[pn], "comments": rec["comments"], "title": title, "border": None,
+                                "markups": summaries[pn]}
+            else:
+                report.sheets.append({"page_no": pn, "pdf": os.path.abspath(pdf), "markups": summaries[pn],
+                                      "title_block": title.to_dict()})
+    located, comment_of, match_of = {}, {}, {}
+    if locate and per_page:
+        located, comment_of, match_of, _ = _locate_all(per_page, settings, report, log=log)
+        by_page = {s["page_no"]: s for s in report.sheets}
+        for pn, rec in per_page.items():           # keep the markup counts beside the match
+            if pn in by_page:
+                by_page[pn]["markups"] = rec["markups"]
+    return _sequence_all(report, comments, sheet_of, settings, backend, out_dir, log, act=act, located=located,
+                         comment_of=comment_of, match_of=match_of, on_conflict=on_conflict)
+
+
+def _locate_all(per_page: dict, settings, report: Report, log=_log) -> tuple:
+    """Which drawing and layout each page is, opened in Civil 3D through the
+    plugin, and where every comment lands in it.
+
+    per_page: {page_no: {"page": Page, "comments": [Comment], "title": TitleBlockRead, "border": rect|None}}.
+    Returns (located {key: Located}, comment_of {key: Comment}, match_of
+    {page_no: SheetMatch}, sheet_wide [(page_no, Comment)]). A key is the
+    comment id, or id#n for the n-th target of a multi-target comment.
+    Sheet-wide notes are not located; they come back in `sheet_wide`. A page
+    that cannot be matched (no candidate, plugin unreachable, no layout)
+    is recorded in report.unmatched_pages and its comments get
+    Located(space="none", reason=...). Nothing here raises."""
+    opener = _open_drawing(settings)
+    entries = {}
+    match_of = {}
+    for pn, rec in per_page.items():
+        page, title = rec["page"], rec["title"]
+
+        def open_drawing(path):
+            entry = opener(path)
+            entries[os.path.normcase(os.path.abspath(path))] = entry
+            return entry.data
+        try:
+            m = sheet_mod.match(page, title, settings, open_drawing, border_rect_px=rec.get("border"))
+        except Exception as e:
+            m = sheet_mod.SheetMatch(page_no=pn, title_block=title.to_dict(), reason=f"could_not_match: {e}")
+        rec["match"] = m
+        match_of[pn] = m
+        report.sheets.append(m.to_dict())
+        if not m.ok or m.reason:
+            report.unmatched_pages.append({"page_no": pn, "reason": m.reason or "unmatched"})
+            log(f"page {pn}: not matched ({m.reason}); {len(rec['comments'])} comment(s) will be reported only")
+        else:
+            log(f"page {pn}: {m.dwg_path} / {m.layout_name} ({m.how})"
+                + (" opened by the pipeline" if m.opened_by_pipeline else ""))
+
+    located = {}          # key -> Located
+    comment_of = {}       # key -> Comment
+    sheet_wide = []       # (page_no, Comment)
+    for pn, rec in per_page.items():
+        m = rec.get("match")
+        matched = m is not None and m.ok and not m.reason
+        for c in rec["comments"]:
+            if c.scope == "sheet":
+                sheet_wide.append((pn, c))
+                continue
+            if not matched:
+                loc = Located(comment_id=c.id, space="none", reason=m.reason if m else "unmatched")
+                located[loc.key] = loc
+                comment_of[loc.key] = c
+                continue
+            entry = entries[os.path.normcase(os.path.abspath(m.dwg_path))]
+            layout = next((l for l in entry.data.get("layouts") or [] if l.get("name") == m.layout_name), {})
+            pidx = PaperIndex(layout)
+            p2p, vps = sheet_mod.transforms_for(m)
+            frozen = {v["handle"]: v.get("frozen_layers") or [] for v in m.viewports}
+            layers = locate_mod.layer_map(entry.data)
+            for loc in locate_mod.locate(c, p2p, vps, entry.index, entry.data, pidx, frozen_by_handle=frozen,
+                                         radius=settings.context_radius, layers=layers, layout_name=m.layout_name):
+                located[loc.key] = loc
+                comment_of[loc.key] = c
+                log(f"  {loc.key} '{c.text[:40]}' -> {loc.space} {loc.model_xy or loc.paper_xy}")
+    report.located = [l.to_dict() for l in located.values()]
+    return located, comment_of, match_of, sheet_wide
 
 
 def _backend(settings):
@@ -262,58 +409,19 @@ def review_located(pdfs: list, settings=None, dry_run: bool = False, ocr=None, p
         report.recall_warnings.extend(rec["warnings"])
         report.comments.extend(c.to_dict() for c in rec["comments"])
 
-    # ── 2. which drawing, which layout ────────────────────────────────────
-    opener = _open_drawing(settings)
-    entries = {}
-    for pn, rec in per_page.items():
-        page, title = rec["page"], rec["title"]
+    # ── 2 + 3. which drawing, which layout; locate every comment ──────────
+    located, comment_of, match_of, sheet_wide = _locate_all(per_page, settings, report, log=log)
 
-        def open_drawing(path):
-            entry = opener(path)
-            entries[os.path.normcase(os.path.abspath(path))] = entry
-            return entry.data
-        m = sheet_mod.match(page, title, settings, open_drawing, border_rect_px=rec["border"])
-        rec["match"] = m
-        report.sheets.append(m.to_dict())
-        if not m.ok or m.reason:
-            report.unmatched_pages.append({"page_no": pn, "reason": m.reason or "unmatched"})
-            log(f"page {pn}: not matched ({m.reason}); {len(rec['comments'])} comment(s) will be reported only")
-        else:
-            log(f"page {pn}: {m.dwg_path} / {m.layout_name} ({m.how})")
-
-    # ── 3. locate every comment; file the sheet-wide ones ─────────────────
-    located = {}          # key -> Located   (key = comment id, or id#n for the n-th target)
-    comment_of = {}       # key -> Comment
+    # file the sheet-wide notes as directives (the parked flow's rule)
     found_directives = {} # dwg path (or None) -> [Directive] found in this review
-    for pn, rec in per_page.items():
-        m = rec.get("match")
-        matched = m is not None and m.ok and not m.reason
+    for pn, c in sheet_wide:
+        m = match_of.get(pn)
         dwg = m.dwg_path if m is not None else None
-        for c in rec["comments"]:
-            if c.scope == "sheet":
-                d = directives_mod.add(settings.review_dir, review_id, c, dwg, m.layout_name if m else None,
-                                       sheet_no=rec["title"].sheet_no)
-                found_directives.setdefault(dwg, []).append(d)
-                report.directives.append(d.to_dict())
-                log(f"  {c.id} '{c.text[:40]}' -> sheet-wide note, stored as {d.id}")
-                continue
-            if not matched:
-                loc = Located(comment_id=c.id, space="none", reason=m.reason if m else "unmatched")
-                located[loc.key] = loc
-                comment_of[loc.key] = c
-                continue
-            entry = entries[os.path.normcase(os.path.abspath(m.dwg_path))]
-            layout = next((l for l in entry.data.get("layouts") or [] if l.get("name") == m.layout_name), {})
-            pidx = PaperIndex(layout)
-            p2p, vps = sheet_mod.transforms_for(m)
-            frozen = {v["handle"]: v.get("frozen_layers") or [] for v in m.viewports}
-            layers = locate_mod.layer_map(entry.data)
-            for loc in locate_mod.locate(c, p2p, vps, entry.index, entry.data, pidx, frozen_by_handle=frozen,
-                                         radius=settings.context_radius, layers=layers, layout_name=m.layout_name):
-                located[loc.key] = loc
-                comment_of[loc.key] = c
-                log(f"  {loc.key} '{c.text[:40]}' -> {loc.space} {loc.model_xy or loc.paper_xy}")
-    report.located = [l.to_dict() for l in located.values()]
+        d = directives_mod.add(settings.review_dir, review_id, c, dwg, m.layout_name if m else None,
+                               sheet_no=per_page[pn]["title"].sheet_no)
+        found_directives.setdefault(dwg, []).append(d)
+        report.directives.append(d.to_dict())
+        log(f"  {c.id} '{c.text[:40]}' -> sheet-wide note, stored as {d.id}")
 
     # ── 4. plan ───────────────────────────────────────────────────────────
     planner = planner or _planner(settings)
@@ -322,7 +430,6 @@ def review_located(pdfs: list, settings=None, dry_run: bool = False, ocr=None, p
     examples = palette.load_examples()
     notes_cache = {}
     proposals = {}
-    match_of = {pn: rec.get("match") for pn, rec in per_page.items()}
     for key, loc in located.items():
         c = comment_of[key]
         m = match_of.get(c.page_no)

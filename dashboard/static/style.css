@@ -577,3 +577,103 @@ main {
 .log-entry.finished { border-left-color: var(--ok); }
 .log-entry .t { color: var(--muted); margin-right: 6px; }
 .log-entry .tool { color: var(--accent); font-weight: 600; }
+
+/* ── The prompt block ─────────────────────────────────────────────────── */
+
+.param-prompt { align-items: flex-start; }
+.param-prompt .param-input { width: 340px; resize: vertical; line-height: 1.4; font-family: inherit; }
+
+.block-plan {
+  margin-top: 7px;
+  padding: 6px 8px 6px 26px;
+  border-top: 1px dashed var(--border);
+  font-size: 10px;
+  color: var(--muted);
+}
+.plan-hint { margin: 0; font-style: italic; }
+
+.plan-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 5px;
+}
+.plan-reason { flex: 1; min-width: 0; color: var(--text); }
+.plan-replan { width: auto; padding: 0 7px; }
+
+.chip {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  font-size: 9px;
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.chip.model { font-family: ui-monospace, Consolas, monospace; }
+.chip.role-read { border-color: var(--accent); color: var(--accent); }
+.chip.role-write { border-color: var(--warn, #d9a441); color: var(--warn, #d9a441); }
+.chip.by-helper, .chip.by-prefill { color: var(--ok); border-color: var(--ok); }
+.chip.by-llm { color: var(--accent); border-color: var(--accent); }
+.chip.by-human { color: var(--text); border-color: var(--text); }
+.chip.by-none { color: var(--err); border-color: var(--err); }
+.chip.status-ready, .chip.status-ran, .chip.status-executed, .chip.status-planned { color: var(--ok); border-color: var(--ok); }
+.chip.status-needs_fill { color: var(--warn, #d9a441); border-color: var(--warn, #d9a441); }
+.chip.status-needs_human, .chip.status-not_filled, .chip.status-failed, .chip.status-blocked { color: var(--err); border-color: var(--err); }
+
+.plan-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.plan-step {
+  border-left: 2px solid var(--border);
+  padding-left: 7px;
+}
+.plan-step.st-ran, .plan-step.st-executed { border-left-color: var(--ok); }
+.plan-step.st-planned { border-left-color: var(--accent); }
+.plan-step.st-needs_fill { border-left-color: var(--warn, #d9a441); }
+.plan-step.st-not_filled, .plan-step.st-failed, .plan-step.st-blocked { border-left-color: var(--err); }
+
+.plan-step-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.plan-n { color: var(--muted); }
+.plan-tool { font-weight: 600; color: var(--text); font-family: ui-monospace, Consolas, monospace; }
+.plan-note { color: var(--muted); font-style: italic; }
+.plan-del { width: 18px; height: 18px; font-size: 10px; margin-left: auto; }
+
+.plan-params {
+  display: block;
+  width: 100%;
+  margin-top: 3px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  padding: 3px 6px;
+  font-size: 10px;
+  font-family: ui-monospace, Consolas, monospace;
+  resize: vertical;
+  line-height: 1.4;
+}
+.plan-params:focus { outline: none; border-color: var(--accent); }
+.plan-params.invalid { border-color: var(--err); }
+.plan-params[readonly] { opacity: .7; }
+
+.plan-result {
+  margin-top: 2px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plan-result.error { color: var(--err); white-space: normal; }

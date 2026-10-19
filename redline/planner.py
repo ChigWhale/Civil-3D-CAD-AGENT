@@ -206,10 +206,21 @@ def known_handles(context: dict) -> set:
         out.add(str(n.get("handle")))
     for rec in (ctx.get("within") or {}).values():
         out.update(str(h) for h in rec.get("handles") or [])
-    for key in ("inside", "labels", "texts", "paper_texts", "paper_blocks", "paper_tables"):
+    for key in ("inside", "labels", "texts", "paper_texts", "paper_blocks", "paper_tables", "objects"):
         for rec in ctx.get(key) or []:
             if rec.get("handle"):
                 out.add(str(rec["handle"]))
+    pick = ctx.get("pick") or {}
+    for rec in [pick.get("object")] + list(pick.get("labels") or []) + list(pick.get("candidates") or []) + list(pick.get("enclosing") or []):
+        if isinstance(rec, dict) and rec.get("handle"):
+            out.add(str(rec["handle"]))
+            for l in rec.get("labels") or []:
+                if isinstance(l, dict) and l.get("handle"):
+                    out.add(str(l["handle"]))
+    for rec in ctx.get("objects") or []:
+        for l in rec.get("labels") or []:
+            if isinstance(l, dict) and l.get("handle"):
+                out.add(str(l["handle"]))
     out.discard("None")
     return out
 

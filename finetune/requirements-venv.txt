@@ -1,0 +1,15 @@
+# The fine-tuning environment (.venv-finetune), installed by `python -m finetune setup`.
+# torch is installed first from the PyTorch index (CUDA build), not from here.
+transformers==5.20.1
+peft==0.21.2
+trl==1.16.0
+datasets>=5.0
+accelerate>=1.10
+safetensors>=0.5
+sentencepiece
+protobuf
+# llama.cpp's convert_hf_to_gguf.py (run inside this venv) needs these too
+numpy
+pyyaml
+tqdm
+requests

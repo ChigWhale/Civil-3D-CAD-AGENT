@@ -117,3 +117,12 @@ into the bundle (the `SyncDevBundle` target), so a code change only needs a
 build and a Civil 3D restart. Stop NETLOADing from `bin\` once the bundle is
 installed; loading the assembly twice errors. `-Uninstall` removes it. The
 installer built by `package\build.ps1` lays down the same bundle for users.
+
+## FeatureLineSync (standalone DLL)
+
+`FeatureLineSync/FeatureLineSync.csproj` builds a separate plug-in for one job:
+after road feature lines were moved and lost their elevations, anchor the points
+that touch the corridor to a chosen surface and re-apply the grades from a
+Save-As copy made before the move. Commands `FLSYNC`, `FLEXPORT`, `FLIMPORT`;
+`NETLOAD` `FeatureLineSync/bin/Debug/net10.0-windows/FeatureLineSync.dll`. See
+`FeatureLineSync/README.md` for the method, the prompts and the live test steps.

@@ -21,6 +21,7 @@ dashboard starts without models and `doctor` says so.
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -217,12 +218,89 @@ def dashboard_url() -> str:
     return f"http://127.0.0.1:{dashboard_port()}"
 
 
+def code_version() -> str | None:
+    """DASHBOARD_VERSION as written in dashboard/server.py, read without
+    importing the server (which would pull in FastAPI and the spatial index)."""
+    try:
+        with open(os.path.join(HERE, "dashboard", "server.py"), encoding="utf-8") as f:
+            m = re.search(r'^DASHBOARD_VERSION\s*=\s*"([^"]+)"', f.read(), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def running_version(url: str) -> str | None:
+    try:
+        with urllib.request.urlopen(f"{url}/version", timeout=2) as r:
+            return str(json.loads(r.read().decode("utf-8")).get("version") or "") or None
+    except Exception:
+        return None
+
+
+def _port_pid(port: int) -> int | None:
+    """The process listening on a local TCP port (Windows), for when the pid
+    file is stale: the server outlived the launcher that wrote it."""
+    if os.name != "nt":
+        return None
+    out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[3].upper() == "LISTENING":
+            try:
+                return int(parts[4])
+            except ValueError:
+                continue
+    return None
+
+
+def _is_our_dashboard(pid: int | None) -> bool:
+    """True when the process runs dashboard.server, so stopping it replaces
+    our own server and never someone else's service on the port."""
+    if not pid:
+        return False
+    if os.name == "nt":
+        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                              f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"],
+                             capture_output=True, text=True).stdout
+    else:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                out = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            out = ""
+    return "dashboard.server" in out
+
+
 def start_dashboard() -> str:
-    if _http_ok(f"{dashboard_url()}/version"):
-        return "dashboard already up"
+    """Starts the dashboard, or replaces a running one of ours whose /version
+    no longer matches the code (a server left up across a code change keeps
+    serving the old blocks and the old page). A server on the port that is
+    not ours is left alone and reported."""
+    url = dashboard_url()
+    note = "dashboard started"
+    if _http_ok(f"{url}/version"):
+        want, have = code_version(), running_version(url)
+        if not want or not have or want == have:
+            return "dashboard already up"
+        pid = _read_pid("dashboard")
+        if not _alive(pid):
+            pid = _port_pid(dashboard_port())
+        if not _is_our_dashboard(pid):
+            return (f"dashboard already up but out of date (running {have}, code is {want}) and not started by "
+                    f"this launcher: stop it, then run this again")
+        _kill(pid)
+        try:
+            os.remove(_pid_file("dashboard"))
+        except OSError:
+            pass
+        for _ in range(50):
+            if not _http_ok(f"{url}/version", 0.5):
+                break
+            time.sleep(0.2)
+        note = f"dashboard restarted ({have} -> {want})"
     _spawn("dashboard", [sys.executable, "-m", "uvicorn", "dashboard.server:app", "--host", "127.0.0.1",
                          "--port", str(dashboard_port()), "--log-level", "warning"], cwd=HERE)
-    return "dashboard started" if _wait(f"{dashboard_url()}/version", 60) else "dashboard did not answer in 60 s (see logs)"
+    return note if _wait(f"{url}/version", 60) else "dashboard did not answer in 60 s (see logs)"
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -263,6 +341,13 @@ def cmd_open(args) -> int:
     if not _http_ok(f"{dashboard_url()}/version"):
         args.no_browser, args.no_models = True, False
         cmd_start(args)
+    else:
+        # up, but maybe from before the code changed: start_dashboard replaces a stale one of ours
+        os.makedirs(run_dir(), exist_ok=True)
+        os.makedirs(log_dir(), exist_ok=True)
+        msg = start_dashboard()
+        if msg != "dashboard already up":
+            print(msg)
     webbrowser.open(dashboard_url())
     return 0
 

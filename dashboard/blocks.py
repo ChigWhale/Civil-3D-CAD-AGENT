@@ -722,6 +722,42 @@ BLOCK_SPECS.append({
     ],
 })
 
+# -- Prompt: free text -> tool sequence -> filled parameters -> run ------------
+#
+# The one block whose steps are not known until a model has read the prompt.
+# At its turn the model names the MCP tools in order, helpers and the model
+# fill their parameters (lookups run live so later steps can use what they
+# found), the plan goes to the browser (kept in the block's "plan" field and
+# shown step by step), and the writes run at once through the MCP server's own
+# functions (prompting/ drives it; see _run_prompt_block in server.py). A plan
+# nobody could finish fails the run and stays on the card to be fixed by hand;
+# Run then executes the fixed plan as it is. Editing the prompt or the anchor
+# clears the plan; an executed plan is planned afresh.
+
+BLOCK_SPECS.append({
+    "type": "prompt",
+    "label": "Prompt",
+    "group": "Generated",
+    "description": ("Type what to do. A model picks the tool sequence, helpers and the model fill the "
+                    "parameters, and the steps run; the plan and what each step did stay on the card."),
+    "help": ("One Run plans and executes. The model names the tools, the parameters are filled from the "
+             "prompt, the anchor and the lookups (the model fills what code cannot), and the writes run through "
+             "the spatial gate under the lane's conflict policy. An anchor point works like a redline comment's "
+             "arrow: object_at and the lookups start there and points are filled from it; without one the model "
+             "guesses where. A step nobody could fill fails the run with the reason; fix its JSON on the card "
+             "and Run again. Every plan is recorded in the redline label set (source 'prompt') for the "
+             "fine-tune. Typed scripts cannot carry a prompt; this block is for the browser and the API."),
+    "expand": "prompt",   # planned or executed at its turn; see _run_prompt_block in server.py
+    "fields": [
+        {"name": "prompt", "label": "Prompt", "type": "prompt",
+         "help": "What to do, in your words: 'move the hydrant 20 ft north', \"put a note 'SEE DETAIL 3' here\"."},
+        {"name": "anchor", "label": "Anchor x,y", "type": "point", "optional": True,
+         "help": "Model feet. The spot the prompt is about: fills x/y and gives the model what is drawn there."},
+        {"name": "plan", "label": "Plan", "type": "json", "optional": True, "hidden": True,
+         "help": "Filled by the run; shown as the step list under the fields."},
+    ],
+})
+
 BLOCK_SPECS.append({
     "type": "cut_grading_sheets",
     "label": "Cut Grading Sheets",

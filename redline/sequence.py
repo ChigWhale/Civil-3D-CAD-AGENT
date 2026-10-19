@@ -30,7 +30,9 @@ Rules:
 1. Use names from TOOLS only, spelled exactly.
 2. 1 to 8 tools, in the order you would call them.
 3. When the comment is about an existing object (move it, change it, delete it, label it), start with
-   a lookup such as find_entities or describe_location, then the tools that change the drawing.
+   object_at (the object under the comment's arrow), then the tools that change the drawing. Use
+   nearby to see everything around a spot, find_entities for every object of one kind, and
+   describe_location to understand a place before drawing something new there.
 4. Always answer with at least one tool, even when the comment is unclear; pick the closest fit.
 Answer as JSON: {"tools": ["first_tool", "second_tool"]}"""
 
@@ -51,14 +53,20 @@ def load_examples(path: str | None = None) -> list:
     return [e for e in data if isinstance(e, dict) and e.get("comment") and e.get("tools")]
 
 
-def build_user_prompt(comment, tools_text: str, examples: list | None = None, retry_error: str | None = None) -> str:
-    parts = ["TOOLS:", tools_text, ""]
-    if examples:
-        parts.append("EXAMPLES:")
-        for e in examples:
-            kind = f" kind={e.get('kind')}" if e.get("kind") else ""
-            parts.append(f'comment: text="{e["comment"]}"{kind} -> tools: {", ".join(e["tools"])}')
-        parts.append("")
+def build_user_prompt(comment, tools_text: str, examples: list | None = None, retry_error: str | None = None,
+                      mode: str = "full") -> str:
+    """The user message. mode "full" carries the tool list and the few-shot
+    examples; "short" carries the comment line only, the prompt a model
+    fine-tuned on this task (finetune/) is trained and served on."""
+    parts = []
+    if mode != "short":
+        parts += ["TOOLS:", tools_text, ""]
+        if examples:
+            parts.append("EXAMPLES:")
+            for e in examples:
+                kind = f" kind={e.get('kind')}" if e.get("kind") else ""
+                parts.append(f'comment: text="{e["comment"]}"{kind} -> tools: {", ".join(e["tools"])}')
+            parts.append("")
     text = str(comment.text).replace('"', "'")
     parts.append(f'COMMENT: text="{text}" kind={comment.kind} confidence={float(comment.confidence):.2f}')
     if retry_error:
@@ -105,17 +113,22 @@ def clean(reply: str, names: list) -> tuple:
     return known[:MAX_TOOLS], unknown
 
 
-def sequence(comment, backend, tools_text: str, names: list, examples: list | None = None, log=None) -> ToolSequence:
+def sequence(comment, backend, tools_text: str, names: list, examples: list | None = None, log=None,
+             system_prompt: str | None = None, mode: str = "full") -> ToolSequence:
+    """`system_prompt` lets another caller (the dashboard's prompt block, where
+    the text is an instruction typed by the user, not a reviewer's comment)
+    keep this parsing and retry while framing the task its own way. `mode`
+    is the prompt shape (see build_user_prompt)."""
     out = ToolSequence(comment_id=comment.id, model=getattr(backend, "name", ""))
     schema = answer_schema(names)
     error = None
     for attempt in (1, 2):
         out.attempt = attempt
-        prompt = build_user_prompt(comment, tools_text, examples, retry_error=error)
+        prompt = build_user_prompt(comment, tools_text, examples, retry_error=error, mode=mode)
         out.prompt_chars = len(prompt)
         t0 = time.time()
         try:
-            reply = backend.complete(SYSTEM_PROMPT, prompt, schema)
+            reply = backend.complete(system_prompt or SYSTEM_PROMPT, prompt, schema)
         except ModelError as e:
             out.latency_s += time.time() - t0
             out.error = f"model_error: {str(e)[:300]}"
@@ -142,13 +155,13 @@ class FakeSequencer:
     because this stage never skips."""
     name = "fake"
     DEFAULT_RULES = [
-        {"match": "move hyd", "tools": ["find_entities", "move_entities"]},
-        {"match": "dr14", "tools": ["find_entities", "edit_text"]},
-        {"match": "change to", "tools": ["find_entities", "edit_text"]},
-        {"match": "add inlet", "tools": ["draw_shape", "draw_leader"]},
-        {"match": "label", "tools": ["draw_leader"]},
-        {"match": "connect", "tools": ["draw_polyline"]},
-        {"match": "delete", "tools": ["find_entities", "delete_objects"]},
+        {"match": "move hyd", "tools": ["object_at", "move_entities"]},
+        {"match": "dr14", "tools": ["object_at", "edit_text"]},
+        {"match": "change to", "tools": ["object_at", "edit_text"]},
+        {"match": "add inlet", "tools": ["describe_location", "draw_shape", "draw_leader"]},
+        {"match": "label", "tools": ["object_at", "draw_leader"]},
+        {"match": "connect", "tools": ["object_at", "draw_polyline"]},
+        {"match": "delete", "tools": ["object_at", "delete_objects"]},
         {"match": "fix", "tools": ["space_labels"]},
     ]
 

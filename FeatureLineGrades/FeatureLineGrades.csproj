@@ -1,0 +1,67 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Labels only. This DLL holds the FLGRADES command and nothing else: it reads feature line
+    geometry and draws transient grade text. It has no command that writes elevations.
+    The shared sources are linked from FeatureLineSync; FeatureLineWriter.cs, SyncPlanner.cs
+    and Commands.cs (FLSYNC / FLEXPORT / FLIMPORT) are deliberately NOT included.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>FeatureLineGrades</AssemblyName>
+    <RootNamespace>FeatureLineSync</RootNamespace>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <Platforms>AnyCPU;x64</Platforms>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="PlugIn.cs" />
+    <Compile Include="..\FeatureLineSync\SnapshotModel.cs" Link="SnapshotModel.cs" />
+    <Compile Include="..\FeatureLineSync\FlGeometry.cs" Link="FlGeometry.cs" />
+    <Compile Include="..\FeatureLineSync\FeatureLineReader.cs" Link="FeatureLineReader.cs" />
+    <Compile Include="..\FeatureLineSync\GradeLabels.cs" Link="GradeLabels.cs" />
+    <Compile Include="..\FeatureLineSync\GradeOverlay.cs" Link="GradeOverlay.cs" />
+  </ItemGroup>
+
+  <!-- Auto-detect the Civil 3D installation (same convention as CADAgent.csproj) -->
+  <PropertyGroup>
+    <AutoCADPath Condition="'$(AutoCADPath)' == ''">$([System.IO.Directory]::GetDirectories('C:\Program Files\Autodesk','AutoCAD 20*')[0])</AutoCADPath>
+    <Civil3DPath>$(AutoCADPath)\C3D</Civil3DPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="acdbmgd">
+      <HintPath>$(AutoCADPath)\acdbmgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="acmgd">
+      <HintPath>$(AutoCADPath)\acmgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="accoremgd">
+      <HintPath>$(AutoCADPath)\accoremgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="AeccDbMgd">
+      <HintPath>$(Civil3DPath)\AeccDbMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="AecBaseMgd">
+      <HintPath>$(AutoCADPath)\ACA\AecBaseMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Drop the DLL next to CADAgent.dll so one NETLOAD folder holds every plug-in -->
+  <Target Name="CopyNextToCadAgent" AfterTargets="Build" Condition="Exists('..\bin\Debug\net10.0-windows')">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="..\bin\Debug\net10.0-windows" ContinueOnError="true" />
+  </Target>
+
+</Project>

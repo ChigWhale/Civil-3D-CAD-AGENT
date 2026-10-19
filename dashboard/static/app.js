@@ -336,11 +336,16 @@ function renderBlock(lane, block, index) {
     for (const field of spec.fields) {
       params.appendChild(renderField(lane, block, field));
     }
+    // the prompt block shows its plan (the steps the first Run made) under the fields
+    if (spec.expand === "prompt") el.appendChild(renderPlan(lane, block));
   }
   return el;
 }
 
 function renderField(lane, block, field) {
+  // a field the server fills and the card shows some other way (the prompt block's plan)
+  if (field.hidden) return document.createDocumentFragment();
+
   const wrap = document.createElement("label");
   wrap.className = `param param-${field.type}`;
 
@@ -442,6 +447,11 @@ function renderField(lane, block, field) {
     input.rows = 2;
     input.placeholder = optionalBlank ? '{"TAG": "value"} (optional)' : "JSON";
     input.value = value;
+  } else if (field.type === "prompt") {
+    input = document.createElement("textarea");
+    input.rows = 3;
+    input.placeholder = "e.g. move the hydrant 20 ft north";
+    input.value = value;
   } else if (field.type === "number" || field.type === "int" || field.type === "color") {
     input = document.createElement("input");
     input.type = "number";
@@ -460,6 +470,11 @@ function renderField(lane, block, field) {
   input.addEventListener("input", () => {
     block.params[field.name] = input.value;
     if (swatch) paintSwatch(swatch, input.value);
+    if (block.type === "prompt" && planOf(block)) {
+      // the plan was made for other words or another spot: it no longer applies
+      block.params.plan = "";
+      refreshPlan(lane, block);
+    }
     saveSequence(lane);
   });
 
@@ -471,6 +486,188 @@ function renderField(lane, block, field) {
 
   wrap.appendChild(input);
   return wrap;
+}
+
+// ── The prompt block's plan ───────────────────────────────────────────────────
+//
+// One Run does it all: the model names the tools, helpers and the model fill
+// their parameters, the lookups run, the plan comes back in a prompt_planned
+// event, and the writes execute at once; prompt_executed brings the outcome.
+// The plan is kept in the block's "plan" param and shown here step by step:
+// tool, who filled it, its status, the parameters, what a lookup found and
+// what a write did. A plan that needed a person (a step nobody could fill)
+// stays editable: fix the JSON and Run executes it as it is. Editing the
+// prompt or the anchor, or pressing Re-plan, drops the plan; an executed plan
+// is planned afresh on the next Run.
+
+function planOf(block) {
+  const p = block.params && block.params.plan;
+  return p && typeof p === "object" && Array.isArray(p.steps) ? p : null;
+}
+
+/** Redraws one block's plan panel in place (the fields keep their focus). */
+function refreshPlan(lane, block) {
+  const card = blockCard(lane, block.uid);
+  if (!card) return;
+  const fresh = renderPlan(lane, block);
+  const old = card.querySelector(".block-plan");
+  if (old) old.replaceWith(fresh);
+  else card.appendChild(fresh);
+}
+
+function chip(text, cls) {
+  const s = document.createElement("span");
+  s.className = `chip ${cls || ""}`;
+  s.textContent = text;
+  return s;
+}
+
+const OPEN_STEP_STATUSES = ["planned", "needs_fill", "ran"];
+
+/** A person edited or removed a step: the plan is ready again once every
+ *  remaining step is either planned, to be filled at run time, or already ran. */
+function recomputePlanStatus(plan) {
+  if (!plan || plan.status === "executed" || plan.status === "failed") return;
+  const open = plan.steps.filter((s) => !OPEN_STEP_STATUSES.includes(s.status));
+  if (!open.length) {
+    plan.status = "ready";
+    plan.reason = null;
+  }
+}
+
+function paintPlanStatus(box, plan) {
+  const head = box.querySelector(".plan-head");
+  if (!head) return;
+  const status = head.querySelector(".chip.plan-status");
+  if (status) {
+    status.textContent = String(plan.status).replace("_", " ");
+    status.className = `chip plan-status status-${plan.status}`;
+  }
+  const why = head.querySelector(".plan-reason");
+  if (why) why.textContent = planReasonText(plan);
+}
+
+function planReasonText(plan) {
+  if (plan.reason) return plan.reason;
+  if (plan.status === "ready") return "not executed yet — Run executes these steps as they are";
+  if (plan.status === "executed") return "done — the next Run plans the prompt again";
+  return "";
+}
+
+function renderPlan(lane, block) {
+  const box = document.createElement("div");
+  box.className = "block-plan";
+  const plan = planOf(block);
+  if (!plan) {
+    const hint = document.createElement("p");
+    hint.className = "plan-hint";
+    hint.textContent = "Run plans this prompt, shows the steps here, and executes them.";
+    box.appendChild(hint);
+    return box;
+  }
+  const frozen = plan.status === "executed" || plan.status === "failed";
+
+  const head = document.createElement("div");
+  head.className = "plan-head";
+  head.appendChild(chip(String(plan.status).replace("_", " "), `plan-status status-${plan.status}`));
+  if (plan.model) head.appendChild(chip(plan.model, "model"));
+  const why = document.createElement("span");
+  why.className = "plan-reason";
+  why.textContent = planReasonText(plan);
+  head.appendChild(why);
+  const replan = document.createElement("button");
+  replan.className = "block-btn plan-replan";
+  replan.textContent = "Re-plan";
+  replan.title = "Drop this plan; the next Run plans the prompt again";
+  replan.addEventListener("click", () => {
+    block.params.plan = "";
+    saveSequence(lane);
+    refreshPlan(lane, block);
+  });
+  head.appendChild(replan);
+  box.appendChild(head);
+
+  const list = document.createElement("ol");
+  list.className = "plan-steps";
+  plan.steps.forEach((step, index) => list.appendChild(renderPlanStep(lane, block, plan, step, index, frozen, box)));
+  box.appendChild(list);
+  return box;
+}
+
+function renderPlanStep(lane, block, plan, step, index, frozen, box) {
+  const li = document.createElement("li");
+  li.className = `plan-step ${step.role} st-${step.status}`;
+
+  const head = document.createElement("div");
+  head.className = "plan-step-head";
+  const n = document.createElement("span");
+  n.className = "plan-n";
+  n.textContent = `${index + 1}.`;
+  const tool = document.createElement("span");
+  tool.className = "plan-tool";
+  tool.textContent = step.tool;
+  const by = chip(step.filled_by || "", `by-${step.filled_by}`);
+  const st = chip(String(step.status || "").replace("_", " "), `status-${step.status}`);
+  head.append(n, tool, chip(step.role, `role-${step.role}`), by, st);
+  if (step.helper_note) {
+    const note = document.createElement("span");
+    note.className = "plan-note";
+    note.textContent = step.helper_note;
+    head.appendChild(note);
+  }
+  if (!frozen) {
+    const del = document.createElement("button");
+    del.className = "block-btn plan-del";
+    del.title = "Remove this step from the plan";
+    del.textContent = "×";
+    del.addEventListener("click", () => {
+      plan.steps.splice(index, 1);
+      plan.steps.forEach((s, i) => { s.n = i + 1; });
+      recomputePlanStatus(plan);
+      saveSequence(lane);
+      refreshPlan(lane, block);
+    });
+    head.appendChild(del);
+  }
+  li.appendChild(head);
+
+  const params = document.createElement("textarea");
+  params.className = "plan-params";
+  params.rows = 1;
+  params.value = JSON.stringify(step.params || {});
+  params.readOnly = frozen;
+  params.title = frozen ? "this plan already ran" : "the parameters as JSON — edit, then Run";
+  params.addEventListener("input", () => {
+    let parsed = null;
+    try { parsed = JSON.parse(params.value); } catch (e) { parsed = null; }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      params.classList.add("invalid");
+      return;
+    }
+    params.classList.remove("invalid");
+    step.params = parsed;
+    step.filled_by = "human";
+    step.missing = [];
+    if (step.status === "needs_fill" || step.status === "not_filled" || step.status === "failed") step.status = "planned";
+    recomputePlanStatus(plan);
+    by.textContent = "human";
+    by.className = "chip by-human";
+    st.textContent = String(step.status).replace("_", " ");
+    st.className = `chip status-${step.status}`;
+    li.className = `plan-step ${step.role} st-${step.status}`;
+    paintPlanStatus(box, plan);
+    saveSequence(lane);
+  });
+  li.appendChild(params);
+
+  const out = document.createElement("div");
+  out.className = `plan-result ${step.error ? "error" : ""}`;
+  out.textContent = step.error
+    ? `error: ${step.error}`
+    : step.result_preview
+      || (step.missing && step.missing.length ? `filled at run time: ${step.missing.join(", ")}` : "");
+  if (out.textContent) li.appendChild(out);
+  return li;
 }
 
 /** Per-lane cache of drawing-sourced option lists (currently alignments).
@@ -766,6 +963,21 @@ function handleEvent(event) {
     setRunStatus(lane, `running 0/${event.total}`, "");
     lane.runTotal = event.total;
     lane.runDone = 0;
+    lane.promptMessage = null;
+    return;
+  }
+  if (event.type === "prompt_planned" || event.type === "prompt_executed") {
+    // The prompt block's plan (or its outcome) comes back: it lives in the
+    // block's params so the next Run sends up exactly what the card shows.
+    const block = lane.blocks.find((b) => b.uid === event.block);
+    if (block) {
+      block.params.plan = event.plan;
+      saveSequence(lane);
+      refreshPlan(lane, block);
+    }
+    if (event.ok === false) addLogEntry(lane, { tool: "prompt", _ts: event._ts, warning: event.message }, "warning");
+    else addLogEntry(lane, { tool: "prompt", _ts: event._ts, result: event.message, duration_ms: 0 }, "ok");
+    lane.promptMessage = event.message;
     return;
   }
   if (event.type === "run_paused") {
@@ -783,7 +995,8 @@ function handleEvent(event) {
   }
   if (event.type === "run_finished") {
     setRunning(lane, false);
-    setRunStatus(lane, `done — ${event.completed} command(s)`, "ok");
+    setRunStatus(lane, lane.promptMessage || `done — ${event.completed} command(s)`, "ok");
+    lane.promptMessage = null;
     return;
   }
   if (event.type === "run_stopped") {
@@ -852,7 +1065,8 @@ function handleEvent(event) {
     }
     addLogEntry(lane, event, "finished");
 
-    if (lane.runTotal) {
+    // a prompt block's inner tool calls are steps within one command, not commands
+    if (lane.runTotal && !event.inner) {
       lane.runDone = (lane.runDone || 0) + 1;
       setRunStatus(lane, `running ${lane.runDone}/${lane.runTotal}`, "");
     }

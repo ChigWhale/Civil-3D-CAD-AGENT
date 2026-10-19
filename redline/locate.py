@@ -17,6 +17,8 @@ from .paper_index import PaperIndex
 from .transform import viewport_at
 from .types import Located
 
+PICK_TOLERANCE_FT = 5.0     # floor: how far from the arrow tip an object may be and still be "the one it points at"
+PICK_TOLERANCE_IN = 0.15    # ... and on paper, scaled by the viewport (see pick_tolerance)
 NEAREST_TAGS = ("hydrant", "appurtenance", "fitting", "water", "sanitary", "storm", "structure", "pipe", "curb",
                 "lot_line", "pad", "driveway", "swale", "label", "text", "block", "alignment", "easement", "right_of_way")
 FAMILY_PLAN_TYPE = {"water": "water", "sanitary": "sanitary", "storm": "storm", "grading": "grading",
@@ -68,12 +70,23 @@ def _points_near(items, key, xy, radius, limit, layers, frozen):
     return out[:limit]
 
 
+def pick_tolerance(feet_per_inch: float | None) -> float:
+    """How far from the arrow tip the picked object may be: a hand-placed
+    tip is good to about 0.15 in on paper, so the tolerance grows with the
+    plot scale (6 ft at 1"=40', 15 ft at 1"=100'), never below the floor."""
+    if not feet_per_inch:
+        return PICK_TOLERANCE_FT
+    return round(max(PICK_TOLERANCE_FT, PICK_TOLERANCE_IN * float(feet_per_inch)), 2)
+
+
 def comment_context(index, data: dict, model_xy, radius: float = 100.0, frozen_layers=None,
-                    paper_index: PaperIndex | None = None, paper_xy=None, layers: dict | None = None) -> dict:
+                    paper_index: PaperIndex | None = None, paper_xy=None, layers: dict | None = None,
+                    pick_tolerance_ft: float | None = None) -> dict:
     x, y = float(model_xy[0]), float(model_xy[1])
     layers = layers if layers is not None else layer_map(data)
     frozen = {str(f).lower() for f in (frozen_layers or [])}
-    ctx = {"model_xy": [round(x, 2), round(y, 2)], "radius_ft": radius}
+    tol = pick_tolerance_ft or PICK_TOLERANCE_FT
+    ctx = {"model_xy": [round(x, 2), round(y, 2)], "radius_ft": radius, "pick_tolerance_ft": tol}
     try:
         loc = index.locate(x, y)
         ctx["cell"] = index.describe(loc["key"])
@@ -114,6 +127,15 @@ def comment_context(index, data: dict, model_xy, radius: float = 100.0, frozen_l
         ctx["inside"] = []
     ctx["labels"] = _points_near(data.get("labels"), "anchor", (x, y), radius, 6, layers, frozen)
     ctx["texts"] = _points_near(data.get("texts"), "position", (x, y), radius, 6, layers, frozen)
+    # the objects themselves, with geometry: what the parameter filler works from
+    try:
+        import spatial_summary
+        lookup = spatial_summary.by_handle(data)
+        ctx["pick"] = spatial_summary.object_at(data, index, (x, y), tolerance=tol, frozen=frozen, lookup=lookup)
+        ctx["objects"] = spatial_summary.nearby(data, index, (x, y), radius=radius, limit=8, frozen=frozen, lookup=lookup)["objects"]
+    except Exception as e:      # the digest must never fail the comment
+        ctx["pick"] = {"object": None, "labels": [], "candidates": [], "error": str(e)}
+        ctx["objects"] = []
     if paper_index is not None and paper_xy is not None:
         ctx["paper_texts"] = paper_index.texts_near(paper_xy, radius_in=3.0)
         ctx["paper_decimated"] = paper_index.decimated
@@ -164,7 +186,8 @@ def locate_point(comment, anchor_px, page_to_paper, viewports, index, data, pape
     out.model_xy = [round(X, 3), round(Y, 3)]
     frozen = (frozen_by_handle or {}).get(vp.handle) or []
     out.context = comment_context(index, data, (X, Y), radius=radius, frozen_layers=frozen,
-                                  paper_index=paper_index, paper_xy=(px, py), layers=layers)
+                                  paper_index=paper_index, paper_xy=(px, py), layers=layers,
+                                  pick_tolerance_ft=pick_tolerance(vp.feet_per_inch()))
     out.context["viewport"] = {"handle": vp.handle, "scale_text": f"1\"={1.0 / vp.scale:.0f}'",
                                "twist_deg": vp.twist_deg}
     return out

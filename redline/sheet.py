@@ -111,13 +111,47 @@ def _has_print(tile, min_fraction: float = 0.0005) -> bool:
     return float(dark.mean()) >= min_fraction
 
 
+def title_from_text_layer(pdf_path: str, page_no: int) -> TitleBlockRead:
+    """The title block parsed from the PDF's own text, when it has any. A
+    sheet plotted from CAD (what Bluebeam marks up) carries the plot stamp
+    as real text, so this is exact and costs no model call. A scan has no
+    text layer and yields an empty read; so does any failure."""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(pdf_path)
+        page = reader.pages[int(page_no) - 1]
+        text = page.extract_text() or ""
+    except Exception:
+        return TitleBlockRead()
+    read = parse_title_text(text)
+    if read.printed_file or read.sheet_no:
+        read.how = "text_layer"
+    return read
+
+
+def _oriented(img) -> list:
+    """The orientations a strip is read in. A strip taller than it is wide
+    carries text running along it (a plot stamp up the left edge reads
+    bottom-to-top), so it is turned to landscape first: clockwise, then
+    counter-clockwise. A landscape strip is read as it is."""
+    if img.height <= img.width:
+        return [img]
+    from PIL import Image
+    return [img.transpose(Image.Transpose.ROTATE_270), img.transpose(Image.Transpose.ROTATE_90)]
+
+
 def read_title_block(page, ocr, settings, out_dir: str | None = None) -> TitleBlockRead:
-    """OCR the title strips (page fractions in settings.title_rects) and parse.
+    """The title block: from the PDF's text layer when it has one, else OCR
+    of the title strips (page fractions in settings.title_rects), parsed.
 
     Each strip is rendered at settings.title_dpi and read in tiles no longer
     than settings.max_image_px, since one call with a whole 24 in strip does
     not fit a small model's context. Reading stops early once a drawing file
     name and a sheet number have both been seen."""
+    if getattr(page, "pdf", None) and os.path.isfile(str(page.pdf)):
+        read = title_from_text_layer(page.pdf, page.page_no)
+        if read.how == "text_layer":
+            return read
     texts, crops = [], []
     dpi = getattr(settings, "title_dpi", None) or settings.crop_dpi
     max_px = getattr(settings, "max_image_px", 0)
@@ -148,16 +182,24 @@ def read_title_block(page, ocr, settings, out_dir: str | None = None) -> TitleBl
             path = os.path.join(out_dir, f"{page.id}_title{i}.png")
             img.save(path)
             crops.append(path)
-        for tile in _tiles(img, max_px):
-            if not _has_print(tile):
-                continue                      # blank paper: no model call
-            texts.append(ocr.read_text(tile, hint=TITLE_HINT))
+        for turned in _oriented(img):
+            if done:
+                break
+            for tile in _tiles(turned, max_px):
+                if not _has_print(tile):
+                    continue                      # blank paper: no model call
+                texts.append(ocr.read_text(tile, hint=TITLE_HINT))
+                so_far = parse_title_text("\n".join(texts))
+                if so_far.printed_file and so_far.sheet_no:
+                    done = True
+                    break
+            # the other orientation is only worth its model calls when this one read nothing useful
             so_far = parse_title_text("\n".join(texts))
-            if so_far.printed_file and so_far.sheet_no:
-                done = True
+            if so_far.printed_file or so_far.sheet_no:
                 break
     read = parse_title_text("\n".join(texts))
     read.crops = crops
+    read.how = "vision" if texts else None
     return read
 
 

@@ -50,10 +50,112 @@ Three commands:
     python -m redline review --text "MOVE HYD 20' N" --text "DELETE THIS LINE"
                                                             # typed comments, no scan: tries the model alone
     python -m redline markups marked.pdf [more.pdf ...]     # Bluebeam text boxes: no vision model, same output
+    python -m redline markups marked.pdf --locate           # also open the drawing printed on the sheet and
+    python -m redline review scans.pdf --locate             #   place each comment in model space (nothing drawn)
+    python -m redline markups marked.pdf --dry-run          # ... and fill every tool's parameters; lookups run, writes do not
+    python -m redline markups marked.pdf --run [--on-conflict pause|warn]
+                                                            # ... and run the tools, writes included, through the spatial gate
 
 `ocr` (optical character recognition, reading text out of an image) is
 accepted as another name for `transcribe`; `bluebeam` for `markups`. The
 command line is the only way to run the comment automation for now.
+
+## Opening the drawing (`--locate`)
+
+With `--locate`, both `review` and `markups` read the title block, open the
+drawing it names in Civil 3D, pick the layout the sheet was plotted from,
+and place every comment in model space before the sequencer runs. Nothing
+is drawn; the drawing is only opened. The sequencer is not told about the
+location yet.
+
+- **The path.** A PDF plotted from CAD (what Bluebeam marks up) carries the
+  plot stamp as real text, so it is read from the PDF's text layer with no
+  model call (`sheet.title_from_text_layer`). A scan has no text layer; its
+  title strips are cropped by `CAD_REDLINE_TITLE_RECT` (default: the left
+  edge first, then the right edge and the bottom edge) and read by the vision
+  model. A strip taller than it is wide, like a plot stamp up the left edge,
+  is turned to landscape before it is read.
+- **The drawing.** Candidates are the printed path if it exists on this
+  machine, the drawings Civil 3D already has open, and `.dwg` files under
+  `CAD_PROJECT_ROOT` whose name matches. Two candidates within 0.05 of each
+  other is `ambiguous_drawing` and the page is reported, not guessed. The
+  best candidate is opened by asking the plugin for its snapshot.
+- **The layout** is the one whose title block `#` matches the sheet number.
+- **The place.** Page pixels go to paper inches (plot paper size and
+  rotation; a border fit when `CAD_REDLINE_BORDER_RECT` is set), then through
+  the viewport to model feet. For a Bluebeam callout the anchor is the
+  leader's arrowhead; for handwriting it is the arrow tip the ink detector
+  found, else the centre of the writing.
+- **The report** adds, per page, the drawing opened and the layout, and per
+  comment a `where` column plus a line with the spatial index's sentence for
+  that spot (region, alignment station and side, what is drawn there).
+  Training rows carry the same under `located`.
+
+Civil 3D must be running with the plugin on `CAD_PLUGIN_BASE` (port 5199).
+If it is not reachable the pages are reported as unmatched and the run
+still completes.
+
+## Filling the parameters and running the tools (`--dry-run`, `--run`)
+
+The last two steps of the workflow. Both imply `--locate`. For every
+located comment, the tools in its sequence are taken **one at a time**:
+
+1. `fill.py` asks the language model for that one tool's parameters. It is
+   shown the comment, the located point and the viewport's model window,
+   the digest of what is around the point (with handles), the whole
+   sequence with the current step marked, the real results of the steps
+   already run, and the tool's own description and parameter schema from
+   the MCP registry. Code fills what it can first (the located point for
+   `x`/`y`). The answer is checked before anything runs: every required
+   parameter present and typed; **every handle must come from the digest
+   or an earlier step's result**, never typed by the model; every
+   coordinate must sit inside the sheet's model window (with slack). One
+   retry with the error stated, then the comment is `needs_human`.
+2. `act.py` calls the tool: the MCP server's own function, in this
+   process, with the dashboard assigned to the drawing (created with source
+   `redline` when none is). A read-only tool (`find_entities`,
+   `describe_location`, `select_entities` ...) runs in a dry run too, and
+   the handles it returns are what the next step may use. A write runs only
+   with `--run`, and goes through the same spatial gate as a call from
+   Claude Desktop: a conflicting write comes back blocked instead of drawn.
+   `--on-conflict pause` (default) records that and stops the comment;
+   `warn` acknowledges the conflicts and repeats the call. A tool error
+   (a missing radius, an unknown colour name) is fed back to the model
+   once, which refills the step with the error in front of it and runs it
+   again; the same error twice fails the comment with both tries recorded.
+   Colour names are turned into ACI numbers before a call.
+
+**Picking the object.** A reviewer's arrow tip is a pick point, and two
+read-only tools answer what is there without a layer tag: `object_at`
+returns the one object under the point (type, layer, name or text, geometry
+such as a line's endpoints or a block's attributes, its labels, and the
+next few candidates that were also close), and `nearby` lists everything
+within reach, nearest first. Labels never win a pick (they are reported
+under the object they belong to), and a point object beats a line passing
+through the same spot. The digest built around every located comment
+already carries both (`pick` and `objects`), so the filler sees the
+geometry before it is asked for a parameter; the worked examples start
+object comments with `object_at`. `describe_location` now names its
+nearest objects and `find_entities` works with no tag. The same helper is
+`spatial_summary.py` at the repo root.
+
+The pick tolerance follows the plot scale: about 0.15 in on paper, so 6 ft
+at 1"=40' and 15 ft at 1"=100', never under 5 ft. When nothing is within
+it, `object_at` still lists the nearest objects within ten tolerances as
+candidates and the closed shapes the point is inside (`enclosing`, for
+"draw X inside"), but a write may not name a candidate farther than three
+tolerances away: a delete 100 ft from where the reviewer pointed is a
+guess, so that comment goes to a person with the candidates in the report.
+
+The report lists, per comment, every tool call with its parameters and what
+happened (`ok`, `not run (dry)`, `blocked`, `failed`), and the summary
+counts `done`, `dry_run`, `needs_human`, `paused`, `failed`,
+`not_located`. Training rows carry the parameters under `actions` with a
+`human_params` slot for a person's correction.
+
+Order of trust: `--dry-run` on every new sheet and read the parameters,
+then `--run` on a copy of the drawing before a production file. The
+dashboard records every run; Civil 3D's undo is the way back.
 
 Output goes to `dashboard/uploads/reviews/<review_id>/`: `report.md` (one
 row per comment with its tool sequence), `report.json`, `training.jsonl`,
@@ -107,6 +209,35 @@ A **flattened** PDF has no annotations left: the command reports zero text
 boxes and says so. Ask reviewers for the unflattened file, or for Bluebeam's
 "allow markup recovery" when they flatten.
 
+## The results window, labels and metrics
+
+Every run ends by opening its results in a window (`view.py`: a page the
+dashboard serves at `/redline.html`, opened as an Edge app window; `--no-view`
+or `CAD_REDLINE_VIEW=0` prevents it; `python -m redline view` reopens a run).
+The page shows the sheet with a pin per comment, every comment's text,
+placement, pick, chain, filled parameters (read-only), outcome and doability,
+and a Metrics tab. Labelling happens there: verdict buttons and a Scratch-like
+tray of tool-name blocks (`labels.py` stores them in the run's `labels.json`
+and mirrors them into `training.jsonl`; no parameters, ever).
+
+Every tool call is classified (`tools.py`): a **bin** (lookup, draw, modify,
+text, layer, block, sheet, civil) and a **risk tier** (read, draw, modify,
+delete, design). Before a comment's tools run, `act.py` records its
+**doability**: grounded, action covered, parameters determinable,
+unambiguous. `metrics.py` turns labelled runs into the numbers: coverage and
+precision with Wilson intervals, tool-set P/R/F1, order score, first wrong
+step, step accuracy by position, risk–coverage, calibration (ECE), pass^k
+over repeated runs, Cohen's kappa between labellers. `COMMANDS.md` has the
+glossary.
+
+**The label set** (`labelset.py`, `python -m redline.labelset`) is the
+standalone cousin for fine-tuning data: no run, no metrics. A person types
+the comment's text and drags tool-name blocks into its chain in a window of
+its own (`/labelset.html`, the same library and tray). Examples live in
+`labelset.json` with `labelset.jsonl` rewritten beside it on every save
+(`CAD_REDLINE_LABELSET_DIR`, else `labelset` under the review folder) until
+deleted or discarded.
+
 ## Before trusting a review
 
 1. `python -m redline review --text "..."` with a few comments you know the
@@ -120,19 +251,22 @@ boxes and says so. Ask reviewers for the unflattened file, or for Bluebeam's
 ## Parked for the parameter stage
 
 `pipeline.review_located()` is the earlier full run and is not reachable from
-the command line. It and its modules are kept, unchanged, for when the
-tool-name stage is good enough to add parameters: `sheet.py` (which drawing
-and layout the sheet is), `transform.py` (page pixels to paper inches to
-model feet through the viewport), `locate.py` and `paper_index.py` (what is
-at the point, with handles), `planner.py` (parameterised block chains
-validated by the dashboard), `runner.py` (running them with the conflict
-policy), `directives.py` (sheet-wide starred notes). `tests/run_redline.py`
+the command line. Its opening and locating half (`sheet.py`, `transform.py`,
+`locate.py`, `paper_index.py`) is live behind `--locate`, and `runner.py`'s
+dashboard client is used by `act.py`. What stays parked is `planner.py`
+(one-shot parameterised block chains, superseded by the per-step filler)
+and `directives.py` (sheet-wide starred notes). `tests/run_redline.py`
 still exercises all of it against the stub plugin, so it does not rot.
 
 ## Tests
 
     python tests/test_redline_sequence.py   # vocabulary, parsing, retry, fake backend, typed review
     python tests/test_redline_markups.py    # Bluebeam FreeText reader, rotation mapping, markups review, CLI
+    python tests/test_redline_fill.py       # parameter schemas, validation, handle guard, executor dry/run/blocked/warn
+    python tests/test_spatial_summary.py    # object summaries, the pick (object_at) and nearby, on the stub data
+    python tests/test_redline_metrics.py    # the metrics maths against hand-checked numbers
+    python tests/test_redline_view.py       # labels file and mirror, review-folder guards, payload, window helpers (no browser)
+    python tests/test_redline_labelset.py   # the standalone label set: document, jsonl mirror, validation, export, CLI (no browser)
     python tests/test_redline_transform.py
     python tests/test_redline_marks.py
     python tests/test_redline_sheet.py
@@ -147,13 +281,19 @@ and runs the parked flow too. Everything is forced under `%TEMP%`; the live
 
 ## Fine-tuning
 
-Not yet. `training.jsonl` accumulates, per comment, the text, the kind, the
-tool sequence the model gave, its raw reply and the vocabulary version, with
-`human_tools` / `human_verdict` to be filled in by a person. Consider a LoRA
-on the planner model once there are ten or more verified sequences per
-comment class across two or more projects and the few-shot examples in
-`examples/sequences.json` are clearly short of that. Until then, add
-examples there; it is free and reversible.
+The `finetune/` package (see its README) turns the labels into a model:
+`python -m finetune build` collects the label set and every run row a
+person labelled (`human_tools`, or `human_verdict` "good"), `train` fits a
+LoRA on Qwen2.5-Coder-1.5B-Instruct with a completion-only loss, `deploy`
+merges it, converts it to GGUF and registers it in Ollama as
+`cad-sequencer`, and `eval` scores the stock model and the tuned one on the
+same held-out comments. The tuned model is trained and served on the
+**short prompt** (`CAD_REDLINE_PROMPT=short`: the comment line only, no tool
+list, no examples); the builder warns when a class has fewer than ten
+examples or comes from a single project, which is the point at which the
+few-shot examples in `examples/sequences.json` stop being the cheaper fix.
+Nothing in `redline/` imports torch; the training stack lives in its own
+environment (`python -m finetune setup`).
 
 ## Settings
 
@@ -166,13 +306,19 @@ examples there; it is free and reversible.
 | `CAD_REDLINE_OCR` / `CAD_REDLINE_PLANNER` | `openai` | or `fake` for tests |
 | `CAD_REDLINE_MODEL_TIMEOUT` | 600 | seconds to wait for one model answer |
 | `CAD_REDLINE_DPI` / `CAD_REDLINE_CROP_DPI` | 150 / 300 | page render, crop render |
-| `CAD_REDLINE_TITLE_RECT` | `0.84,0,1,1;0,0.9,1,1` | page fractions holding the title text |
+| `CAD_REDLINE_TITLE_RECT` | `0,0,0.06,1;0.84,0,1,1;0,0.9,1,1` | page fractions holding the title text (left strip, right strip, bottom strip); scans only |
+| `CAD_PLUGIN_BASE` | `http://127.0.0.1:5199` | the Civil 3D plugin (`--locate`) |
+| `CAD_PROJECT_ROOT` | unset | folders searched for `.dwg` files, `;` separated (`--locate`) |
+| `CAD_REDLINE_BORDER_RECT` | unset | border's paper rectangle, inches, for the fit on shrunk scans (`--locate`) |
 | `CAD_REDLINE_SWEEP` | `1` | the model takes a second look for handwriting on page tiles; `0` to skip |
 | `CAD_REDLINE_MIN_AREA` | 0.04 | ink boxes smaller than this (square inches) are specks |
 
-Read only by the parked flow: `CAD_PLUGIN_BASE`, `CAD_DASHBOARD_BASE`,
-`CAD_PROJECT_ROOT`, `CAD_REDLINE_BORDER_RECT`, `CAD_REDLINE_MIN_CONFIDENCE`,
-`CAD_REDLINE_ON_CONFLICT`, `CAD_REDLINE_CONTEXT_RADIUS`.
+`CAD_DASHBOARD_BASE` (default `http://127.0.0.1:8765`) is the dashboard
+server `--dry-run` / `--run` assign the drawing through;
+`CAD_REDLINE_ON_CONFLICT` (`pause` | `warn`) is the default for
+`--on-conflict`; `CAD_REDLINE_CONTEXT_RADIUS` (default 100 ft) sets how far
+around a located comment the digest looks. Read only by the parked flow:
+`CAD_REDLINE_MIN_CONFIDENCE`.
 
 ## What the ink detector records
 

@@ -30,3 +30,6 @@ package/dist/
 cad-agent.json
 install.json
 package/*.log
+
+# Fine-tuning environment (python -m finetune setup)
+.venv-finetune/

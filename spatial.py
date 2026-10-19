@@ -1880,10 +1880,11 @@ class SpatialIndex:
 
     # -- the gate ---------------------------------------------------------------
 
-    def planned_cells(self, payloads: list, handles=None) -> set:
+    def planned_cells(self, payloads: list, handles=None, after: "SpatialIndex | None" = None) -> set:
         """Level-0 cells a set of payloads is expected to change: every cell the
-        proposed geometry passes through, every cell the named handles occupy,
-        and their immediate neighbours."""
+        proposed geometry passes through, every cell the named handles occupy
+        (here, and in `after` for handles the write itself created), and their
+        immediate neighbours."""
         keys = set()
         for _, piece in _payload_pieces(payloads):
             if piece.kind == "pt":
@@ -1894,6 +1895,8 @@ class SpatialIndex:
                     keys.add(key)
         for h in handles or ():
             keys |= self.entity_cells.get(str(h), set())
+            if after is not None:
+                keys |= after.entity_cells.get(str(h), set())
         out = set(keys)
         for k in keys:
             out.update(self._neighbours(k))
@@ -2000,7 +2003,7 @@ class SpatialIndex:
         # boundary) is not a change anyone can see.
         changed = sorted(k for k in set(d["added"]) | set(d["removed"]) | set(d["changed"])
                          if has_content(self, k) or has_content(after, k))
-        expected = self.planned_cells(payloads or [], handles) if (payloads or handles) else None
+        expected = self.planned_cells(payloads or [], handles, after=after) if (payloads or handles) else None
         unexpected = [k for k in changed if expected is not None and k not in expected]
         before_h, after_h = set(self.entity_cells), set(after.entity_cells)
         new = sorted(h for h in after_h - before_h if not h.startswith("payload:"))

@@ -43,6 +43,8 @@ KEYS = {
     "model_base": ("CAD_REDLINE_MODEL_BASE", "http://127.0.0.1:11434/v1"),
     "vlm": ("CAD_REDLINE_VLM", "qwen3-vl:4b-instruct"),
     "llm": ("CAD_REDLINE_LLM", "qwen2.5-coder:7b"),
+    # the dashboard prompt block's model; unset = llm. The slot a fine-tuned model drops into.
+    "prompt_llm": ("CAD_PROMPT_LLM", None),
     "models_dir": ("CAD_MODELS_DIR", None),
     "python": ("CAD_PYTHON", None),
     "packaged": (None, False),
@@ -184,5 +186,5 @@ def describe() -> dict:
     """What every process would resolve right now; for `doctor` commands."""
     return {"config_path": config_path(), "packaged": packaged(), "program_root": PROGRAM_ROOT,
             "package_root": package_root(), "data_dir": data_dir(create=False),
-            **{k: get(k) for k in ("plugin_base", "dashboard_base", "model_base", "vlm", "llm", "version")},
+            **{k: get(k) for k in ("plugin_base", "dashboard_base", "model_base", "vlm", "llm", "prompt_llm", "version")},
             "project_roots": project_roots()}

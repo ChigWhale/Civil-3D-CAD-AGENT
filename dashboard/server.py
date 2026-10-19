@@ -30,7 +30,7 @@ from pathlib import Path
 
 import requests
 from fastapi import FastAPI, File, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 # Works both as a package ("uvicorn dashboard.server:app") and when this file's
@@ -70,7 +70,12 @@ LONG_INTENTS = {"label_grading", "space_labels", "list_surface_label_styles", "l
 # Generated blocks that must read the drawing as EARLIER STEPS of the same run
 # left it (sheets over profile views the run itself draws) are expanded at
 # their turn, not before the run starts.
-DEFERRED_EXPANDERS = {"profile_sheets", "profile_place", "profile_labels"}
+DEFERRED_EXPANDERS = {"profile_sheets", "profile_place", "profile_labels", "prompt"}
+
+# This server's own address as a client last reached it, for the prompt block:
+# its tool calls are the MCP server's functions run in this process, and they
+# resolve the dashboard's drawing over HTTP from the dashboard server -- us.
+_SELF_BASE: str | None = None
 
 BASE_DIR = Path(__file__).resolve().parent
 # Runs, attention items and avatars live here. A server aimed at a stub plugin
@@ -93,6 +98,22 @@ if os.environ.get("CAD_PLUGIN_BASE"):
 _HISTORY_LEN = 400
 
 app = FastAPI(title="CAD Agent Dashboards")
+
+
+@app.middleware("http")
+async def _no_stale_pages(request: Request, call_next):
+    """The page, its script and its stylesheet are revalidated on every load.
+    Without this a browser keeps index.html by its own heuristic (a tenth of
+    the file's age, days for a file months old), and a kept index.html loads
+    the old app.js under the old ?v=, so a new block renders without its UI
+    and the server sees requests the page cannot answer. no-cache still
+    lets the ETag answer 304, so a reload costs nothing."""
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.endswith((".html", ".js", ".css")):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
 
 _history: deque = deque(maxlen=_HISTORY_LEN)
 _clients: set[WebSocket] = set()
@@ -323,6 +344,8 @@ class Run:
         self.verification: dict | None = None
         self.error: str | None = None
         self.decisions: list = []
+        self.prompt_created: list = []   # handles the prompt block's tool calls made or changed (verified by handle)
+        self.prompt_version: str | None = None   # the tool vocabulary the prompt blocks were classified against
         self.created = time.time()
         self.started: float | None = None
         self.finished: float | None = None
@@ -600,7 +623,7 @@ async def list_alignment_names(dashboard_id: str):
 # Bumped whenever the server or its static files change in a way a running
 # instance cannot pick up. cad_mcp_server.py probes /version on startup and
 # treats a server that doesn't answer with this value as stale.
-DASHBOARD_VERSION = "2026-10-07.1"
+DASHBOARD_VERSION = "2026-10-19.4"
 
 
 @app.get("/version")
@@ -1127,6 +1150,10 @@ async def _run_sequence(run: "Run") -> None:
     try:
         run.status = "checking"
         _touch(run)
+        # the tool vocabulary the prompt blocks' plans are checked against
+        has_prompt = any(p.get("intent") == "__expand__" and p.get("expander") == "prompt" for p in commands)
+        if has_prompt:
+            run.prompt_version = await asyncio.to_thread(_prompt_tools_version)
         resolved = []
         for payload in commands:
             if payload.get("intent") == "__expand__" and payload.get("expander") not in DEFERRED_EXPANDERS:
@@ -1139,7 +1166,8 @@ async def _run_sequence(run: "Run") -> None:
         # judge the whole drawing rather than "what the run created". (A grading
         # cut's label steps carry _sheet too: they belong to a sheet.)
         run.sheet_cut = bool(commands) and all(
-            isinstance(p, dict) and ("_sheet" in p or p.get("expander") in DEFERRED_EXPANDERS) for p in commands)
+            isinstance(p, dict) and ("_sheet" in p or (p.get("expander") in DEFERRED_EXPANDERS and p.get("expander") != "prompt"))
+            for p in commands)
 
         # The index from before the run: the gate for every payload, expanded
         # or hand-built, and the "before" half of the post-run check. Built
@@ -1147,10 +1175,13 @@ async def _run_sequence(run: "Run") -> None:
         writes = [p for p in commands
                   if str(p.get("intent") or "") not in spatial.READ_ONLY_INTENTS and p.get("intent") != "__expand__"]
         conflicts = []
-        if writes:
+        # a prompt block writes through the MCP gate, not through payloads:
+        # nothing to check up front, but the "before" index is still wanted
+        # so what it creates can be verified afterwards by handle
+        if writes or has_prompt:
             try:
                 before = (await asyncio.to_thread(spatial_cache.get, file, None, PLUGIN_BASE)).index
-                conflicts = await _warn_conflicts(dashboard_id, "sequence", before, writes)
+                conflicts = await _warn_conflicts(dashboard_id, "sequence", before, writes) if writes else []
             except Exception as e:
                 run.warnings.append(f"dry-run check skipped: {e}")
                 await _broadcast({"type": "run_warning", "dashboard": dashboard_id,
@@ -1172,6 +1203,13 @@ async def _run_sequence(run: "Run") -> None:
         i = 0
         while i < len(commands):
             payload = commands[i]
+            if payload.get("intent") == "__expand__" and payload.get("expander") == "prompt":
+                # the prompt block plans or executes at its turn through the
+                # MCP server's own functions; it never becomes plugin payloads
+                completed += await _run_prompt_block(run, payload, i + 1, len(commands))
+                run.done = completed
+                i += 1
+                continue
             if payload.get("intent") == "__expand__":
                 # deferred: planned against the drawing as the earlier steps left it
                 try:
@@ -1254,10 +1292,10 @@ async def _run_sequence(run: "Run") -> None:
         # Verify first, then announce the outcome: a client woken by
         # run_finished must find the verification already on the record.
         after = None
-        if completed and writes:
+        if completed and (writes or run.prompt_created):
             run.status = "verifying"
             _touch(run)
-            after = await _verify_run(run, before, writes)
+            after = await _verify_run(run, before, writes, handles=run.prompt_created or None)
         if run.checks_spec:
             await _check_run(run, after)
         run.status = outcome
@@ -1280,6 +1318,206 @@ async def _run_sequence(run: "Run") -> None:
 
 _COMPUTE_FIRST = {"label_grading", "space_labels"}
 _RESULT_KEEP = 48_000       # characters of each step's reply kept on the run record
+
+
+# ── The prompt block ──────────────────────────────────────────────────────────
+#
+# prompting/ does the work (compose the tool sequence, fill the parameters,
+# run the steps through redline.act.Executor, record the label); this is the
+# dashboard's side of it: which phase a block is in, the events the browser
+# reads, the run's conflict policy, and the thread boundary. Everything that
+# imports cad_mcp_server, calls a tool, calls the model, reads the spatial
+# cache or writes the label set runs in a worker thread; everything that
+# touches the run, broadcasts, or waits on a decision runs on the loop.
+
+
+def _prompt_tools_version() -> str:
+    from redline import tools
+    return tools.version()
+
+
+async def _run_prompt_block(run: "Run", payload: dict, step_index: int, total: int) -> int:
+    """The prompt block at its turn, start to finish: compose the tool
+    sequence, fill the steps (reads run live), record the plan and hand it to
+    the browser (prompt_planned), then run the plan's writes in order through
+    the Executor, pausing on or stopping at conflicts as the run's policy
+    says, and hand the outcome back (prompt_executed). A block that arrives
+    with a plan still good for its prompt (one a person edited on the card)
+    skips the planning and runs that plan as it is. A plan that needs a
+    person fails the run with the reason. Returns 1 when the block completed;
+    raises to fail the run."""
+    from prompting import backends as prompt_backends, compose as prompt_compose, plan as prompt_plan
+    from prompting import record as prompt_record, run as prompt_run, session as prompt_session
+
+    params = payload.get("params") or {}
+    block_id = payload.get("_block")
+    text = str(params.get("prompt") or "").strip()
+    anchor = params.get("anchor")
+    policy = run.policy["on_conflict"]
+    label = f"{step_index}/{total}"
+
+    why = prompt_plan.why_replan(params, run.prompt_version)
+    if why and isinstance(params.get("plan"), dict):
+        message = f"prompt block: planning again -- {why}"
+        run.warnings.append(message)
+        await _broadcast({"type": "run_warning", "dashboard": run.dashboard, "tool": "prompt",
+                          "message": message, "_ts": time.time()})
+
+    session = await asyncio.to_thread(prompt_session.open, run.dashboard, run.file, policy, _SELF_BASE, PLUGIN_BASE)
+    reason = await asyncio.to_thread(prompt_backends.preflight, session.settings)
+    if reason:
+        raise RuntimeError(f"prompt block: {reason}")
+    try:
+        entry = await asyncio.to_thread(spatial_cache.get, run.file, None, PLUGIN_BASE)
+    except spatial_cache.PluginError as e:
+        raise RuntimeError(f"prompt block: {e}")
+    index, data = entry.index, entry.data
+
+    async def started(tool: str, stage: str, **args) -> float:
+        t0 = time.time()
+        await _broadcast({"type": "tool_call_started", "dashboard": run.dashboard, "tool": tool, "block": block_id,
+                          "inner": True, "args": {"step": label, "stage": stage, **args}, "_ts": t0})
+        return t0
+
+    async def finished(tool: str, t0: float, result="", error=None) -> None:
+        await _broadcast({"type": "tool_call_finished", "dashboard": run.dashboard, "tool": tool, "block": block_id,
+                          "inner": True, "result": str(result or "")[:300], "error": error,
+                          "duration_ms": round((time.time() - t0) * 1000), "_ts": time.time()})
+
+    def record(stage: str, tool: str, ok: bool, error, body, t0: float) -> None:
+        run.results.append({"step": step_index, "tool": tool, "block": block_id, "stage": stage,
+                            "ok": bool(ok), "error": error, "result": json.dumps(body, default=str)[:_RESULT_KEEP],
+                            "duration_ms": round((time.time() - t0) * 1000)})
+
+    # ── plan phase ──────────────────────────────────────────────────────
+    if why is not None:
+        t0 = await started("compose", "plan", prompt=text[:80])
+        seq = await asyncio.to_thread(prompt_compose.compose, text, session.sequencer)
+        seq_info = {"tools": list(seq.tools), "unknown_tools": list(seq.unknown_tools), "error": seq.error,
+                    "attempt": seq.attempt, "latency_s": round(seq.latency_s, 3)}
+        await finished("compose", t0, result=", ".join(seq.tools), error=seq.error)
+        record("plan", "compose", not seq.error, seq.error, seq_info, t0)
+
+        planner = prompt_plan.Planner(text, anchor, seq.tools, session.filler, session.executor, run.dashboard,
+                                      index, data, model=session.model, sequence_info=seq_info)
+        while planner.i < len(planner.names) and not planner.stopped:
+            tool = planner.names[planner.i]
+            t0 = await started(tool, "plan")
+            rec = await asyncio.to_thread(planner.next)
+            if rec is None:
+                break
+            preview = rec["result_preview"] if rec["role"] == "read" else \
+                f"{rec['status']}: {json.dumps(rec['params'], default=str)[:200]}"
+            await finished(tool, t0, result=preview, error=rec.get("error"))
+            record("plan", tool, rec["status"] not in ("not_filled", "failed"), rec.get("error"), rec, t0)
+        plan = planner.plan()
+        if not seq.tools:
+            plan["status"], plan["reason"] = "needs_human", f"no tool sequence: {seq.error or 'the model named no tools'}"
+        if seq.tools:
+            plan["labelset_id"] = await asyncio.to_thread(prompt_record.record_plan, session.settings, text, seq.tools,
+                                                          f"planned by {session.model}; status {plan['status']}")
+        n_write = sum(1 for s in plan["steps"] if s["role"] == "write")
+        if plan["status"] != "ready":
+            message = f"needs a person: {plan['reason']}"
+        elif n_write:
+            message = f"planned {len(plan['steps'])} step(s): {', '.join(s['tool'] for s in plan['steps'])} -- executing"
+        else:
+            message = f"planned {len(plan['steps'])} lookup step(s) and ran them; nothing to write"
+        # a snapshot: the execute phase goes on changing this dict, and the
+        # event history must keep saying what the plan was when it was made
+        await _broadcast({"type": "prompt_planned", "dashboard": run.dashboard, "run": run.id, "block": block_id,
+                          "plan": json.loads(json.dumps(plan, default=str)), "message": message,
+                          "ok": plan["status"] == "ready", "_ts": time.time()})
+        _touch(run)
+        if plan["status"] != "ready":
+            # the card shows the plan and the step that stopped it; the run fails with the reason
+            raise RuntimeError(f"prompt block needs a person: {plan['reason']}")
+        if not n_write:
+            return 1
+    else:
+        plan = params["plan"]
+
+    # ── execute phase ───────────────────────────────────────────────────
+    runner = prompt_run.Runner(plan, text, anchor, session.filler, session.executor, run.dashboard, index, data)
+    pending = runner.pending()
+
+    async def fail(reason: str) -> None:
+        plan["status"], plan["reason"] = "failed", reason
+        plan["executed"] = {"at": time.time(), "run": run.id, "created": list(runner.created),
+                            "steps": _prompt_outcomes(plan)}
+        await asyncio.to_thread(prompt_record.record_outcome, session.settings, plan.get("labelset_id"), f"run failed: {reason}"[:400])
+        await _broadcast({"type": "prompt_executed", "dashboard": run.dashboard, "run": run.id, "block": block_id,
+                          "plan": json.loads(json.dumps(plan, default=str)), "message": f"failed: {reason}",
+                          "ok": False, "_ts": time.time()})
+        _touch(run)
+
+    for _ in range(len(pending)):
+        idx = runner.pending()[0]
+        tool = plan["steps"][idx]["tool"]
+        t0 = await started(tool, "run")
+        out = await asyncio.to_thread(runner.next)
+        if out is None:
+            break
+        if out["status"] == "needs_human":
+            await finished(tool, t0, error=out.get("error"))
+            record("run", tool, False, out.get("error"), _prompt_slim(out), t0)
+            reason = f"{tool}: {out.get('error')}"
+            await fail(reason)
+            raise RuntimeError(reason)
+        if out["status"] == "blocked":
+            found = out.get("blocked") or {}
+            conflicts = list(found.get("conflicts") or [])
+            count = int(found.get("count") or len(conflicts))
+            if policy == "stop":
+                await finished(tool, t0, error=out.get("error"))
+                record("run", tool, False, out.get("error"), _prompt_slim(out), t0)
+                reason = f"stopped at {tool}: {count} conflict(s) ({_conflict_words(conflicts)})"
+                await fail(reason)
+                raise RuntimeError(reason)
+            # pause: the attention queue and a resume with its reason, then the
+            # conflicts acknowledged with that reason and the step repeated
+            # (warn never gets here: the Executor acknowledged and repeated itself)
+            run.resume = asyncio.Event()
+            await _pause_for_decision(run, conflicts)
+            run.status = "running"
+            _touch(run)
+            decision = run.decisions[-1]["reason"] if run.decisions else "resumed"
+            out = await asyncio.to_thread(runner.retry_after_ack, out["idx"], decision)
+            if out["status"] == "blocked":
+                out["status"] = "failed"
+                out["error"] = f"still blocked after the acknowledgement: {out.get('error')}"
+                plan["steps"][out["idx"]].update(status="failed", error=out["error"])
+        await finished(tool, t0, result=out.get("result_preview"), error=out.get("error"))
+        record("run", tool, out["status"] == "ran", out.get("error"), _prompt_slim(out), t0)
+        run.prompt_created.extend(out.get("created") or [])
+        if out["status"] != "ran":
+            reason = f"{tool}: {out.get('error')}"
+            await fail(reason)
+            raise RuntimeError(reason)
+
+    plan["status"] = "executed"
+    plan["reason"] = None
+    plan["executed"] = {"at": time.time(), "run": run.id, "created": list(runner.created), "steps": _prompt_outcomes(plan)}
+    n_created = len(runner.created)
+    if pending:
+        message = f"executed {len(pending)} step(s)" + (f"; {n_created} object(s) created or changed" if n_created else "")
+    else:
+        message = "nothing to write: the plan held lookups only"
+    await asyncio.to_thread(prompt_record.record_outcome, session.settings, plan.get("labelset_id"), f"executed OK: {message}"[:400])
+    await _broadcast({"type": "prompt_executed", "dashboard": run.dashboard, "run": run.id, "block": block_id,
+                      "plan": json.loads(json.dumps(plan, default=str)), "message": message, "ok": True,
+                      "_ts": time.time()})
+    _touch(run)
+    return 1
+
+
+def _prompt_outcomes(plan: dict) -> list:
+    return [{k: s.get(k) for k in ("n", "tool", "status", "error", "result_preview", "created", "conflicts")}
+            for s in plan.get("steps") or [] if s.get("role") == "write" or s.get("status") in ("ran", "failed")]
+
+
+def _prompt_slim(out: dict) -> dict:
+    return {k: v for k, v in out.items() if k not in ("blocked",)}
 
 
 def _truthy(value) -> bool:
@@ -1357,16 +1595,18 @@ async def _pause_for_decision(run: "Run", conflicts: list) -> None:
     _resolve_attention(item["id"], run.decisions[-1]["reason"] if run.decisions else "resumed")
 
 
-async def _verify_run(run: "Run", before, payloads: list):
+async def _verify_run(run: "Run", before, payloads: list, handles: list | None = None):
     """After a run: rebuild the index and say what changed, in the words the
     run was planned in, flagging any changed cell outside the area the
-    payloads should have touched. Returns the rebuilt index (or None)."""
+    payloads should have touched. `handles` are objects the run made or
+    changed without a payload (the prompt block's tool calls); their cells
+    count as planned too. Returns the rebuilt index (or None)."""
     spatial_cache.invalidate(run.file)
     if before is None:
         return None
     try:
         after = (await asyncio.to_thread(spatial_cache.get, run.file, None, PLUGIN_BASE)).index
-        report = before.verify(after, payloads)
+        report = before.verify(after, payloads, handles=handles)
     except Exception as e:
         run.warnings.append(f"post-run check skipped: {e}")
         await _broadcast({"type": "run_warning", "dashboard": run.dashboard, "tool": "verify",
@@ -1497,6 +1737,11 @@ async def run_script(dashboard_id: str, request: Request):
         return JSONResponse({"error": f"This dashboard is already running a sequence "
                                       f"(run {current.id}, {current.status})."},
                             status_code=409)
+
+    global _SELF_BASE
+    # how this client reached us is how the prompt block's in-process tool
+    # calls will reach us (127.0.0.1, never localhost: see PLUGIN_BASE above)
+    _SELF_BASE = str(request.base_url).rstrip("/").replace("//localhost", "//127.0.0.1")
 
     body = await request.json()
     try:
@@ -1669,6 +1914,12 @@ async def resolve_attention(item_id: str, request: Request):
 async def post_event(request: Request):
     """Ingested from cad_mcp_server.py's dashboard_events.emit() calls."""
     event = await request.json()
+    # The prompt block calls the MCP server's functions inside THIS process;
+    # their @observed wrapper reports here like any other caller's would. The
+    # block already announces every step with its block id, so these twins
+    # (tagged with our own pid) are dropped rather than counted twice.
+    if event.get("type") in ("tool_call_started", "tool_call_finished") and event.get("session") == os.getpid():
+        return {"ok": True, "dropped": "own process"}
     event["_ts"] = time.time()
     await _broadcast(event)          # records into the history as well
     return {"ok": True}
@@ -1710,4 +1961,217 @@ async def get_avatar(dashboard: str = Query(...)):
 
 
 # Catch-all static file mount for the frontend; must come after the routes above.
+# ── Redline review results: the page at /redline.html reads these ───────────
+#
+# The review folder is the pipeline's own (redline/config.py resolves it:
+# CAD_REDLINE_DIR, else the data dir's reviews folder, else
+# dashboard/uploads[-test]/reviews), never UPLOAD_DIR/reviews. Everything is
+# served through redline.view's guards: a review id is one or two plain path
+# segments, a file is a relative path under that folder with an allowed suffix.
+# These routes sit above the catch-all static mount and are registered most
+# specific first because {review_id:path} is greedy.
+
+def _rv():
+    from redline import view as redline_view
+    return redline_view
+
+
+def _review_root() -> str:
+    return _rv().review_dir()
+
+
+def _review_404(review_id: str):
+    return JSONResponse({"error": f"no review {review_id!r} under {_review_root()}"}, status_code=404)
+
+
+def _labels_response(folder: str, review_id: str, extra: dict | None = None):
+    from redline import labels as labels_mod
+    v = _rv()
+    report = v.load_report(folder) or {}
+    labs = labels_mod.load(folder)
+    from redline import metrics
+    body = {"ok": True, "labels": labs.get("comments") or {},
+            "counts": labels_mod.counts(labs, len(report.get("comments") or [])),
+            "metrics": metrics.review_metrics(report, labs.get("comments") or {})}
+    body.update(extra or {})
+    return JSONResponse(body)
+
+
+@app.get("/redline/reviews")
+async def redline_reviews():
+    from redline import labels as labels_mod
+    root = _review_root()
+    return {"review_dir": root, "whoami": labels_mod.whoami(), "reviews": _rv().list_reviews(root)}
+
+
+@app.get("/redline/metrics")
+async def redline_metrics(limit: int = Query(50, ge=1, le=500)):
+    return _rv().aggregate_payload(_review_root(), limit=limit)
+
+
+@app.get("/redline/reviews/{review_id:path}/file/{rel:path}")
+async def redline_review_file(review_id: str, rel: str):
+    v = _rv()
+    folder = v.resolve(_review_root(), review_id)
+    path = v.safe_file(folder, rel) if folder else None
+    if not path:
+        return JSONResponse({"error": "no such file"}, status_code=404)
+    return FileResponse(path)
+
+
+@app.get("/redline/reviews/{review_id:path}/labels")
+async def redline_labels_get(review_id: str):
+    folder = _rv().resolve(_review_root(), review_id)
+    if not folder:
+        return _review_404(review_id)
+    return _labels_response(folder, review_id)
+
+
+@app.put("/redline/reviews/{review_id:path}/labels/{comment_id}")
+async def redline_label_put(review_id: str, comment_id: str, request: Request):
+    from redline import labels as labels_mod
+    v = _rv()
+    folder = v.resolve(_review_root(), review_id)
+    if not folder:
+        return _review_404(review_id)
+    report = v.load_report(folder) or {}
+    if comment_id not in {c.get("id") for c in report.get("comments") or []}:
+        return JSONResponse({"error": f"no comment {comment_id!r} in review {review_id!r}"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    labeller = str(body.get("labeller") or "").strip()
+    if not labeller:
+        return JSONResponse({"error": "labeller is required"}, status_code=400)
+    known = v.vocabulary(folder) or None
+    try:
+        rec = labels_mod.set_label(folder, report.get("review_id") or review_id, comment_id, labeller,
+                                   verdict=body.get("verdict"), tools=body.get("tools"), note=body.get("note") or "",
+                                   tools_version=(report.get("vocabulary") or {}).get("version"), known=known)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return _labels_response(folder, review_id, {"label": rec})
+
+
+@app.delete("/redline/reviews/{review_id:path}/labels/{comment_id}")
+async def redline_label_delete(review_id: str, comment_id: str, labeller: str | None = Query(None)):
+    from redline import labels as labels_mod
+    folder = _rv().resolve(_review_root(), review_id)
+    if not folder:
+        return _review_404(review_id)
+    labels_mod.clear_label(folder, comment_id, labeller or None)
+    return _labels_response(folder, review_id)
+
+
+@app.delete("/redline/reviews/{review_id:path}/labels")
+async def redline_labels_discard(review_id: str):
+    from redline import labels as labels_mod
+    folder = _rv().resolve(_review_root(), review_id)
+    if not folder:
+        return _review_404(review_id)
+    cleared = labels_mod.discard(folder)
+    return _labels_response(folder, review_id, {"cleared_rows": cleared})
+
+
+@app.get("/redline/reviews/{review_id:path}")
+async def redline_review(review_id: str):
+    body = _rv().payload(_review_root(), review_id)
+    if body is None:
+        return _review_404(review_id)
+    return JSONResponse(body)
+
+
+# ── Label set for fine-tuning: the page at /labelset.html reads these ────────
+#
+# A person types a comment and drags tool-name blocks into the chain that
+# addresses it (redline/labelset.py). Kept in its own folder
+# (CAD_REDLINE_LABELSET_DIR, else <review dir>/labelset), never in a review.
+# No metrics, and no parameter is ever stored.
+
+def _ls():
+    from redline import labelset
+    return labelset
+
+
+def _labelset_payload(extra: dict | None = None):
+    ls = _ls()
+    body = {"ok": True}
+    body.update(ls.payload(ls.folder()))
+    body.update(extra or {})
+    return JSONResponse(body)
+
+
+async def _labelset_body(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return None, JSONResponse({"error": "body must be JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return None, JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    return body, None
+
+
+@app.get("/redline/labelset")
+async def labelset_get():
+    return _labelset_payload()
+
+
+@app.get("/redline/labelset/export")
+async def labelset_export():
+    ls = _ls()
+    text = ls.jsonl_text(ls.load(ls.folder()))
+    return Response(content=text, media_type="application/x-ndjson",
+                    headers={"Content-Disposition": f'attachment; filename="{ls.JSONL}"'})
+
+
+@app.post("/redline/labelset/examples")
+async def labelset_add(request: Request):
+    ls = _ls()
+    body, err = await _labelset_body(request)
+    if err:
+        return err
+    fold = ls.folder()
+    try:
+        ex = ls.add(fold, body.get("text"), body.get("tools"), labeller=body.get("labeller") or "",
+                    note=body.get("note") or "", source=body.get("source") or "typed", known=ls.known_tools(fold))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return _labelset_payload({"example": ex})
+
+
+@app.put("/redline/labelset/examples/{ex_id}")
+async def labelset_update(ex_id: str, request: Request):
+    ls = _ls()
+    body, err = await _labelset_body(request)
+    if err:
+        return err
+    fold = ls.folder()
+    try:
+        ex = ls.update(fold, ex_id, text=body.get("text"), tool_names=body.get("tools"), labeller=body.get("labeller"),
+                       note=body.get("note"), source=body.get("source"), known=ls.known_tools(fold))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if ex is None:
+        return JSONResponse({"error": f"no example {ex_id!r}"}, status_code=404)
+    return _labelset_payload({"example": ex})
+
+
+@app.delete("/redline/labelset/examples/{ex_id}")
+async def labelset_delete(ex_id: str):
+    ls = _ls()
+    if not ls.remove(ls.folder(), ex_id):
+        return JSONResponse({"error": f"no example {ex_id!r}"}, status_code=404)
+    return _labelset_payload()
+
+
+@app.delete("/redline/labelset")
+async def labelset_discard():
+    ls = _ls()
+    n = ls.discard(ls.folder())
+    return _labelset_payload({"discarded": n})
+
+
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

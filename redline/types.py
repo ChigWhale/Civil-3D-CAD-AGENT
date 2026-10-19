@@ -108,6 +108,7 @@ class TitleBlockRead(Record):
     printed_path: Optional[str] = None
     printed_file: Optional[str] = None       # the .dwg name without folders
     crops: list = field(default_factory=list)  # paths of the crops read
+    how: Optional[str] = None                # text_layer | vision | None (nothing read)
 
 
 @dataclass
@@ -214,6 +215,40 @@ class ToolSequence(Record):
 
 
 @dataclass
+class ToolStep(Record):
+    """One tool call of an action: the parameters the model filled and what
+    happened when it ran."""
+    tool: str
+    params: dict = field(default_factory=dict)
+    status: str = "planned"      # planned | ran | dry | failed | blocked | not_filled
+    result_preview: str = ""
+    error: Optional[str] = None
+    conflicts: int = 0
+    attempt: int = 1
+    latency_s: float = 0.0
+    raw_reply: str = ""
+    created: list = field(default_factory=list)   # handles the step made or found
+    bin: str = ""                # lookup | draw | modify | text | layer | block | sheet | civil (tools.bin_of)
+    risk: str = ""               # read | draw | modify | delete | design (tools.risk_of)
+    token: Optional[str] = None  # the gate's token when the step came back blocked (acknowledge it to go ahead)
+    blocked: Optional[dict] = None   # {"count", "conflicts"}: what the gate found, for whoever decides
+
+
+@dataclass
+class Action(Record):
+    """What was done (or planned, in a dry run) for one located target."""
+    key: str                     # the Located key: comment id, or id#n
+    comment_id: str
+    status: str = "planned"      # done | dry_run | failed | paused | needs_human | not_located | skipped
+    reason: Optional[str] = None
+    dashboard: Optional[str] = None
+    dwg_path: Optional[str] = None
+    steps: list = field(default_factory=list)      # ToolStep dicts
+    model: str = ""
+    doability: Optional[dict] = None               # metrics.doability record; None when the comment was not located
+
+
+@dataclass
 class CommentOutcome(Record):
     comment_id: str
     status: str                              # done | skipped | failed | paused | dry_run | needs_human
@@ -245,3 +280,5 @@ class Report(Record):
     recall_warnings: list = field(default_factory=list)   # hints that a comment may have been missed
     sequences: list = field(default_factory=list)         # ToolSequence per comment (the text-to-text stage)
     vocabulary: dict = field(default_factory=dict)        # {"version", "count", "excluded"} of the tool list offered
+    actions: list = field(default_factory=list)           # Action per located target (parameters filled, tools run)
+    mode: Optional[str] = None                            # None | "dry" | "run"

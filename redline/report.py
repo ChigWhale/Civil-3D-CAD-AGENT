@@ -51,6 +51,32 @@ def _md_cell(s) -> str:
     return str(s if s is not None else "").replace("|", "\\|").replace("\n", " ")
 
 
+def _where(loc: dict) -> str:
+    if loc.get("space") == "model" and loc.get("model_xy"):
+        return f"model ({loc['model_xy'][0]:.0f}, {loc['model_xy'][1]:.0f})"
+    if loc.get("space") == "paper" and loc.get("paper_xy"):
+        return f"paper ({loc['paper_xy'][0]:.1f}, {loc['paper_xy'][1]:.1f}) in"
+    return "not located" + (f": {loc['reason']}" if loc.get("reason") else "")
+
+
+def _located_row(keys: list, located: dict) -> dict | None:
+    """What a training row keeps of the location: the first target in full,
+    the rest as a short list."""
+    if not keys:
+        return None
+
+    def brief(loc):
+        ctx = loc.get("context") or {}
+        return {"key": loc.get("key"), "space": loc.get("space"), "model_xy": loc.get("model_xy"),
+                "paper_xy": loc.get("paper_xy"), "viewport_handle": loc.get("viewport_handle"),
+                "cell": ctx.get("cell") if isinstance(ctx.get("cell"), str) else None,
+                "nearest": (ctx.get("nearest") or [])[:5], "reason": loc.get("reason")}
+    out = brief(located[keys[0]])
+    if len(keys) > 1:
+        out["targets"] = [brief(located[k]) for k in keys[1:]]
+    return out
+
+
 def _markdown_sequences(r: dict) -> str:
     """The text-to-text stage: one row per comment with the tool names."""
     counts = r.get("counts") or {}
@@ -60,9 +86,15 @@ def _markdown_sequences(r: dict) -> str:
     lines += ["| comments | sequenced | empty | model errors |", "|---|---|---|---|",
               "| {comments} | {sequenced} | {empty} | {model_errors} |".format(
                   **{k: counts.get(k, 0) for k in ("comments", "sequenced", "empty", "model_errors")}), ""]
+    if r.get("mode"):
+        acts = {k[4:]: v for k, v in counts.items() if k.startswith("act_")}
+        lines.append(("Dry run" if r["mode"] == "dry" else "Run") + ": " + ", ".join(f"{v} {k}" for k, v in sorted(acts.items())))
+        lines.append("")
     seqs = {s["comment_id"]: s for s in r.get("sequences") or []}
     sheets = {s["page_no"]: s for s in r.get("sheets") or []}
+    located = _by(r.get("located") or [], "key")
     with_author = any(c.get("author") for c in r["comments"])
+    with_where = bool(located)
     from_markups = (r.get("settings") or {}).get("source") == "markups"
     pages = sorted({c["page_no"] for c in r["comments"]} | ({s["page_no"] for s in sheets.values()} if from_markups else set()))
     for pn in pages:
@@ -77,25 +109,97 @@ def _markdown_sequences(r: dict) -> str:
             if other:
                 line += "; other markups ignored: " + ", ".join(f"{k} {v}" for k, v in sorted(other.items()))
             lines.append(line)
-        elif tb:
+        if tb and (tb.get("sheet_no") or tb.get("printed_file") or not mk):
             lines.append(f"- title block read: sheet {tb.get('sheet_no')} project {tb.get('project_no')} "
-                         f"file {tb.get('printed_file')}")
+                         f"file {tb.get('printed_file')}" + (f" ({tb['how']})" if tb.get("how") else ""))
+        if sheet.get("dwg_path"):
+            p2p = sheet.get("page_to_paper") or {}
+            lines.append(f"- drawing: `{sheet['dwg_path']}` ({sheet.get('how')}, score {sheet.get('score')})"
+                         + (" opened by the pipeline" if sheet.get("opened_by_pipeline") else ""))
+            lines.append(f"- layout: {sheet.get('layout_name')}; page->paper {p2p.get('method')}"
+                         f" rmse {p2p.get('rmse_in')} in; viewports {len(sheet.get('viewports') or [])}")
+        if sheet.get("reason"):
+            lines.append(f"- **not matched:** {sheet['reason']}")
+            if sheet.get("candidates_considered"):
+                lines.append("- candidates: " + "; ".join(f"{c['path']} ({c['score']})" for c in sheet["candidates_considered"][:4]))
         lines.append("")
         page_comments = [c for c in r["comments"] if c["page_no"] == pn]
         if not page_comments:
             lines.append("_no text boxes on this page_\n")
             continue
-        head = "| id | comment | kind |" + (" author |" if with_author else "") + " confidence | tools |"
+        head = ("| id | comment | kind |" + (" author |" if with_author else "") + " confidence |"
+                + (" where |" if with_where else "") + " tools |")
         lines.append(head)
-        lines.append("|---|---|---|" + ("---|" if with_author else "") + "---|---|")
+        lines.append("|---|---|---|" + ("---|" if with_author else "") + "---|" + ("---|" if with_where else "") + "---|")
+        landed = []
         for c in page_comments:
             s = seqs.get(c["id"]) or {}
             shown = " → ".join(s.get("tools") or []) or f"(none: {s.get('error') or 'no answer'})"
             if s.get("unknown_tools"):
                 shown += f" — dropped: {', '.join(s['unknown_tools'][:4])}"
             author = f" {_md_cell(c.get('author'))} |" if with_author else ""
-            lines.append(f"| {c['id']} | {_md_cell(c.get('text'))} | {c.get('kind')} |{author} {float(c.get('confidence') or 0):.2f} | {_md_cell(shown)} |")
+            where = ""
+            if with_where:
+                keys = _keys_for(c["id"], located)
+                if c.get("scope") == "sheet":
+                    where = " whole sheet |"
+                elif not keys:
+                    where = " ? |"
+                else:
+                    first = located[keys[0]]
+                    where = f" {_where(first)}" + (f" (+{len(keys) - 1} more)" if len(keys) > 1 else "") + " |"
+                    for k in keys:
+                        loc = located[k]
+                        if loc.get("space") == "none":
+                            landed.append(f"- {_label(k, len(keys))}: not located ({loc.get('reason')})")
+                        else:
+                            ctx = loc.get("context") or {}
+                            cell = ctx.get("cell") or ""
+                            pk = ctx.get("pick") or {}
+                            pick = pk.get("object")
+                            picked = ""
+                            if pick:
+                                what = pick.get("text") or pick.get("name") or (pick.get("geometry") or {}).get("part_type") or ""
+                                picked = f" Pick: {pick.get('type')} {pick.get('handle')}" + (f" ({_md_cell(what)[:40]})" if what else "") \
+                                         + f" {pick.get('distance', 0):.1f} ft."
+                            elif "pick" in ctx:
+                                picked = f" No object within {ctx.get('pick_tolerance_ft', 5)} ft of the arrow tip"
+                                if pk.get("candidates"):
+                                    cand = pk["candidates"][0]
+                                    picked += f"; nearest {cand.get('type')} {cand.get('handle')} at {cand.get('distance', 0):.0f} ft"
+                                picked += "."
+                            if pk.get("enclosing"):
+                                e = pk["enclosing"][0]
+                                picked += f" Inside {e.get('type')} {e.get('handle')}."
+                            landed.append(f"- {_label(k, len(keys))}: {_where(loc)}.{picked} {cell}")
+            lines.append(f"| {c['id']} | {_md_cell(c.get('text'))} | {c.get('kind')} |{author} {float(c.get('confidence') or 0):.2f} |{where} {_md_cell(shown)} |")
         lines.append("")
+        if landed:
+            lines.append("Where each comment landed:")
+            lines.append("")
+            lines += landed
+            lines.append("")
+        page_actions = [a for a in r.get("actions") or [] if a["comment_id"] in {c["id"] for c in page_comments}]
+        if page_actions:
+            lines.append("Tool calls" + (" (dry run: writes were filled, not executed)" if r.get("mode") == "dry" else "") + ":")
+            lines.append("")
+            for a in page_actions:
+                n_keys = len([x for x in page_actions if x["comment_id"] == a["comment_id"]])
+                head = f"- **{_label(a['key'], n_keys)}**: {a['status']}" + (f" ({_md_cell(a.get('reason'))})" if a.get("reason") else "")
+                lines.append(head)
+                for i, s in enumerate(a.get("steps") or [], start=1):
+                    params = _md_cell(json.dumps(s.get("params") or {}, default=str))
+                    if len(params) > 220:
+                        params = params[:220] + "…"
+                    tail = ""
+                    if s.get("status") == "ran":
+                        tail = f" → ok" + (f", {len(s['created'])} handle(s)" if s.get("created") else "")
+                    elif s.get("status") == "dry":
+                        tail = " → not run (dry)"
+                    elif s.get("error"):
+                        tail = f" → {s['status']}: {_md_cell(s['error'])[:200]}"
+                    lines.append(f"  {i}. `{s['tool']}` {params}{tail}")
+            lines.append("")
     if r.get("recall_warnings"):
         lines.append("## Possible missed comments")
         lines.append("")
@@ -231,13 +335,27 @@ def sequence_rows(report: Report, sheet_of: dict | None = None) -> list:
     the tool names the model gave, and empty slots for a person's answer."""
     r = report.to_dict()
     seqs = {s["comment_id"]: s for s in r.get("sequences") or []}
+    located = _by(r.get("located") or [], "key")
+    matches = {s["page_no"]: s for s in r.get("sheets") or [] if s.get("dwg_path")}
+    actions = {}
+    for a in r.get("actions") or []:
+        actions.setdefault(a["comment_id"], []).append(a)
     sheet_of = sheet_of or {}
     rows = []
     for c in r["comments"]:
         s = seqs.get(c["id"]) or {}
         tb = sheet_of.get(c["page_no"]) or {}
+        m = matches.get(c["page_no"]) or {}
+        acted = actions.get(c["id"]) or []
         rows.append({"ts": time.time(), "review_id": r["review_id"], "key": c["id"], "comment": c,
-                     "sheet": {"sheet_no": tb.get("sheet_no"), "printed_file": tb.get("printed_file")},
+                     "sheet": {"sheet_no": tb.get("sheet_no"), "printed_file": tb.get("printed_file"),
+                               "dwg_path": m.get("dwg_path"), "layout_name": m.get("layout_name")},
+                     "located": _located_row(_keys_for(c["id"], located), located) if located else None,
+                     "mode": r.get("mode"),
+                     "actions": [{"key": a["key"], "status": a["status"], "reason": a.get("reason"),
+                                  "steps": [{"tool": st["tool"], "params": st.get("params"), "status": st.get("status"),
+                                             "error": st.get("error")} for st in a.get("steps") or []]} for a in acted] or None,
+                     "human_params": None,
                      "tools_version": (r.get("vocabulary") or {}).get("version"),
                      "tools": s.get("tools") or [], "unknown_tools": s.get("unknown_tools") or [],
                      "raw_reply": s.get("raw_reply", ""), "model": s.get("model", ""), "error": s.get("error"),

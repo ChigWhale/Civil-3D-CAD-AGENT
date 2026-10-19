@@ -15,6 +15,7 @@ import profiles
 import sheets
 import spatial
 import spatial_cache
+import spatial_summary
 import swales
 from dashboard_events import SESSION_ID, DashboardError, emit, resolve_file
 
@@ -2676,21 +2677,73 @@ def describe_location(dashboard: str, x: float, y: float) -> str:
     -- plus the same frame as data, the region id, and what the eight
     neighbouring cells hold. Use it to check a spot before drawing there."""
     try:
-        index = _index_for(dashboard)
+        entry = spatial_cache.get(_file_for(dashboard))
     except Exception as e:
         return json.dumps({"error": str(e)})
+    index = entry.index
     loc = index.locate(x, y)
+    near = spatial_summary.nearby(entry.data, index, (x, y), radius=25.0, limit=5)["objects"]
     return json.dumps({"description": index.describe(loc["key"]),
                        "cell": list(loc["key"]), "bounds": list(loc["bounds"]),
                        "tags": loc["tags"], "frame": loc["frame"],
-                       "region": loc["region"], "neighbours": loc["neighbours"]})
+                       "region": loc["region"], "neighbours": loc["neighbours"],
+                       "nearest": [spatial_summary.brief(s) for s in near]})
 
 
 @mcp.tool()
 @observed
-def find_entities(dashboard: str, tag: str, x: float, y: float,
+def object_at(dashboard: str, x: float, y: float, tolerance: float = 5.0) -> str:
+    """The ONE object under a point: what a reviewer's arrow tip or a pick
+    means. Returns `object` (handle, type, layer, name/text, geometry such as
+    a line's start/end/length, a block's position and attributes, a pipe's
+    size), its `labels`, the `distance` from the point, and `candidates`:
+    the next few objects that were also close, so you can see what else it
+    might have meant. Labels never win the pick (they are listed under the
+    object they belong to); a point object beats a line passing through the
+    same spot. `object` is null when nothing is within `tolerance` ft; the
+    candidates are then the nearest objects within ten tolerances, so a near
+    miss is visible. `enclosing` lists the closed shapes (circles, closed
+    polylines, parcels) the point is inside, smallest first, for comments
+    about what is "inside" or "in" something. Pick a tolerance from the plot
+    scale: about 0.15 in on paper (6 ft at 1"=40', 15 ft at 1"=100'). The
+    handle is what the modify tools take."""
+    try:
+        entry = spatial_cache.get(_file_for(dashboard))
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    out = spatial_summary.object_at(entry.data, entry.index, (x, y), tolerance=tolerance)
+    out["point"] = [x, y]
+    out["tolerance"] = tolerance
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
+@observed
+def nearby(dashboard: str, x: float, y: float, radius: float = 50.0, types: str = "", limit: int = 20) -> str:
+    """Every object within `radius` ft of a point, summarised and nearest
+    first, no layer tag needed: handle, type (line, polyline, arc, circle,
+    block, text, label, pipe, structure, appurtenance, alignment ...), layer,
+    name or text, geometry and distance. `types` narrows to those type words,
+    comma separated (e.g. "text,label"). Use it to see what is around a spot
+    before changing anything; the handles are what the modify tools take.
+    find_entities is the same search by layer tag or family."""
+    try:
+        entry = spatial_cache.get(_file_for(dashboard))
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    want = [t.strip() for t in str(types or "").split(",") if t.strip()] or None
+    out = spatial_summary.nearby(entry.data, entry.index, (x, y), radius=radius, limit=max(1, int(limit)), types=want)
+    out["point"] = [x, y]
+    out["radius"] = radius
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
+@observed
+def find_entities(dashboard: str, x: float, y: float, tag: str = "",
                   radius: float = 100.0, state: str = "") -> str:
-    """Handles of entities of one tag or family within `radius` ft of a point.
+    """Handles of entities within `radius` ft of a point, of one tag or family
+    or (tag left empty) of any kind.
 
     tag is a word from list_tags: a hand tag (pad, curb, lot_line, setback,
     centreline, right_of_way, boundary, easement, driveway, swale ...), a full
@@ -2698,15 +2751,27 @@ def find_entities(dashboard: str, tag: str, x: float, y: float,
     family word that means all of its parts (water, sanitary, storm ...).
     state narrows to proposed / existing / future / demolition / abandoned /
     temporary. Point entities (labels, blocks, structures, text) match on
-    their anchor. Handles are what move_to_layer, edit_layer and the modify
-    tools take, so this is how a reasoned-about area becomes something to act on."""
+    their anchor. Besides `handles`, `objects` gives each one's type, layer,
+    what it is and its distance. Handles are what move_to_layer, edit_layer
+    and the modify tools take, so this is how a reasoned-about area becomes
+    something to act on. For the single object under a point use object_at."""
     try:
-        index = _index_for(dashboard)
+        entry = spatial_cache.get(_file_for(dashboard))
     except Exception as e:
         return json.dumps({"error": str(e)})
-    handles = index.entities(tag, point=(x, y), radius=radius, state=state or None)
-    return json.dumps({"tag": tag, "count": len(handles), "handles": handles,
-                       "region": index.region_of(point=(x, y))})
+    index = entry.index
+    handles = index.entities(tag or None, point=(x, y), radius=radius, state=state or None)
+    lookup = spatial_summary.by_handle(entry.data)
+    objects = []
+    for h in handles:
+        s = spatial_summary.summarize(entry.data, index, h, lookup)
+        if s is None:
+            continue
+        s["distance"] = spatial_summary.distance_to(index, h, (x, y))
+        objects.append(spatial_summary.brief(s))
+    objects.sort(key=lambda o: (o.get("distance") if o.get("distance") is not None else 1e9))
+    return json.dumps({"tag": tag or "any", "count": len(handles), "handles": handles, "objects": objects,
+                       "region": index.region_of(point=(x, y))}, default=str)
 
 
 @mcp.tool()
@@ -2849,14 +2914,15 @@ drafting_tools.register(mcp, observed, _post, _file_for)
 
 
 @mcp.tool()
-def delete_objects(handles: list[str]) -> str:
-    """Permanently deletes objects from the drawing by their handle strings.
-    Handles are found in the get_model_space output.
+@observed
+def delete_objects(dashboard: str, handles: list[str]) -> str:
+    """Permanently deletes objects from the drawing assigned to a dashboard, by
+    their handle strings (from get_model_space, find_entities or select_entities).
     Only call when the user explicitly asks to delete or remove objects."""
     return _post({
         "intent":  "delete",
         "objects": [{"object_handle": h, "object_type": "object"} for h in handles],
-    })
+    }, _file_for(dashboard))
 
 _DASHBOARD_PORT = 8765
 _DASHBOARD_URL  = f"http://localhost:{_DASHBOARD_PORT}"
@@ -2869,7 +2935,7 @@ _DASHBOARD_URL  = f"http://localhost:{_DASHBOARD_PORT}"
 # Point _HEALTH_PATH at a route the CURRENT server has and older ones don't, and
 # require the version stamp to match so a server running older code is replaced.
 _HEALTH_PATH = "/version"
-_DASHBOARD_VERSION = "2026-10-07.1"   # must equal dashboard/server.py DASHBOARD_VERSION
+_DASHBOARD_VERSION = "2026-10-19.1"   # must equal dashboard/server.py DASHBOARD_VERSION
 
 # How long a server gets to answer before it counts as failed or stale. Covers
 # uvicorn's own startup plus the sibling-process case described in _launch.

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Label set</title>
+  <link rel="stylesheet" href="redline.css?v=2026-10-13.2">
+  <link rel="stylesheet" href="labelset.css?v=2026-10-13.2">
+</head>
+<body>
+  <header id="hdr">
+    <h1>Label set</h1>
+    <div id="chips" class="chips"></div>
+    <div class="hdr-right">
+      <label class="lab">Labeller <input id="labeller" type="text" placeholder="your name" spellcheck="false" autocomplete="off"></label>
+      <span id="countChip" class="count"></span>
+      <button id="exportBtn" type="button" class="ghost-btn" title="Download labelset.jsonl, the fine-tuning rows">Download JSONL</button>
+      <button id="discardBtn" type="button" class="ghost-btn">Discard all</button>
+      <button id="copyBtn" type="button" class="ghost-btn">Copy folder path</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <main id="main">
+    <section class="view split">
+      <div id="editorPane" class="pane left ls-left">
+        <div class="editor">
+          <div class="ed-head">
+            <span id="edTitle" class="ed-title">New example</span>
+            <span id="edBadge" class="badge"></span>
+          </div>
+          <textarea id="text" rows="3" placeholder="Type the comment exactly as the reviewer wrote it" spellcheck="false"></textarea>
+          <div class="ed-label">The chain of blocks that addresses it</div>
+          <div id="tray" class="tray" role="list" tabindex="-1" data-placeholder="Drag blocks here, or click one in the library"></div>
+          <div class="strip-btns">
+            <button id="saveBtn" type="button" class="primary">Save example</button>
+            <button id="clearBtn" type="button" class="ghost-btn">Clear</button>
+            <button id="cancelBtn" type="button" class="ghost-btn" hidden>Cancel edit</button>
+            <span class="keys">Ctrl+Enter saves · / searches blocks · Esc cancels an edit</span>
+          </div>
+        </div>
+        <div id="library" class="library"></div>
+      </div>
+
+      <div id="listPane" class="pane right">
+        <div class="list-head">
+          <span id="listTitle">Saved examples</span>
+          <input id="filter" type="search" class="lib-search" placeholder="filter examples" spellcheck="false" autocomplete="off">
+        </div>
+        <div id="examples" class="examples"></div>
+      </div>
+    </section>
+    <div id="message" class="message" hidden></div>
+  </main>
+
+  <div id="dndLive" class="sr-only" aria-live="polite"></div>
+
+  <script src="redline-dnd.js?v=2026-10-13.2"></script>
+  <script src="labelset.js?v=2026-10-13.2"></script>
+</body>
+</html>
