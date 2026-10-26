@@ -70,7 +70,7 @@ saved. This fed the label GNN work and is not used by the agent.
 Interactive. Asks whether to build a label graph or a feedforward graph
 (`L`/`F`) and for a project name, then walks the drawing and writes one JSON
 file per graph to `Downloads\JSON GNN Representation\`. Part of the older
-neural-network labelling experiment (`GNN_*.py`, `LabelGNN*.py`), kept for
+neural-network labelling experiment (now under `archive/`), kept for
 reference.
 
 ## CADAGENT

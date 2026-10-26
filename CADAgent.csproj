@@ -23,12 +23,6 @@
     <PackageReference Include="MathNet.Numerics" Version="5.0.0" />
   </ItemGroup>
 
-  <!-- UI is built entirely in code — exclude the XAML file from compilation -->
-  <ItemGroup>
-    <Page Remove="AgentPaletteControl.xaml" />
-    <None Include="AgentPaletteControl.xaml" />
-  </ItemGroup>
-
   <ItemGroup>
     <!-- AutoCAD core references -->
     <Reference Include="acdbmgd">
@@ -75,15 +69,6 @@
     <None Remove="PipeInvertSetter\**" />
     <Compile Remove="PipeInvertSetter.Tests\**" />
     <None Remove="PipeInvertSetter.Tests\**" />
-    <Compile Remove="ReeseOclock\**" />
-    <None Remove="ReeseOclock\**" />
-    <EmbeddedResource Remove="ReeseOclock\**" />
-    <Compile Remove="Gambol\**" />
-    <None Remove="Gambol\**" />
-    <EmbeddedResource Remove="Gambol\**" />
-    <Compile Remove="MathDrill\**" />
-    <None Remove="MathDrill\**" />
-    <EmbeddedResource Remove="MathDrill\**" />
     <Compile Remove="FeatureLineSync\**" />
     <None Remove="FeatureLineSync\**" />
     <EmbeddedResource Remove="FeatureLineSync\**" />

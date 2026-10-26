@@ -33,3 +33,6 @@ package/*.log
 
 # Fine-tuning environment (python -m finetune setup)
 .venv-finetune/
+
+# Title-block templates are not published; keep a local copy
+Layout Templates/

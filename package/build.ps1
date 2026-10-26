@@ -112,9 +112,9 @@ if (-not $SkipPython) {
 # ── 3. app: the repo's Python and local data ─────────────────────────────────
 Step "copying the app"
 $AppDir = Join-Path $Stage "app"
-$exclude = @(".git", ".vs", ".claude", "bin", "obj", "tests", "package", "finetune", ".venv-finetune", "__pycache__", "MathDrill", "Gambol",
+$exclude = @(".git", ".vs", ".claude", "bin", "obj", "tests", "package", "finetune", ".venv-finetune", "__pycache__", "archive",
              "uploads", "uploads-test", "downloads", "stage", "dist", "PipeInvertSetter", "PipeInvertSetter.Tests",
-             "ReeseOclock", "Commands", ".run", "observations", "FeatureLineSync", "FeatureLineSync.Tests")
+             "Commands", ".run", "observations", "FeatureLineSync", "FeatureLineSync.Tests")
 if ($Lite) { $exclude += "redline" }      # the comment addresser stays out of the lite package
 $excludeFiles = @("*.cs", "*.csproj", "*.sln", "*.slnx", "*.pyc", "*.user", "*.xaml", "*.pt", "layer_tags.learned.json",
                   "ollama_agent.py", "GNN_*.py", "LabelGNN*.py", "Testing.py", "*.bak", "redline.json", "cad-agent.json",
