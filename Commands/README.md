@@ -330,7 +330,7 @@ labels are created and left where their styles put them (`do.anchors` false,
 
 Sheets (2026-09-16 afternoon): the span picks the template layout -- `profile.sheets["36"]`
 = "DWG to PDF (34x22)", `["40"]` = "DWG to PDF (36x24)" in the
-`layout template .dwt` -- with its paper size,
+layout template `.dwt` -- with its paper size,
 `slots` (paper inches where each view's datum corner goes; the first slot is the upper view)
 and a per-span band set. Each sheet is ONE viewport the size of the sheet border
 (`create_viewport` with `fit: "layout"` takes the extents of what the cloned layout carries,
