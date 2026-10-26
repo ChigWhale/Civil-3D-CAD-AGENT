@@ -36,3 +36,11 @@ package/*.log
 
 # Title-block templates are not published; keep a local copy
 Layout Templates/
+
+# Local data: playbooks, harvested standards, recipes, learned layer families
+playbooks/*/
+standards/global.json
+standards/global.md
+standards/observations/
+learn/recipes/*.json
+layer_tags.learned.json
