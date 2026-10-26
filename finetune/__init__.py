@@ -8,8 +8,7 @@
     python -m finetune eval      # the tuned model on the same held-out rows
     python -m finetune status
 
-The package is separate from redline/ (which stays free of torch) and from
-learn/ (numpy only). Heavy libraries live in their own virtual environment
+The package is separate from redline/ (which stays free of torch). Heavy libraries live in their own virtual environment
 (.venv-finetune); only `train` and `merge` run inside it. Nothing here is
 shipped in the packaged product.
 """

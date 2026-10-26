@@ -16,8 +16,7 @@
                             the dashboard. Kept, with its modules (sheet,
                             transform, locate, planner, runner, directives),
                             for the parameter stage that comes after the
-                            tool-name stage works. tests/run_redline.py still
-                            exercises it against the stub.
+                            tool-name stage works.
 
 Order of model use: every page is read first (vision model), then every
 comment is sequenced (text model). On an 8 GB card only one of the two fits
