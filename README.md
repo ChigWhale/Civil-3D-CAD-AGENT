@@ -22,7 +22,7 @@ The methodology for incorporating open-source LLMs is to try and generalize any 
 - package/: installer that ships the plugin, Python, and models.
 - redline/: the planner, filler and tool catalog that the prompt block runs on, plus a pipeline that reads reviewer markups from scanned PDFs with a local vision model (Qwen3-VL 4B).
 - sheets.py, playbooks.py: sheet cutting from a plan-type spec. The specs themselves are site-specific and not versioned.
-- archive/: earlier experiments, the LangGraph prototype and the GNN label-placement work. You chose to keep the folder, so name it, or it looks forgotten.
+- archive/: earlier experiments, the LangGraph prototype and the GNN label-placement work.
 
 ## Workflow Visualization
 
