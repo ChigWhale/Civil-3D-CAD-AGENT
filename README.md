@@ -37,3 +37,14 @@ flowchart TB
     n4 --> n8
     n8 --> n9["Chains are committed to model space"]
 ```
+
+## Example
+Below is an example of what a section of civil plans might look like that would need driveways:
+<img width="952" height="873" alt="Demo Before" src="https://github.com/user-attachments/assets/e4ef5ff0-429f-4a51-b280-8b0e6dcca5dc" />
+
+Using the agent dashboard and the prompt "Draw driveways for the current modelspace", the section of the civil plans were able to have their driveways drawn in the same workflow as seen above (Both the dashboard and the finalized section of the civil plans can be seen below)
+<img width="956" height="847" alt="Demo After" src="https://github.com/user-attachments/assets/08545fd1-dda5-4e86-b119-2c9e31eb23b5" />
+<img width="953" height="943" alt="CAD-AGENT Dashboard" src="https://github.com/user-attachments/assets/26c28801-6d84-46ce-9c6a-e17de5d06408" />
+
+## Limitations
+The biggest limitations so far is the relatively smaller size of the model that is running behind the custom prompt, and the struggle of figuring out what in modelspace is required to be addressed by the prompt, and where it located. The current workflow works best with prompts that address multiple objects of the same type and leave out ambiguous language (i.e. "Move fire hydrants in the northwestern portion of the plans).
