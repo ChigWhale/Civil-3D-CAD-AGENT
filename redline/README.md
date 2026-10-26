@@ -255,29 +255,7 @@ the command line. Its opening and locating half (`sheet.py`, `transform.py`,
 `locate.py`, `paper_index.py`) is live behind `--locate`, and `runner.py`'s
 dashboard client is used by `act.py`. What stays parked is `planner.py`
 (one-shot parameterised block chains, superseded by the per-step filler)
-and `directives.py` (sheet-wide starred notes). `tests/run_redline.py`
-still exercises all of it against the stub plugin, so it does not rot.
-
-## Tests
-
-    python tests/test_redline_sequence.py   # vocabulary, parsing, retry, fake backend, typed review
-    python tests/test_redline_markups.py    # Bluebeam FreeText reader, rotation mapping, markups review, CLI
-    python tests/test_redline_fill.py       # parameter schemas, validation, handle guard, executor dry/run/blocked/warn
-    python tests/test_spatial_summary.py    # object summaries, the pick (object_at) and nearby, on the stub data
-    python tests/test_redline_metrics.py    # the metrics maths against hand-checked numbers
-    python tests/test_redline_view.py       # labels file and mirror, review-folder guards, payload, window helpers (no browser)
-    python tests/test_redline_labelset.py   # the standalone label set: document, jsonl mirror, validation, export, CLI (no browser)
-    python tests/test_redline_transform.py
-    python tests/test_redline_marks.py
-    python tests/test_redline_sheet.py
-    python tests/test_redline_planner.py
-    python tests/run_redline.py        # end to end on the stub plugin and a test dashboard
-
-The end-to-end test starts its own servers on 5399 and 8799, builds a
-two-page PDF from the stub's layouts, runs the current flow with fake OCR
-and a fake sequencer (one row per comment, no skips, dashboard untouched),
-and runs the parked flow too. Everything is forced under `%TEMP%`; the live
-`runs.json` is checked untouched.
+and `directives.py` (sheet-wide starred notes).
 
 ## Fine-tuning
 

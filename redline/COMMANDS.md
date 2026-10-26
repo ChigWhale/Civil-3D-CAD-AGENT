@@ -93,17 +93,6 @@ could not be filled without guessing), `paused` (the gate blocked a write),
 copy of the drawing before a production file. The dashboard records every
 run; Civil 3D's undo is the way back.
 
-### Tests
-
-    python tests/test_redline_sequence.py      # tool vocabulary, sequencer parsing and retry
-    python tests/test_redline_markups.py       # Bluebeam reader, rotation mapping, markups review
-    python tests/test_redline_sheet.py         # title block parsing, text layer, drawing candidates, layout choice
-    python tests/test_redline_fill.py          # parameter schemas, validation, handle guard, executor
-    python tests/test_spatial_summary.py       # object summaries, the pick (object_at), nearby, enclosing
-    python tests/test_redline_transform.py     # page -> paper -> model transform
-    python tests/test_redline_marks.py         # ink detector
-    python tests/run_redline.py                # end to end on the stub plugin (starts its own servers on 5399/8799)
-
 ## The results window
 
 Every `review`, `markups` and `transcribe` run opens its results in a window
@@ -196,8 +185,6 @@ folder (so a process aimed at a stub plugin keeps its set under
 `dashboard\uploads-test`). `tools.txt` in that folder is the snapshot of
 tool names the blocks come from, written when the command opens the window;
 without it the page offers every name in the bin tables.
-
-    python tests/test_redline_labelset.py      # the document, jsonl mirror, validation, export, CLI (no browser)
 
 ### From labels to a model
 

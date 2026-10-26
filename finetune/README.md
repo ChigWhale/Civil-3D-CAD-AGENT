@@ -3,8 +3,7 @@
 The redline pipeline's text stage turns one reviewer comment into an ordered
 list of MCP tool names. This package fine-tunes a small open model on the
 labels that stage collects and puts the result back in front of the
-pipeline. It is separate from `redline/` (which never imports torch) and
-from `learn/` (numpy only), and it is not shipped in the packaged product.
+pipeline. It is separate from `redline/` (which never imports torch), and it is not shipped in the packaged product.
 
 New to this? Read `FINE-TUNING.md` first: machine and data
 requirements, what the model learns, how to read the eval table, when to

@@ -345,7 +345,7 @@ paper sizes. Title block and furniture as for plan sheets plus `{alignment}` `{s
 `cut_profile_sheets` (the latter expanded at its turn in a run, so both can go in one run);
 chat tools `profile_context`, `plan_profile_views`, `draw_profile_views`,
 `cut_profile_sheets`, `produce_profile_sheets`. Spec: `playbooks/sanitary/sheets.json`.
-Tests: `tests/test_profiles.py`, `tests/run_profiles.py`. Untested live: every Civil 3D
+Untested live: every Civil 3D
 call above (compiled against 2025; signatures checked against AeccDbMgd 13.7), the
 centreline-Z convention for inverts, band item write-back, `DraggedOffset` on station
 sub-entities, and whether the real profile view extents fit the default slots.
@@ -366,8 +366,7 @@ and `cut_grading_sheets` (pick cells; `label_grading` then `space_labels` once o
 drawing -- `label_scope: cells` runs them inside each cell's `window` instead -- then one
 sequence per cell); chat tools `read_key_map`, `list_key_map`,
 `plan_grading_sheets`, `cut_grading_sheets`. Spec: `playbooks/grading/sheets.json`
-(`key_map` and `grading` sections). Tests: `tests/test_keymap.py`,
-`tests/run_grading_sheets.py`. Untested live: the twist sign on a real rotated cell, text
+(`key_map` and `grading` sections). Untested live: the twist sign on a real rotated cell, text
 insertion points for keys that are not left-justified, the template on the cut.
 
 ## Sequences

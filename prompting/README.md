@@ -132,8 +132,3 @@ dictionary (water + hydrant -> water_hydrant), then as a literal tag.
   parallelism. Everything not covered still goes to the model, and a model's
   point with nothing to ground it is refused.
 
-## Tests
-
-    python tests/test_prompting.py      # offline: spec, compose, helpers, Planner, Runner, record, phases
-    python tests/test_prompting_helpers.py   # offline: measures, words, subjects, geometry, the drawing-reading helpers on the stub drawing
-    python tests/run_prompting.py       # stub plugin 5399 + dashboard 8799: plan, run, mixed lane, edited plan, re-plan
