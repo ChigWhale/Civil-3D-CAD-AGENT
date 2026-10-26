@@ -7,13 +7,13 @@ The deterministic tasks are usually ones that are repetitive but require the sam
 
 The methodology for incorporating open-source LLMs is to try and generalize any outcome in Civil 3D as a chain of both helper functions (Figuring out both where exactly we are in model space and what is around at any point) and basic commands (Such as draw_line, draw_shape, create_layer, and so on). The goal of using these open-sourced models is to generalize chains of CAD commands so that any action can then be decomposed into its components. This idea is analogous to a vector space (Modelspace) in which the basis vectors (Basic CAD operations & helpers) span the entirety of the space. The future goal for this portion of the project is to start collecting enough prompt-to-chain labels so that fine-tuning of these models can achieve better accuracy.
 
-# Some Design Choices
+## Some Design Choices
 - Models themselves never write code. Only the parameters for the predetermined tools are filled at execution time.
 - All models are constrained to only picking from the set of pre-defined tools.
 - The tool calls as of now are just tokens (i.e. as of now, making chains of actions is purely done through text and there is no special indexing for what each tool call represents, but that is a consideration for the future)
 - Tools made for specific tasks are included in the available list for LLMs to call (i.e. the tools created specifically for grading sheets and other specific tasks are included in what the LLMs can chain together)
 
-# What's here
+## What's here
 - HttpBridge.cs, Commands/, PipeInvertSetter/: the C# plugin. A localhost HTTP listener inside Civil 3D, 126 drafting intents, and compute-then-draw handlers for pipe elevations and labels. Every write is one transaction.
 - cad_mcp_server.py, drafting_tools.py: the Python MCP server, 167 tools, used by Claude Desktop.
 - spatial.py: a grid index of the drawing. Every write is dry-run against it and diffed afterward.
@@ -23,3 +23,17 @@ The methodology for incorporating open-source LLMs is to try and generalize any 
 - redline/: the planner, filler and tool catalog that the prompt block runs on, plus a pipeline that reads reviewer markups from scanned PDFs with a local vision model (Qwen3-VL 4B).
 - sheets.py, playbooks.py: sheet cutting from a plan-type spec. The specs themselves are site-specific and not versioned.
 - archive/: earlier experiments, the LangGraph prototype and the GNN label-placement work. You chose to keep the folder, so name it, or it looks forgotten.
+
+## Workflow Visualization
+
+```mermaid
+flowchart TB
+    n1(["Start"]) --> n2["User selects pre-defined tools"] & n3["User enters prompt"]
+    n2 --> n4["User manually chains together a series of tools"]
+    n3 --> n5["Prompt is decomposed into a chain of tool calls via an open-source LLM"]
+    n5 --> n6["The chain is validated against the available tools"]
+    n6 --> n7["Each tool's parameters are filled in by helpers or by the model"]
+    n7 --> n8["Proposed chains are checked against the existing drawing for conflicts"]
+    n4 --> n8
+    n8 --> n9["Chains are committed to model space"]
+```
